@@ -1,0 +1,12 @@
+services:
+  subtensor-localnet:
+    image: ghcr.io/opentensor/subtensor-localnet:latest
+    container_name: subtensor-localnet
+    ports:
+      - "9944:9944"
+      - "9945:9945"
+      - "9946:9946"
+    # "True"  = fast-runtime: 250ms blocks (good for dev — fast epoch iteration)
+    # "False" = non-fast-runtime: 12s blocks
+    command: ["True"]
+    restart: unless-stopped

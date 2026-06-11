@@ -1,0 +1,25 @@
+[project]
+name = "validator"
+version = "4.1.36"
+description = "TPN Validator"
+authors = [{ name = "tpn.xyz" }]
+readme = "README.md"
+dependencies = [
+    "aiohttp>=3.9.0",
+    "common",
+    "competition",
+    "bittensor>=10.4.0",
+    "bittensor-cli==9.22.0",
+]
+requires-python = ">=3.12"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.uv.sources]
+common = { workspace = true }
+competition = { workspace = true }
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/validator"]

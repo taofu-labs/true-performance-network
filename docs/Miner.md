@@ -1,0 +1,121 @@
+# Miner Operations
+
+## Prerequisites
+
+- Bittensor wallet
+- HuggingFace account with write access
+
+## Install CLI
+
+Installs `uv` if not present, then installs the `tpn` CLI tool:
+
+```bash
+./install_cli.sh
+```
+
+Verify:
+```bash
+tpn --help
+```
+
+## Workflow
+
+### 1. Register on subnet
+
+```bash
+tpn register --wallet <coldkey> --hotkey default
+```
+
+### 2. List competitions
+
+```bash
+tpn competitions
+tpn competitions --all   # include inactive
+```
+
+### 3. Upload model to HuggingFace
+
+Uploads your `.gguf` file to a private HF repo and saves upload metadata locally.
+
+```bash
+tpn upload ./my-model.gguf \
+  --repo my-model-q4 \
+  --coldkey <coldkey> \
+  --competition <competition-id>
+```
+
+### 4. Commit
+
+Submits a TimeLocked Commit to chain. Auto-reveals at `commit_end_block`.
+
+```bash
+tpn commit --wallet <coldkey> --competition <competition-id>
+```
+
+Claims (self-reported benchmark scores 0–1) are prompted interactively if not provided. Pass via flag to skip prompts:
+
+```bash
+tpn commit -w <coldkey> -c <competition-id> \
+  --claims '[{"b":"benchmark-name","s":0.85}]'
+```
+
+Use `--dry-run` to inspect the payload without writing to chain.
+
+### 5. Publish repo
+
+Makes the HF repo public so validators can download your model. Do this before the scoring phase begins.
+
+```bash
+tpn publish --wallet <coldkey> --competition <competition-id>
+```
+
+### 6. Check status
+
+```bash
+tpn status --wallet <coldkey>
+tpn status --wallet <coldkey> --competition <competition-id>
+```
+
+## Local state
+
+The CLI stores per-wallet submission state in:
+
+- Linux/macOS: `~/.tpn/<coldkey>/<hotkey>/<competition-id>.json`
+- Windows: `%APPDATA%/tpn/<coldkey>/<hotkey>/<competition-id>.json`
+
+Created on `register`. Each competition file holds the uploaded repo, filename, SHA256, file size, claims, and commit end block. Used by `commit`, `publish`, and `status` to resume without re-entering data.
+
+## Command reference
+
+```
+tpn register      Register hotkey on subnet
+tpn competitions  List competitions
+tpn upload        Upload GGUF to HuggingFace
+tpn commit        Submit TimeLocked Commit to chain
+tpn publish       Make HF repo public
+tpn status        Show submission state
+tpn version       Print CLI version
+```
+
+## Overriding defaults
+
+For local development or non-standard setups, all commands accept these global flags before the subcommand:
+
+| Flag | Default | Description |
+|---|---|---|
+| `--network` | `finney` | Chain endpoint |
+| `--netuid` | subnet UID | Subnet UID |
+| `--wallet-path` | `~/.bittensor/wallets` | Override wallet directory |
+| `--competition-url` | GitHub raw URL | Override competition index |
+| `--block-time` | `12.0` | Seconds per block (use `0.300` for localnet) |
+
+Example:
+```bash
+uv run --package cli tpn \
+  --network ws://localhost:9946 \
+  --netuid 2 \
+  --block-time 0.300 \
+  --competition-url ./competitions/localnet/index.json \
+  --wallet-path ./wallets \
+  commit -w charlie -c tpn-localnet
+```

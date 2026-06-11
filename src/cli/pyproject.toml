@@ -1,0 +1,31 @@
+[project]
+name = "cli"
+version = "4.1.36"
+description = "TPN CLI"
+authors = [{ name = "tpn.xyz" }]
+readme = "README.md"
+requires-python = ">=3.12"
+
+dependencies = [
+    "common",
+    "competition",
+    "bittensor>=10.4.0",
+    "bittensor-cli==9.22.0",
+    "huggingface_hub>=0.23.0",
+    "rich>=14.2.0",
+    "typer>=0.20.0",
+]
+
+[project.scripts]
+tpn = "cli.app:app"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.uv.sources]
+common = { workspace = true }
+competition = { workspace = true }
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/cli"]

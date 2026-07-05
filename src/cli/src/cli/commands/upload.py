@@ -40,11 +40,12 @@ def upload(
     api.create_repo(repo_id=repo_id, private=True, exist_ok=True)
 
     console.print(f"[blue]Uploading {gguf_path.name} ({gguf_path.stat().st_size:,} bytes)...[/blue]")
-    api.upload_file(
+    commit_info = api.upload_file(
         path_or_fileobj=str(gguf_path),
         path_in_repo=gguf_path.name,
         repo_id=repo_id,
     )
+    revision = commit_info.oid  # immutable commit SHA of this upload
 
     file_sha256 = _sha256(gguf_path)
     file_size = gguf_path.stat().st_size
@@ -55,6 +56,7 @@ def upload(
         "file": gguf_path.name,
         "file_sha256": file_sha256,
         "file_size": file_size,
+        "huggingface_revision": revision,
     })
     save_competition_config(coldkey, hotkey_name, competition_id, cfg)
 
@@ -62,6 +64,7 @@ def upload(
         f"[green]✓ Uploaded successfully[/green]\n\n"
         f"Repo:    [cyan]{repo_id}[/cyan]\n"
         f"File:    [dim]{gguf_path.name}[/dim]\n"
+        f"Rev:     [dim]{revision}[/dim]\n"
         f"SHA256:  [dim]{file_sha256}[/dim]\n"
         f"Size:    [dim]{file_size:,} bytes[/dim]\n\n"
         f"[dim]Next step: run `tpn commit --wallet {coldkey} --hotkey {hotkey_name} --competition {competition_id}`[/dim]",

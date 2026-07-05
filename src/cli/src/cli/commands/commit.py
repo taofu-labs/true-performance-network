@@ -67,7 +67,7 @@ def commit(
         cfg = load_competition_config(coldkey, hotkey_name, competition_id)
 
     # ── Validate upload fields ────────────────────────────────────────────────
-    missing = [f for f in ("repository", "file", "file_sha256", "file_size") if not cfg.get(f)]
+    missing = [f for f in ("repository", "file", "file_sha256", "file_size", "huggingface_revision") if not cfg.get(f)]
     if missing:
         console.print(
             f"[red]Missing upload data: {', '.join(missing)}[/red]\n"
@@ -88,6 +88,7 @@ def commit(
         f"Competition:      [cyan]{competition_id}[/cyan] — {spec.name}\n"
         f"Repo:             [cyan]{cfg['repository']}[/cyan]\n"
         f"File:             [dim]{cfg['file']}[/dim]\n"
+        f"Rev:              [dim]{cfg['huggingface_revision']}[/dim]\n"
         f"SHA256:           [dim]{cfg['file_sha256'][:24]}...[/dim]\n"
         f"Size:             [dim]{cfg['file_size']:,} bytes[/dim]\n"
         f"Claims:           [dim]{claims_display}[/dim]\n"
@@ -107,6 +108,7 @@ def commit(
         file_sha256=cfg["file_sha256"],
         file_size=cfg["file_size"],
         claims=parsed_claims,
+        huggingface_revision=cfg["huggingface_revision"],
     )
 
     # ── Persist state ─────────────────────────────────────────────────────────

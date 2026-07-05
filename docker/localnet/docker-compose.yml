@@ -1,6 +1,6 @@
 services:
   subtensor-localnet:
-    image: ghcr.io/opentensor/subtensor-localnet:latest
+    image: ghcr.io/raofoundation/subtensor-localnet:latest
     container_name: subtensor-localnet
     ports:
       - "9944:9944"

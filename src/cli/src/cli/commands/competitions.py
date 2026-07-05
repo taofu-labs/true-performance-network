@@ -43,9 +43,9 @@ def competitions(
         lines += [
             f"[dim]Phase:[/dim]          {phase.value}  ({remaining} blocks / ~{minutes} min remaining)",
             "",
-            f"[dim]Start block:[/dim]    {spec.start_block}  ({spec.start_date or 'N/A'})",
-            f"[dim]Commit ends:[/dim]    {spec.commit_end_block}  ({spec.commit_end_date or 'N/A'})",
-            f"[dim]Scoring ends:[/dim]   {spec.scoring_end_block}  ({spec.scoring_end_date or 'N/A'})",
+            f"[dim]Start block:[/dim]    {spec.start_block}",
+            f"[dim]Commit ends:[/dim]    {spec.commit_end_block}",
+            f"[dim]Scoring ends:[/dim]   {spec.scoring_end_block}",
             "",
             "[bold]Benchmarks:[/bold]",
         ]
@@ -56,6 +56,5 @@ def competitions(
             "",
             f"[dim]Top N:[/dim]          {spec.top_n}",
             f"[dim]Emissions:[/dim]      {spec.emission_distribution}",
-            f"[dim]Eval backend:[/dim]   {spec.eval.backend}",
         ]
         console.print(Panel("\n".join(lines), title="Competition", border_style="cyan"))

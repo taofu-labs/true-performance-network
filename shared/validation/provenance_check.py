@@ -129,7 +129,6 @@ def _dequant_rows(tensor, row_ids: np.ndarray) -> np.ndarray:
  
  
 def _linear_cka(x: np.ndarray, y: np.ndarray) -> float:
-    print(x.shape)
     """Linear CKA of two (n, d) matrices, in [0, 1]. Invariant to orthogonal transforms + isotropic scale."""
     x, y = x - x.mean(0), y - y.mean(0)  # column-center: strip the shared anisotropic offset
     cross = np.linalg.norm(x.T @ y) ** 2

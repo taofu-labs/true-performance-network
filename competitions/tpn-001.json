@@ -8,10 +8,6 @@
   "commit_end_block": 4020160,
   "scoring_end_block": 4021600,
 
-  "start_date": "2026-06-01T00:00:00Z",
-  "commit_end_date": "2026-06-15T00:00:00Z",
-  "scoring_end_date": "2026-06-17T00:00:00Z",
-
   "top_n": 5,
   "emission_distribution": [0.40, 0.25, 0.20, 0.10, 0.05],
 
@@ -25,10 +21,5 @@
   },
 
   "reveal_grace_blocks": 150,
-  "score_tolerance": 0.02,
-
-  "eval": {
-    "backend": "stub",
-    "note": "Stub scoring only. Real container-based eval in a future release."
-  }
+  "score_tolerance": 0.02
 }

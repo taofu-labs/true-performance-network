@@ -19,11 +19,6 @@ class ModelRequirements(BaseModel):
     format: str = "gguf"
 
 
-class EvalConfig(BaseModel):
-    backend: str = "stub"
-    note: Optional[str] = None
-
-
 class CompetitionSpec(BaseModel):
     schema_version: int = 1
     id: str
@@ -31,15 +26,9 @@ class CompetitionSpec(BaseModel):
     description: Optional[str] = None
     model_repo: Optional[str] = None  # HF repo ID of the base model miners should optimize
 
-    # Phase boundaries — authoritative
     start_block: int
     commit_end_block: int
     scoring_end_block: int
-
-    # Human-readable dates — display only
-    start_date: Optional[str] = None
-    commit_end_date: Optional[str] = None
-    scoring_end_date: Optional[str] = None
 
     top_n: int = 5
     emission_distribution: List[float]
@@ -47,7 +36,6 @@ class CompetitionSpec(BaseModel):
     model_requirements: ModelRequirements = ModelRequirements()
     reveal_grace_blocks: int = 150
     score_tolerance: float = 0.02
-    eval: EvalConfig = EvalConfig()
 
     @model_validator(mode="after")
     def validate_emission_distribution(self):

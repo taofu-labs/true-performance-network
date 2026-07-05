@@ -8,10 +8,6 @@
   "commit_end_block": 200,
   "scoring_end_block": 1000,
 
-  "start_date": "2026-06-02T00:00:00Z",
-  "commit_end_date": "2026-06-02T01:00:00Z",
-  "scoring_end_date": "2026-06-02T02:00:00Z",
-
   "top_n": 2,
   "emission_distribution": [0.60, 0.40],
 
@@ -25,10 +21,5 @@
   },
 
   "reveal_grace_blocks": 10,
-  "score_tolerance": 0.02,
-
-  "eval": {
-    "backend": "stub",
-    "note": "Stub scoring only."
-  }
+  "score_tolerance": 0.02
 }

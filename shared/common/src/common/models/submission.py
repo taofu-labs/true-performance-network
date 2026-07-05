@@ -18,6 +18,7 @@ class MinerSubmission(BaseModel):
     file: str
     file_size: int
     file_sha256: str
+    huggingface_revision: str  # immutable HF commit SHA the model was uploaded at
 
     @field_validator("repository")
     @classmethod
@@ -25,6 +26,14 @@ class MinerSubmission(BaseModel):
         if v.startswith("https://") or v.startswith("http://"):
             raise ValueError("repository must be a bare HF repo ID (e.g. user/repo), not a URL")
         return v
+
+    @field_validator("huggingface_revision")
+    @classmethod
+    def revision_must_be_git_sha(cls, v: str) -> str:
+        # HF commit oids are 40-char git SHA-1; accept 7-64 hex to tolerate short/variant forms.
+        if not (7 <= len(v) <= 64) or not all(c in "0123456789abcdefABCDEF" for c in v):
+            raise ValueError("huggingface_revision must be a hex commit SHA (7-64 chars)")
+        return v.lower()
 
     @field_validator("file_sha256")
     @classmethod
@@ -70,6 +79,7 @@ def build_reveal_payload(
     file_sha256: str,
     file_size: int,
     claims: List[Claim],
+    huggingface_revision: str,
 ) -> str:
     """Minified JSON string submitted to chain via TLE encryption."""
     data = {
@@ -79,6 +89,7 @@ def build_reveal_payload(
         "file": file,
         "file_sha256": file_sha256,
         "file_size": file_size,
+        "huggingface_revision": huggingface_revision,
         "claims": [{"b": c.b, "s": c.s} for c in claims],
     }
     return json.dumps(data, separators=(",", ":"))

@@ -5,22 +5,24 @@ After commit_end_block the chain auto-decrypts TLE commitments and stores
 plaintext in RevealedCommitments storage. Validators read that storage directly.
 """
 from __future__ import annotations
+import sqlite3
 from typing import TYPE_CHECKING, Dict
 from loguru import logger
 
 if TYPE_CHECKING:
-    from bittensor.core.subtensor import Subtensor
+    from bittensor import Subtensor
 
 from common.models.submission import MinerSubmission, parse_reveal_payload
-from common.models.competition import  CompetitionSpec
+from common.models.competition import CompetitionSpec
 from common.chain import read_revealed_commitments
-from validator.punishment import is_banned
+from validator import store
 from common import settings
 
 
 def scan_reveals(
     subtensor: Subtensor,
     competition: CompetitionSpec,
+    conn: sqlite3.Connection,
 ) -> Dict[str, MinerSubmission]:
     """
     Read auto-revealed payloads from RevealedCommitments storage.
@@ -29,9 +31,9 @@ def scan_reveals(
     all_reveals = read_revealed_commitments(subtensor, settings.NETUID)
     is_fast_blocks = subtensor.is_fast_blocks()
     results: Dict[str, MinerSubmission] = {}
-    
+
     for hotkey, entries in all_reveals.items():
-        if is_banned(hotkey):
+        if store.is_banned(conn, hotkey):
             continue
         # Only accept reveals at the competition's commit_end_block
         for raw, reveal_block in entries:

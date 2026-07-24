@@ -13,8 +13,8 @@ import tenacity
 from common import settings as common_settings
 
 if TYPE_CHECKING:
-    from bittensor.core.subtensor import Subtensor
-    from bittensor_wallet import Wallet
+    from bittensor import Subtensor
+    from bittensor import Wallet
 
 
 def _log_subtensor_retry(retry_state):
@@ -34,7 +34,7 @@ def get_subtensor(network: Optional[str] = None) -> "Subtensor":
     """
     if not common_settings.BITTENSOR:
         raise Exception("BITTENSOR=False — subtensor disabled")
-    from bittensor.core.subtensor import Subtensor
+    from bittensor import Subtensor
     target = network or common_settings.NETWORK
     logger.info(f"Connecting to subtensor: {target}")
     return Subtensor(network=target)
@@ -46,7 +46,7 @@ def get_wallet(
     wallet_path: Optional[str] = None,
 ) -> "Wallet":
     """Return a Wallet instance for the given coldkey/hotkey."""
-    from bittensor_wallet import Wallet
+    from bittensor import Wallet
     kwargs = {"name": coldkey, "hotkey": hotkey}
     if wallet_path:
         kwargs["path"] = wallet_path
@@ -66,18 +66,34 @@ def timelocked_commit(
     The chain auto-decrypts at the corresponding drand round and stores
     the plaintext in RevealedCommitments storage.
     """
+    import bittensor
+    from bittensor import calls
+    from bittensor.intents.plan import Policy
+
     logger.info(
         f"timelocked_commit | hotkey={wallet.hotkey.ss58_address[:12]} "
         f"| blocks_until_reveal={blocks_until_reveal}"
     )
-    result = subtensor.set_reveal_commitment(
-        wallet=wallet,
-        netuid=netuid,
-        data=reveal_payload,
-        blocks_until_reveal=blocks_until_reveal,
-        block_time=block_time,
-    )
-    return result.success
+
+    sealed = bittensor.timelock.encrypt(reveal_payload, reveal_in=blocks_until_reveal * block_time)
+    info = {
+        "fields": [[{
+            "TimelockEncrypted": {"encrypted": sealed.ciphertext, "reveal_round": sealed.reveal_round}
+        }]]
+    }
+    call = calls.Commitments.set_commitment(netuid, info)
+
+    # submit_call is policy-gated; temporarily allow raw calls on this connection.
+    original_policy = subtensor.policy
+    subtensor.policy = Policy(allow_raw_calls=True)
+    try:
+        result = subtensor.submit_call(call, wallet, signer="hotkey")
+        return result.success
+    except Exception as e:
+        logger.error(f"timelocked_commit failed: {e}")
+        return False
+    finally:
+        subtensor.policy = original_policy
 
 
 def is_hotkey_registered(
@@ -87,24 +103,10 @@ def is_hotkey_registered(
 ) -> bool:
     """Returns True if hotkey is registered on netuid."""
     try:
-        return subtensor.is_hotkey_registered(hotkey_ss58=hotkey_ss58, netuid=netuid)
+        return subtensor.neurons.uid(hotkey_ss58, netuid) is not None
     except Exception as e:
         logger.warning(f"is_hotkey_registered check failed: {e}")
         return False
-
-
-def _strip_scale_prefix(s: str) -> str:
-    """
-    Strip the SCALE compact-length prefix baked into revealed commitment strings.
-    The substrate client SCALE-encodes the BoundedVec<u8> encrypted field before
-    TLE encryption, so the compact prefix is encrypted in and decrypted back out,
-    appearing as the first 1-4 characters of the revealed string.
-    """
-    if not s:
-        return s
-    mode = ord(s[0]) & 0b11
-    offset = 1 if mode == 0 else (2 if mode == 1 else 4)
-    return s[offset:]
 
 
 def read_revealed_commitments(
@@ -113,23 +115,20 @@ def read_revealed_commitments(
 ) -> dict[str, list[tuple[str, int]]]:
     """
     Returns {hotkey_ss58: [(plaintext_str, reveal_block), ...]} for all miners.
-    Reads RevealedCommitments storage directly via substrate query_map, bypassing
-    the SDK decoder which incorrectly assumes hex encoding.
+    Uses the metagraph's typed commitment map — decryption/decoding handled
+    internally by the SDK, each NeuronCommitment.revealed already a
+    (reveal_block, plaintext) history, oldest first.
     """
     try:
-        raw = subtensor.substrate.query_map(
-            "Commitments", "RevealedCommitments", params=[netuid]
-        )
+        metagraph = subtensor.subnets.metagraph(netuid)
         result: dict[str, list[tuple[str, int]]] = {}
-        for hotkey, entries in raw:
-            decoded = []
-            for raw_str, block in entries:
-                try:
-                    decoded.append((_strip_scale_prefix(raw_str), int(block)))
-                except Exception as e:
-                    logger.debug(f"Failed to decode reveal for {hotkey[:12]}: {e}")
-            if decoded:
-                result[hotkey] = decoded
+        if metagraph is None:
+            return result
+        for commitment in metagraph.commitments.values():
+            if commitment and commitment.revealed:
+                result[commitment.hotkey] = [
+                    (plaintext, block) for block, plaintext in commitment.revealed
+                ]
         return result
     except Exception as e:
         logger.warning(f"read_revealed_commitments failed: {e}")

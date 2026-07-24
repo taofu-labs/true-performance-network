@@ -106,7 +106,7 @@ For local development or non-standard setups, all commands accept these global f
 | `--network` | `finney` | Chain endpoint |
 | `--netuid` | subnet UID | Subnet UID |
 | `--wallet-path` | `~/.bittensor/wallets` | Override wallet directory |
-| `--competition-url` | GitHub raw URL | Override competition index |
+| `--leader-url` | leader validator's public URL | Override leader validator API (serves competition configs) |
 | `--block-time` | `12.0` | Seconds per block (use `0.300` for localnet) |
 
 Example:
@@ -115,7 +115,7 @@ uv run --package cli tpn \
   --network ws://localhost:9946 \
   --netuid 2 \
   --block-time 0.300 \
-  --competition-url ./competitions/localnet/index.json \
+  --leader-url http://localhost:9200 \
   --wallet-path ./wallets \
   commit -w charlie -c tpn-localnet
 ```

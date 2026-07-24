@@ -1,118 +1,268 @@
 """
-Stub scorer for TPN.
+Scorer for TPN — no full model download in the validator process.
 
-Verifies model integrity (SHA256, file size, GGUF header) and returns
-stub benchmark scores equal to the miner's self-reported scores.
-
-TODO: Replace _stub_scores() with container-based eval when ready.
-The container interface will be:
-    run_container_eval(gguf_path: str, tasks: List[BenchmarkTask]) -> Dict[str, float]
+Flow per scoring run:
+  1. precheck_one()   — HF metadata + container (provenance + RAM). Sync, sequential.
+  2. benchmark_one()  — submit all benchmarks, poll until done. Async, runs in parallel
+                        across miners (coordinator manages its own queue).
 """
-import os
-import tempfile
-from typing import Dict
+import asyncio
+import sqlite3
+import time
+from dataclasses import dataclass
+from enum import Enum, auto
+from typing import Dict, List, Optional, Union
+
+from huggingface_hub import HfApi
 from loguru import logger
 
+from common import settings as common_settings
 from common.models.competition import CompetitionSpec
 from common.models.submission import MinerSubmission, ScoringResult
-from competition.model_store import (
-    check_repo_public,
-    download_repo,
-    find_gguf_file,
-    sha256_file,
-    verify_gguf_header,
-)
-from competition.scoring import efficiency_score, passes_floors
-from validator.punishment import check_lying
+from competition.benchmark_client import Coordinator, RunStatusCode
+from competition.model_store import check_repo_public
+from competition.precheck_client import PrecheckContainer
+from competition.scoring import final_score, passes_floors, passes_memory_cap
+from validator import store
+
+_HF_RESOLVE = "https://huggingface.co/{repo}/resolve/{revision}/{file}"
+_hf_api = HfApi()
 
 
-def score_model(hotkey: str, submission: MinerSubmission, spec: CompetitionSpec) -> ScoringResult:
-    logger.info(f"Scoring {hotkey[:12]} | {submission.repository}")
+# ---------------------------------------------------------------------------
+# Outcome
+# ---------------------------------------------------------------------------
 
+class OutcomeKind(Enum):
+    SCORED = auto()
+    SKIPPED = auto()       # any non-lie failure → backfill
+    DISQUALIFIED = auto()  # max_memory lie → also backfill, but flagged
+
+
+@dataclass
+class ScoringOutcome:
+    kind: OutcomeKind
+    result: ScoringResult
+    reason: str = ""
+
+
+@dataclass
+class PrecheckPass:
+    """Carries everything benchmark_one needs — produced by precheck_one on success."""
+    hotkey: str
+    submission: MinerSubmission
+    gguf_file: str
+
+
+# ---------------------------------------------------------------------------
+# Phase 1: precheck (sync — runs sequentially, one at a time)
+# ---------------------------------------------------------------------------
+
+def precheck_one(
+    hotkey: str,
+    submission: MinerSubmission,
+    spec: CompetitionSpec,
+    precheck_ctr: Optional[PrecheckContainer],
+    conn: sqlite3.Connection,
+) -> Union[PrecheckPass, ScoringOutcome]:
+    """
+    Run HF metadata check + container precheck.
+    Returns PrecheckPass on success, ScoringOutcome on skip/disqualify.
+    Blocking — call via asyncio.to_thread.
+    """
     if not check_repo_public(submission.repository):
-        return _disqualify(hotkey, submission, "repo not publicly accessible")
+        return _skip(hotkey, submission, "repo not publicly accessible")
 
-    with tempfile.TemporaryDirectory() as tmpdir:
-        try:
-            local_dir = download_repo(submission.repository, local_dir=tmpdir)
-        except Exception as e:
-            return _disqualify(hotkey, submission, f"download failed: {e}")
+    try:
+        files = list(_hf_api.list_repo_files(
+            repo_id=submission.repository,
+            revision=submission.huggingface_revision,
+        ))
+    except Exception as e:
+        return _skip(hotkey, submission, f"HF API list_repo_files failed: {e}")
 
-        gguf_path = find_gguf_file(local_dir)
-        if not gguf_path:
-            return _disqualify(hotkey, submission, "no .gguf file found in repo")
+    gguf_file = next((f for f in files if f.endswith(".gguf")), None)
+    if not gguf_file:
+        return _skip(hotkey, submission, "no .gguf file found at revision")
 
-        if not verify_gguf_header(gguf_path):
-            return _disqualify(hotkey, submission, "invalid GGUF header")
-
-        actual_sha256 = sha256_file(gguf_path)
-        actual_size = os.path.getsize(gguf_path)
-
-        lying = check_lying(
-            hotkey=hotkey,
-            reveal_size=submission.file_size,
-            actual_size=actual_size,
-            reveal_sha256=submission.file_sha256,
-            actual_sha256=actual_sha256,
-            tolerance=spec.score_tolerance,
+    if precheck_ctr:
+        download_url = _HF_RESOLVE.format(
+            repo=submission.repository,
+            revision=submission.huggingface_revision,
+            file=gguf_file,
         )
-        if lying:
-            return ScoringResult(
-                hotkey=hotkey,
-                competition_id=submission.competition_id,
-                passed_floors=False,
-                disqualified=True,
-                disqualification_reason="integrity check failed",
-                actual_scores={},
-                final_score=0.0,
-                actual_file_size_bytes=actual_size,
-                lying_detected=True,
-                eval_backend="stub",
+        verdict = precheck_ctr.check(download_url, spec.ram_check_context_length)
+
+        if verdict.error:
+            logger.warning(f"{hotkey[:12]} precheck error: {verdict.error}")
+            return _skip(hotkey, submission, f"precheck error: {verdict.error}")
+
+        if verdict.provenance and not verdict.provenance.is_derivative:
+            notes = "; ".join(verdict.provenance.notes) or "CKA below threshold"
+            logger.warning(f"{hotkey[:12]} provenance fail: {notes}")
+            return _skip(hotkey, submission, f"provenance fail: {notes}")
+
+        if verdict.sha256 and verdict.sha256.lower() != submission.file_sha256:
+            reason = f"sha256 mismatch: revealed={submission.file_sha256[:12]} actual={verdict.sha256[:12]}"
+            store.ban(conn, hotkey, reason)
+            logger.warning(f"{hotkey[:12]} BANNED — {reason}")
+            return _skip(hotkey, submission, f"{reason} (hotkey banned)")
+
+        if verdict.ram:
+            if not verdict.ram.passed:
+                return _skip(hotkey, submission, "llama-cli load failed")
+
+            reported_bytes = submission.max_memory * 1024
+            measured_bytes = verdict.ram.ram_bytes
+            tolerance = getattr(common_settings, "RAM_CHECK_LYING_TOLERANCE", 0.01)
+            if reported_bytes > 0 and abs(measured_bytes - reported_bytes) / reported_bytes > tolerance:
+                diff = abs(measured_bytes - reported_bytes) / reported_bytes
+                logger.warning(f"{hotkey[:12]} max_memory lie: reported={reported_bytes} measured={measured_bytes} diff={diff:.1%}")
+                return _disqualify(
+                    hotkey, submission,
+                    f"max_memory lie: reported {reported_bytes}B measured {measured_bytes}B ({diff:.1%})",
+                )
+
+        logger.info(
+            f"{hotkey[:12]} precheck OK"
+            + (f" ram={verdict.ram.ram_bytes:,}B" if verdict.ram else "")
+            + (f" CKA={verdict.provenance.cka:.3f}" if verdict.provenance else "")
+        )
+
+    return PrecheckPass(hotkey=hotkey, submission=submission, gguf_file=gguf_file)
+
+
+# ---------------------------------------------------------------------------
+# Phase 2: benchmark (async — all miners run in parallel)
+# ---------------------------------------------------------------------------
+
+async def benchmark_one(
+    p: PrecheckPass,
+    spec: CompetitionSpec,
+    coordinator: Coordinator,
+    poll_interval: float = 30.0,
+    max_wait_seconds: float = None,
+) -> ScoringOutcome:
+    """Submit all benchmarks for one miner and poll until done."""
+    hotkey, submission = p.hotkey, p.submission
+    if max_wait_seconds is None:
+        max_wait_seconds = getattr(common_settings, "BENCHMARK_POLL_TIMEOUT_SECONDS", 5400)
+
+    run_ids: Dict[str, str] = {}
+    try:
+        for task in spec.benchmarks:
+            run_ids[task.name] = await asyncio.to_thread(
+                coordinator.submit,
+                submission.repository,
+                submission.huggingface_revision,
+                task.name,
+                [p.gguf_file],
             )
+    except Exception as e:
+        return _skip(hotkey, submission, f"benchmark submit error: {e}")
 
-        # STUB: use self-reported scores as actual scores
-        actual_scores = _stub_scores(submission, spec)
-        logger.info(f"[STUB] {hotkey[:12]} scores: {actual_scores}")
+    # Poll
+    actual_scores: Dict[str, float] = {}
+    pending = dict(run_ids)
+    deadline = time.monotonic() + max_wait_seconds
+    while pending:
+        if time.monotonic() >= deadline:
+            logger.warning(f"{hotkey[:12]} benchmark poll timeout after {max_wait_seconds:.0f}s, still pending: {list(pending)}")
+            return _skip(
+                hotkey, submission,
+                f"benchmark poll timeout after {max_wait_seconds:.0f}s, pending: {list(pending)}",
+                actual_scores=actual_scores,
+            )
+        await asyncio.sleep(poll_interval)
+        for bname in list(pending):
+            try:
+                status = await asyncio.to_thread(coordinator.poll, pending[bname])
+            except Exception as e:
+                return _skip(hotkey, submission, f"poll error: {e}")
+            if status.status == RunStatusCode.COMPLETED:
+                actual_scores[bname] = status.scores.get(bname, 0.0)
+                del pending[bname]
+                logger.debug(f"{hotkey[:12]} {bname}={actual_scores[bname]:.4f}")
+            elif status.status == RunStatusCode.FAILED:
+                return _skip(hotkey, submission, f"benchmark {bname} failed: {status.failure_reason or 'unknown'}")
 
-        passed, failures = passes_floors(actual_scores, spec.benchmarks)
-        final = efficiency_score(actual_scores, actual_size, spec.benchmarks) if passed else 0.0
+    # Floor check
+    passed, failures = passes_floors(actual_scores, spec.benchmarks)
+    if not passed:
+        logger.info(f"{hotkey[:12]} floor fail: {failures}")
+        return _skip(hotkey, submission, f"failed floors: {failures}", actual_scores=actual_scores)
 
-        return ScoringResult(
+    # Memory cap check (ram_ceiling competitions only)
+    if not passes_memory_cap(submission.max_memory, spec):
+        logger.info(f"{hotkey[:12]} memory cap fail: {submission.max_memory}KB > {spec.max_memory_kb}KB")
+        return _skip(
+            hotkey, submission,
+            f"exceeded memory cap: {submission.max_memory}KB > {spec.max_memory_kb}KB",
+            actual_scores=actual_scores,
+        )
+
+    final = final_score(actual_scores, submission.max_memory, spec)
+    logger.info(f"{hotkey[:12]} SCORED final={final:.6f} scores={actual_scores}")
+    return ScoringOutcome(
+        kind=OutcomeKind.SCORED,
+        result=ScoringResult(
             hotkey=hotkey,
             competition_id=submission.competition_id,
-            passed_floors=passed,
+            passed_floors=True,
             disqualified=False,
-            disqualification_reason=f"failed floors: {failures}" if not passed else None,
             actual_scores=actual_scores,
             final_score=final,
-            actual_file_size_bytes=actual_size,
+            max_memory_kb=submission.max_memory,
             lying_detected=False,
-            eval_backend="stub",
-        )
-
-
-def _stub_scores(submission: MinerSubmission, spec: CompetitionSpec) -> Dict[str, float]:
-    """
-    Returns self-reported scores as actual scores.
-    Replace this function with container eval when benchmarking is ready.
-    """
-    return {
-        task.name: min(submission.self_reported_scores.get(task.name, 0.0), 1.0)
-        for task in spec.benchmarks
-    }
-
-
-def _disqualify(hotkey: str, submission: MinerSubmission, reason: str) -> ScoringResult:
-    logger.warning(f"Disqualified {hotkey[:12]}: {reason}")
-    return ScoringResult(
-        hotkey=hotkey,
-        competition_id=submission.competition_id,
-        passed_floors=False,
-        disqualified=True,
-        disqualification_reason=reason,
-        actual_scores={},
-        final_score=0.0,
-        actual_file_size_bytes=0,
-        lying_detected=False,
-        eval_backend="stub",
+            eval_backend="coordinator",
+        ),
     )
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _skip(
+    hotkey: str,
+    submission: MinerSubmission,
+    reason: str,
+    actual_scores: Optional[Dict[str, float]] = None,
+) -> ScoringOutcome:
+    return ScoringOutcome(
+        kind=OutcomeKind.SKIPPED,
+        reason=reason,
+        result=ScoringResult(
+            hotkey=hotkey,
+            competition_id=submission.competition_id,
+            passed_floors=False,
+            disqualified=False,
+            disqualification_reason=reason,
+            actual_scores=actual_scores or {},
+            final_score=0.0,
+            max_memory_kb=submission.max_memory,
+            lying_detected=False,
+            eval_backend="coordinator",
+        ),
+    )
+
+
+def _disqualify(hotkey: str, submission: MinerSubmission, reason: str) -> ScoringOutcome:
+    logger.warning(f"DISQUALIFIED {hotkey[:12]}: {reason}")
+    return ScoringOutcome(
+        kind=OutcomeKind.DISQUALIFIED,
+        reason=reason,
+        result=ScoringResult(
+            hotkey=hotkey,
+            competition_id=submission.competition_id,
+            passed_floors=False,
+            disqualified=True,
+            disqualification_reason=reason,
+            actual_scores={},
+            final_score=0.0,
+            max_memory_kb=submission.max_memory,
+            lying_detected=True,
+            eval_backend="coordinator",
+        ),
+    )
+

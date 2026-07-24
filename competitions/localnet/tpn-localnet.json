@@ -5,11 +5,15 @@
   "description": "Local development competition. Block numbers adjusted for localnet.",
 
   "start_block": 0,
-  "commit_end_block": 200,
-  "scoring_end_block": 1000,
+  "commit_end_block": 2100,
+  "scoring_end_block": 6000,
+
+  "competition_type": "benchmark_floor",
 
   "top_n": 2,
   "emission_distribution": [0.60, 0.40],
+  "emission_weight": 1.0,
+  "distribution_blocks": 10000,
 
   "benchmarks": [
     { "name": "mmlu",      "min_score": 0.60, "weight": 0.5 },

@@ -24,8 +24,16 @@ Key env vars:
 | `WALLET_COLDKEY` | `my-validator` | Coldkey name in `~/.bittensor/wallets` |
 | `WALLET_HOTKEY` | `default` | Hotkey name |
 | `WALLET_PATH` | (bittensor default) | Override wallet directory |
-| `COMPETITION_INDEX_URL` | GitHub raw URL | Points to `competitions/index.json` |
 | `LAUNCH_HEALTH` | `True` | Enable health endpoint on port 9100 |
+| `VALIDATOR_MODE` | `leader` | `leader` or `follower` |
+| `LEADER_VALIDATOR_URL` | (none) | Follower mode only — leader's API base URL |
+| `ADMIN_API_KEY` | (none) | Leader mode only — bearer token gating `POST /v1/competitions`. Unset disables the write endpoint |
+
+Competition configs live in the leader's SQLite store now, not GitHub. Leader mode
+reads/writes them directly; follower mode and the CLI read them over the leader's
+`GET /v1/competitions` API. See `src/validator/README.md` for the full API and
+`scripts/seed_competitions.py` for seeding a new leader from the JSON files still
+kept in `competitions/` for reference.
 
 ## Running
 

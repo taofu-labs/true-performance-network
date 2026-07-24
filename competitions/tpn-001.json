@@ -1,19 +1,23 @@
 {
   "schema_version": 1,
   "id": "tpn-001",
-  "name": "TPN First Efficiency Competition",
+  "name": "TPN Ram Floor Competition",
   "description": "Find the most resource-efficient GGUF model that meets benchmark floors.",
 
   "start_block": 4000000,
   "commit_end_block": 4020160,
   "scoring_end_block": 4021600,
 
+  "competition_type": "benchmark_floor",
+
   "top_n": 5,
   "emission_distribution": [0.40, 0.25, 0.20, 0.10, 0.05],
+  "emission_weight": 0.5,
+  "distribution_blocks": 1440,
 
   "benchmarks": [
-    { "name": "mmlu",      "min_score": 0.60, "weight": 0.5 },
-    { "name": "hellaswag", "min_score": 0.55, "weight": 0.5 }
+    { "name": "mmlu",          "min_score": 0.60, "weight": 0.5 },
+    { "name": "hellaswag",     "min_score": 0.55, "weight": 0.5 }
   ],
 
   "model_requirements": {

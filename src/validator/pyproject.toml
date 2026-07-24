@@ -8,8 +8,7 @@ dependencies = [
     "aiohttp>=3.9.0",
     "common",
     "competition",
-    "bittensor>=10.4.0",
-    "bittensor-cli==9.22.0",
+    "bittensor==11.0.0",
 ]
 requires-python = ">=3.12"
 

@@ -41,13 +41,22 @@ NETWORK=ws://localhost:9946
 WALLET_COLDKEY=bob
 WALLET_HOTKEY=default
 WALLET_PATH=./wallets
-COMPETITION_INDEX_URL=./competitions/localnet/index.json
+VALIDATOR_MODE=leader
+ADMIN_API_KEY=localnet-dev-key
 ```
 
 Start validator manually against localnet:
 
 ```bash
 TPN_DOTENV_PATH=.env.localnet uv run --package validator python src/validator/main.py --clean
+```
+
+Seed it with the reference competition (one-time, or after `--clean`):
+
+```bash
+ADMIN_API_KEY=localnet-dev-key python scripts/seed_competitions.py \
+  --leader-url http://localhost:9200 \
+  --dir competitions/localnet
 ```
 
 ## CLI against localnet
@@ -57,7 +66,7 @@ TPN_DOTENV_PATH=.env.localnet uv run --package validator python src/validator/ma
 uv run --package cli tpn \
   --network ws://localhost:9946 \
   --netuid 2 \
-  --competition-url ./competitions/localnet/index.json \
+  --leader-url http://localhost:9200 \
   competitions
 
 # Register miner
@@ -72,18 +81,32 @@ uv run --package cli tpn \
   --network ws://localhost:9946 \
   --netuid 2 \
   --block-time 0.300 \
-  --competition-url ./competitions/localnet/index.json \
+  --leader-url http://localhost:9200 \
   --wallet-path ./wallets \
   commit -w charlie -c tpn-localnet
 ```
 
 ## Local competitions
 
-Localnet competition config lives in `competitions/localnet/`. The index at `competitions/localnet/index.json` lists `tpn-localnet.json`.
+Competition config lives in the leader validator's SQLite store, not in this repo,
+served over `GET /v1/competitions` and written via the bearer-token-gated
+`POST /v1/competitions` (see `src/validator/README.md`). `competitions/` (including
+`competitions/localnet/`) is kept only as historical/seed reference — no running code
+reads it anymore.
 
-Edit `competitions/localnet/tpn-localnet.json` to iterate on competition parameters — the validator and CLI reload on each cycle when using a local `--competition-url` path, no restart needed.
+To change a competition's parameters, re-POST its spec:
 
-Mainnet configs live in `competitions/` and are fetched from GitHub raw URLs by default.
+```bash
+curl -X POST http://localhost:9200/v1/competitions \
+  -H "Authorization: Bearer localnet-dev-key" \
+  -H "Content-Type: application/json" \
+  -d @competitions/localnet/tpn-localnet.json
+```
+
+This upserts by `id`, so editing the JSON file and re-running the command is the
+localnet iteration loop — no validator restart needed, but the CLI/follower client
+cache (`leader_config_client.py`, 10 min TTL) means changes may take a few minutes
+to show up unless you pass `--refresh` (CLI `competitions` command) or restart.
 
 ## Project structure
 
@@ -104,3 +127,8 @@ wallets/               Dev wallets (git-ignored)
 ```bash
 uv sync
 ```
+
+## Testing
+
+See `docs/Testing.md` for the unit test suite and how it relates to this
+localnet setup.

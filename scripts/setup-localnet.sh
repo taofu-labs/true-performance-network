@@ -4,8 +4,9 @@ set -euo pipefail
 CHAIN="ws://127.0.0.1:9946"
 NETUID=2
 
-# Dev accounts — pre-funded at genesis, created via --uri (no mnemonic/transfer needed)
-OWNER="alice"      # subnet owner (Alice coldkey = //Alice, pre-funded)
+# Dev accounts — coldkeys are pre-funded at genesis on this chain spec via the
+# standard substrate dev derivation (//Alice, //Bob, //Charlie).
+OWNER="alice"      # subnet owner (Alice coldkey, pre-funded)
 VALIDATOR="bob"    # validator
 MINER="charlie"    # miner
 
@@ -14,34 +15,64 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WALLET_PATH="$SCRIPT_DIR/../wallets"
 mkdir -p "$WALLET_PATH"
 
+BTCLI=(uv run --project "$SCRIPT_DIR/.." btcli)
+PYTHON=(uv run --project "$SCRIPT_DIR/.." python3)
+
 # ── Wallet creation ────────────────────────────────────────────────────────────
+# bittensor 11's CLI dropped --uri (SURI derivation), so coldkeys can't be
+# regenerated through btcli itself anymore. bittensor_core.Keypair still
+# implements the derivation though (just not wired to the CLI) — use it
+# directly to recreate the coldkey files if missing. Hotkeys are NOT derived
+# from a URI (they're random in this script, like upstream `wallet new_hotkey`)
+# so a missing hotkey just gets a fresh one + re-registration, no recovery needed.
 
-echo "==> Creating dev wallets in $WALLET_PATH ..."
+echo "==> Checking dev wallets in $WALLET_PATH ..."
 
-dev_wallet() {
-  local name="$1" uri="$2"
+recreate_coldkey() {
+  local name="$1" suri="$2"
+  mkdir -p "$WALLET_PATH/$name"
+  "${PYTHON[@]}" -c "
+import json
+from bittensor_core import Keypair, serialized_keypair_to_keyfile_data
+
+kp = Keypair.create_from_uri('//$suri')
+full = json.loads(serialized_keypair_to_keyfile_data(kp))
+pub = {k: v for k, v in full.items() if k != 'privateKey'}
+
+with open('$WALLET_PATH/$name/coldkey', 'w') as f:
+    json.dump(full, f)
+with open('$WALLET_PATH/$name/coldkeypub.txt', 'w') as f:
+    json.dump(pub, f)
+
+print(f'    Recreated {\"$name\"} coldkey from //$suri -> {kp.ss58_address}')
+"
+}
+
+SURI_alice="Alice"
+SURI_bob="Bob"
+SURI_charlie="Charlie"
+
+for name in "$OWNER" "$VALIDATOR" "$MINER"; do
   if [[ -f "$WALLET_PATH/$name/coldkeypub.txt" ]]; then
-    echo "    '$name' already exists, skipping"
+    echo "    '$name' coldkey already exists, skipping"
   else
-    # Coldkey from dev URI (pre-funded at genesis); hotkey is a fresh random key
-    btcli wallet new_coldkey \
-      --wallet.name "$name" \
-      --wallet.path "$WALLET_PATH" \
-      --uri "$uri" \
-      --no-use-password
-    btcli wallet new_hotkey \
-      --wallet.name "$name" \
-      --wallet.path "$WALLET_PATH" \
-      --wallet.hotkey default \
-      --no-use-password \
+    suri_var="SURI_${name}"
+    echo "==> Recreating '$name' coldkey from //${!suri_var} (deterministic, genesis-funded)..."
+    recreate_coldkey "$name" "${!suri_var}"
+  fi
+
+  if [[ -f "$WALLET_PATH/$name/hotkeys/default" ]]; then
+    echo "    '$name' hotkey already exists, skipping"
+  else
+    echo "==> Creating fresh hotkey for '$name' (not recoverable — random, will need (re)registration)..."
+    "${BTCLI[@]}" wallet new-hotkey \
+      --wallet "$name" \
+      --wallet-path "$WALLET_PATH" \
+      --wallet-hotkey default \
       --n-words 12 \
       --quiet
   fi
-}
-
-dev_wallet "$OWNER"     "Alice"
-dev_wallet "$VALIDATOR" "Bob"
-dev_wallet "$MINER"     "Charlie"
+done
 
 # ── Wait for chain ─────────────────────────────────────────────────────────────
 
@@ -62,36 +93,65 @@ done
 echo "==> Chain ready (block $block)"
 
 # ── Create subnet (Alice as owner) ────────────────────────────────────────────
+# subnet create no longer accepts identity flags (--subnet-name etc) — identity
+# is set separately via `sudo set-identity` after creation.
 
-if btcli subnet list --subtensor.chain_endpoint "$CHAIN" 2>&1 | grep -q "tpn"; then
+if "${BTCLI[@]}" subnet list --network "$CHAIN" --json 2>/dev/null | python3 -c "
+import json, sys
+subs = json.load(sys.stdin)
+sys.exit(0 if any(s.get('name') == 'TPN Localnet' for s in subs) else 1)
+"; then
   echo "==> TPN subnet already exists, skipping creation"
 else
   echo "==> Creating TPN subnet (Alice as owner)..."
-  btcli subnet create \
-    --wallet.name "$OWNER" \
-    --wallet.path "$WALLET_PATH" \
-    --wallet.hotkey default \
-    --subtensor.chain_endpoint "$CHAIN" \
-    --subnet-name "TPN Localnet" \
-    --github-repo "https://github.com/taofu-labs/tao-performance-network" \
-    --subnet-contact "dev@example.xyz" \
-    --subnet-url "https://github.com/taofu-labs/tao-performance-network" \
-    --discord-handle "taofu" \
+  "${BTCLI[@]}" subnet create \
+    --wallet "$OWNER" \
+    --wallet-path "$WALLET_PATH" \
+    --wallet-hotkey default \
+    --network "$CHAIN" \
+    --yes
+
+  # Netuid of the subnet just created is the highest netuid now on chain.
+  NETUID=$("${BTCLI[@]}" subnet list --network "$CHAIN" --json | python3 -c "
+import json, sys
+subs = json.load(sys.stdin)
+print(max(s['netuid'] for s in subs))
+")
+
+  echo "==> Setting subnet identity on netuid $NETUID..."
+  "${BTCLI[@]}" sudo set-identity \
+    --netuid "$NETUID" \
+    --wallet "$OWNER" \
+    --wallet-path "$WALLET_PATH" \
+    --wallet-hotkey default \
+    --network "$CHAIN" \
+    --name "TPN Localnet" \
+    --url "https://github.com/taofu-labs/tao-performance-network" \
     --description "TPN localnet dev subnet" \
-    --logo-url "https://github.com/taofu-labs/tao-performance-network" \
-    --additional-info "localnet" \
-    --no-mev-protection \
-    --no-prompt
+    --yes
 fi
+
+# Resolve netuid by name every run (survives reruns/duplicate-creation drift).
+NETUID=$("${BTCLI[@]}" subnet list --network "$CHAIN" --json | python3 -c "
+import json, sys
+subs = json.load(sys.stdin)
+matches = [s['netuid'] for s in subs if s.get('name') == 'TPN Localnet']
+print(max(matches))
+")
+echo "==> Using netuid $NETUID"
 
 # ── Helper: check if hotkey is registered on NETUID ───────────────────────────
 
 is_registered() {
   local wallet="$1"
-  btcli wallet overview \
-    --wallet.name "$wallet" \
-    --wallet.path "$WALLET_PATH" \
-    --subtensor.chain_endpoint "$CHAIN" 2>&1 | grep -q "netuid: $NETUID\|uid:"
+  local hotkey_ss58
+  hotkey_ss58=$(python3 -c "import json; print(json.load(open('$WALLET_PATH/$wallet/hotkeys/default'))['ss58Address'])" 2>/dev/null) || return 1
+
+  "${BTCLI[@]}" subnet metagraph "$NETUID" --network "$CHAIN" --json 2>/dev/null | python3 -c "
+import json, sys
+d = json.load(sys.stdin)
+sys.exit(0 if '$hotkey_ss58' in d.get('hotkeys', []) else 1)
+"
 }
 
 # ── Register validator ─────────────────────────────────────────────────────────
@@ -100,13 +160,13 @@ if is_registered "$VALIDATOR"; then
   echo "==> Validator (Bob) already registered on netuid $NETUID, skipping"
 else
   echo "==> Registering validator (Bob) on netuid $NETUID..."
-  btcli subnet register \
-    --wallet.name "$VALIDATOR" \
-    --wallet.path "$WALLET_PATH" \
-    --wallet.hotkey default \
+  "${BTCLI[@]}" subnet register \
+    --wallet "$VALIDATOR" \
+    --wallet-path "$WALLET_PATH" \
+    --wallet-hotkey default \
     --netuid "$NETUID" \
-    --subtensor.chain_endpoint "$CHAIN" \
-    --no-prompt
+    --network "$CHAIN" \
+    --yes
 fi
 
 # ── Register miner ─────────────────────────────────────────────────────────────
@@ -115,52 +175,50 @@ if is_registered "$MINER"; then
   echo "==> Miner (Charlie) already registered on netuid $NETUID, skipping"
 else
   echo "==> Registering miner (Charlie) on netuid $NETUID..."
-  btcli subnet register \
-    --wallet.name "$MINER" \
-    --wallet.path "$WALLET_PATH" \
-    --wallet.hotkey default \
+  "${BTCLI[@]}" subnet register \
+    --wallet "$MINER" \
+    --wallet-path "$WALLET_PATH" \
+    --wallet-hotkey default \
     --netuid "$NETUID" \
-    --subtensor.chain_endpoint "$CHAIN" \
-    --no-prompt \
+    --network "$CHAIN" \
+    --yes \
     --quiet
 fi
 
 # ── Start subnet emissions (enables staking) ──────────────────────────────────
 
 echo "==> Checking if subnet $NETUID can start..."
-btcli subnet check-start \
-  --netuid "$NETUID" \
-  --network "$CHAIN"
+"${BTCLI[@]}" sudo check-start --netuid "$NETUID" --network "$CHAIN"
 
 echo "==> Starting subnet $NETUID emissions (Alice as owner)..."
-btcli subnet start \
-  --wallet.name "$OWNER" \
-  --wallet.path "$WALLET_PATH" \
-  --wallet.hotkey default \
+"${BTCLI[@]}" sudo start \
+  --wallet "$OWNER" \
+  --wallet-path "$WALLET_PATH" \
+  --wallet-hotkey default \
   --netuid "$NETUID" \
-  --subtensor.chain_endpoint "$CHAIN" \
-  --no-prompt
+  --network "$CHAIN" \
+  --yes || echo "    (already started — ignoring)"
 
 # ── Stake validator ────────────────────────────────────────────────────────────
 
 echo "==> Adding stake to validator (Bob) on netuid $NETUID..."
-btcli stake add \
-  --wallet.name "$VALIDATOR" \
-  --wallet.path "$WALLET_PATH" \
-  --wallet.hotkey default \
-  --subtensor.chain_endpoint "$CHAIN" \
+"${BTCLI[@]}" stake add \
+  --wallet "$VALIDATOR" \
+  --wallet-path "$WALLET_PATH" \
+  --wallet-hotkey default \
+  --network "$CHAIN" \
   --netuid "$NETUID" \
-  --amount 10 \
-  --unsafe \
-  --no-mev-protection \
-  --no-prompt
+  --amount-tao 10 \
+  --no-slippage-protection \
+  --no-mev-shield \
+  --yes
 
 # ── Verify ─────────────────────────────────────────────────────────────────────
 
 echo "==> Verifying setup..."
-btcli subnet list --subtensor.chain_endpoint "$CHAIN"
-btcli wallet overview --wallet.name "$VALIDATOR" --wallet.path "$WALLET_PATH" --subtensor.chain_endpoint "$CHAIN"
-btcli wallet overview --wallet.name "$MINER"     --wallet.path "$WALLET_PATH" --subtensor.chain_endpoint "$CHAIN"
+"${BTCLI[@]}" subnet list --network "$CHAIN"
+"${BTCLI[@]}" wallet overview --wallet "$VALIDATOR" --wallet-path "$WALLET_PATH" --network "$CHAIN"
+"${BTCLI[@]}" wallet overview --wallet "$MINER"     --wallet-path "$WALLET_PATH" --network "$CHAIN"
 
 echo ""
 echo "==> Localnet setup complete!"

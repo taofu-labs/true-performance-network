@@ -16,8 +16,8 @@ class MinerSubmission(BaseModel):
     claims: List[Claim]
     repository: str  # bare HF repo ID: "user/repo"
     file: str
-    file_size: int
     file_sha256: str
+    max_memory: int  # maximum memory in KB the model consumes at inference time (self-reported)
     huggingface_revision: str  # immutable HF commit SHA the model was uploaded at
 
     @field_validator("repository")
@@ -42,11 +42,11 @@ class MinerSubmission(BaseModel):
             raise ValueError("file_sha256 must be 64 hex characters")
         return v.lower()
 
-    @field_validator("file_size")
+    @field_validator("max_memory")
     @classmethod
-    def size_must_be_positive(cls, v: int) -> int:
+    def max_memory_must_be_positive(cls, v: int) -> int:
         if v <= 0:
-            raise ValueError("file_size must be positive")
+            raise ValueError("max_memory must be positive")
         return v
 
     @property
@@ -65,7 +65,7 @@ class ScoringResult(BaseModel):
     disqualification_reason: Optional[str] = None
     actual_scores: Dict[str, float]
     final_score: float
-    actual_file_size_bytes: int
+    max_memory_kb: int
     lying_detected: bool
     eval_backend: str = "stub"
 
@@ -77,7 +77,7 @@ def build_reveal_payload(
     repository: str,
     file: str,
     file_sha256: str,
-    file_size: int,
+    max_memory: int,
     claims: List[Claim],
     huggingface_revision: str,
 ) -> str:
@@ -88,7 +88,7 @@ def build_reveal_payload(
         "repository": repository,
         "file": file,
         "file_sha256": file_sha256,
-        "file_size": file_size,
+        "max_memory": max_memory,
         "huggingface_revision": huggingface_revision,
         "claims": [{"b": c.b, "s": c.s} for c in claims],
     }

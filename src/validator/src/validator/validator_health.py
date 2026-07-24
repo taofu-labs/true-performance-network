@@ -18,10 +18,6 @@ class HealthServerMixin:
             return web.json_response(
                 {
                     "status": "healthy",
-                    "hotkey": getattr(self, "hotkey", "N/A"),
-                    "layer": getattr(self, "layer", "N/A"),
-                    "uid": getattr(self, "uid", "N/A"),
-                    "registered": getattr(self, "reregister_needed", True) is False,
                     "timestamp": time.time(),
                 }
             )

@@ -1,6 +1,7 @@
 {
   "schema_version": 1,
   "competitions": [
-    "tpn-001.json"
+    "tpn-001.json",
+    "tpn-002.json"
   ]
 }

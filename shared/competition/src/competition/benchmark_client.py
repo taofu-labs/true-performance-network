@@ -156,6 +156,7 @@ class HttpCoordinator:
         self._timeout = timeout
         self._benchmark_cache: Optional[set] = None
         self._completed_cache: Dict[str, Dict[str, float]] = {}
+        self._run_benchmark: Dict[str, str] = {}
 
     def list_benchmarks(self) -> set:
         if self._benchmark_cache is not None:
@@ -190,6 +191,7 @@ class HttpCoordinator:
         data = resp.json()
 
         run_id = data["run_id"]
+        self._run_benchmark[run_id] = benchmark
 
         # Coordinator may return a cached/completed result immediately
         if data.get("cached") and data.get("result"):
@@ -207,16 +209,17 @@ class HttpCoordinator:
         data = resp.json()
 
         raw_status = data.get("status", "")
+        benchmark = self._run_benchmark.get(run_id)
 
-        if raw_status == "completed":
-            scores = _extract_scores(data.get("result") or data.get("result_summary") or {}, None)
+        if raw_status in ("completed", "cache_hit"):
+            scores = _extract_scores(data.get("result"), benchmark) or _extract_scores(data.get("result_summary"), benchmark)
             return RunStatus(run_id=run_id, status=RunStatusCode.COMPLETED, scores=scores)
 
-        if raw_status == "failed":
+        if raw_status in ("failed", "cancelled", "cleanup_failed"):
             return RunStatus(
                 run_id=run_id,
                 status=RunStatusCode.FAILED,
-                failure_reason=data.get("failure_reason") or "unknown",
+                failure_reason=data.get("failure_reason") or f"run ended in terminal status {raw_status!r}",
             )
 
         if raw_status in _IN_PROGRESS:
@@ -227,12 +230,18 @@ class HttpCoordinator:
         return RunStatus(run_id=run_id, status=RunStatusCode.RUNNING)
 
 
-def _extract_scores(result: dict, benchmark: Optional[str]) -> Dict[str, float]:
+def _extract_scores(result: Optional[dict], benchmark: Optional[str]) -> Dict[str, float]:
     """
-    Coordinator result shape varies by engine/benchmark. Try common keys:
-    {"results": {"mmlu": {"acc,none": 0.7}}} (lm_eval)
-    {"mmlu": 0.7}
-    {"score": 0.7}  with benchmark name as key
+    Coordinator result shape varies by engine/benchmark and by which field was
+    populated (`result` vs. `/status`'s single-benchmark `result_summary` fallback).
+    Try, in order:
+    {"results": {"mmlu": {"acc,none": 0.7}}}  (lm_eval `result`)
+    {"mmlu": 0.7}                              (flat `result`, keyed by benchmark name)
+    {"score": 0.7, "prompt_tokens": ..., ...}  (`result_summary` — single benchmark,
+                                                 `score` must be mapped to `benchmark`
+                                                 explicitly, not grabbed as a flat dict —
+                                                 the other numeric keys are token/sample
+                                                 counts, not scores)
     """
     if not result:
         return {}
@@ -249,6 +258,13 @@ def _extract_scores(result: dict, benchmark: Optional[str]) -> Dict[str, float]:
                     scores[plain] = float(score)
         if scores:
             return scores
+
+    # result_summary shape: single benchmark's score, plus token/sample counts
+    # that must NOT be mistaken for per-benchmark scores.
+    if "score" in result and any(k in result for k in ("metrics", "prompt_tokens", "completion_tokens", "total_tokens", "samples")):
+        if benchmark and result.get("score") is not None:
+            return {benchmark: float(result["score"])}
+        return {}
 
     # Flat dict keyed by benchmark name
     flat = {k: float(v) for k, v in result.items() if isinstance(v, (int, float))}
@@ -306,5 +322,40 @@ if __name__ == "__main__":
     # Unknown run_id -> FAILED
     bad = c.poll("00000000-0000-0000-0000-000000000000")
     assert bad.status == RunStatusCode.FAILED
+
+    # _extract_scores: result_summary shape must map `score` to the polled
+    # benchmark name, not scoop up token/sample counts as extra "scores".
+    summary_scores = _extract_scores(
+        {"score": 0.42, "metrics": None, "prompt_tokens": 100, "completion_tokens": 50, "total_tokens": 150, "samples": 20},
+        "gsm8k",
+    )
+    assert summary_scores == {"gsm8k": 0.42}, f"result_summary extraction wrong: {summary_scores}"
+
+    # _extract_scores: lm_eval nested result still takes priority over any
+    # result_summary-shaped keys.
+    nested_scores = _extract_scores({"results": {"mmlu": {"acc,none": 0.71}}}, "mmlu")
+    assert nested_scores == {"mmlu": 0.71}, f"nested extraction wrong: {nested_scores}"
+
+    # HttpCoordinator.poll: cache_hit and cancelled/cleanup_failed terminal
+    # statuses must not be treated as still-running.
+    class _FakeResp:
+        def __init__(self, payload):
+            self._payload = payload
+        def raise_for_status(self):
+            pass
+        def json(self):
+            return self._payload
+
+    http = HttpCoordinator(base_url="http://example.invalid", api_key="k")
+    http._run_benchmark["run-cache-hit"] = "gsm8k"
+    http._session.get = lambda *a, **k: _FakeResp({"status": "cache_hit", "result": {"gsm8k": 0.9}})
+    cache_hit_status = http.poll("run-cache-hit")
+    assert cache_hit_status.status == RunStatusCode.COMPLETED, f"cache_hit not treated as completed: {cache_hit_status}"
+    assert cache_hit_status.scores == {"gsm8k": 0.9}, f"cache_hit scores wrong: {cache_hit_status.scores}"
+
+    for terminal_status in ("cancelled", "cleanup_failed"):
+        http._session.get = lambda *a, _s=terminal_status, **k: _FakeResp({"status": _s})
+        terminal = http.poll("run-terminal")
+        assert terminal.status == RunStatusCode.FAILED, f"{terminal_status} not treated as failed: {terminal}"
 
     print(f"OK — mmlu score={status.scores['mmlu']:.4f}, run_id={run_id}")

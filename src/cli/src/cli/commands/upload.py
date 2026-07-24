@@ -10,7 +10,7 @@ from rich.panel import Panel
 from cli.utils.config import load_competition_config, save_competition_config
 from cli.utils.context import get as get_ctx
 from cli.utils.hf_auth import ensure_hf_auth
-from competition.github_config import is_competition
+from competition.leader_config_client import is_competition
 
 console = Console()
 
@@ -24,7 +24,7 @@ def upload(
 ):
     """Upload your GGUF model to a private HuggingFace repo."""
     ctx = get_ctx()
-    if not is_competition(ctx.competition_url, competition_id):
+    if not is_competition(ctx.leader_url, competition_id):
         console.print(f"[red]Competition '{competition_id}' not found.[/red]")
         raise typer.Exit(1)
 
@@ -48,14 +48,12 @@ def upload(
     revision = commit_info.oid  # immutable commit SHA of this upload
 
     file_sha256 = _sha256(gguf_path)
-    file_size = gguf_path.stat().st_size
 
     cfg = load_competition_config(coldkey, hotkey_name, competition_id)
     cfg.update({
         "repository": repo_id,
         "file": gguf_path.name,
         "file_sha256": file_sha256,
-        "file_size": file_size,
         "huggingface_revision": revision,
     })
     save_competition_config(coldkey, hotkey_name, competition_id, cfg)
@@ -65,8 +63,7 @@ def upload(
         f"Repo:    [cyan]{repo_id}[/cyan]\n"
         f"File:    [dim]{gguf_path.name}[/dim]\n"
         f"Rev:     [dim]{revision}[/dim]\n"
-        f"SHA256:  [dim]{file_sha256}[/dim]\n"
-        f"Size:    [dim]{file_size:,} bytes[/dim]\n\n"
+        f"SHA256:  [dim]{file_sha256}[/dim]\n\n"
         f"[dim]Next step: run `tpn commit --wallet {coldkey} --hotkey {hotkey_name} --competition {competition_id}`[/dim]",
         title="Upload Complete",
         border_style="green",

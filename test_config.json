@@ -1,7 +1,0 @@
-{
-  "repository": "generalElephant/test_model",
-  "file": "Qwen3-0.6B.Q4_K_M.gguf",
-  "file_sha256": "dc4503da5d7cc7254055a86cd90e1a8c9d16c6ac71eb3a32b34bf48a1f4e0999",
-  "huggingface_revision": "741d99435e7d821ca699c23b799f50135ef14fb1",
-  "max_memory": 800000
-}

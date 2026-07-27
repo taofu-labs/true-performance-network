@@ -11,7 +11,7 @@ from cli.utils.context import (
     set_context,
     _DEFAULT_NETWORK,
     _DEFAULT_NETUID,
-    _DEFAULT_COMPETITION_URL,
+    _DEFAULT_LEADER_URL,
 )
 
 app = typer.Typer(
@@ -32,10 +32,10 @@ def main(
         "--netuid",
         help="Subnet UID",
     ),
-    competition_url: str = typer.Option(
-        _DEFAULT_COMPETITION_URL,
-        "--competition-url",
-        help="URL or path to competitions index.json (https://... or /abs/path/index.json)",
+    leader_url: str = typer.Option(
+        _DEFAULT_LEADER_URL,
+        "--leader-url",
+        help="Base URL of the leader validator's API (serves competition configs)",
     ),
     wallet_path: Optional[str] = typer.Option(
         None,
@@ -48,7 +48,7 @@ def main(
         help="Seconds per block (default 12.0 for mainnet; use 0.25 for fast-runtime localnet)",
     ),
 ):
-    set_context(network=network, netuid=netuid, competition_url=competition_url, wallet_path=wallet_path, block_time=block_time)
+    set_context(network=network, netuid=netuid, leader_url=leader_url, wallet_path=wallet_path, block_time=block_time)
 
 
 app.command("register")(register)

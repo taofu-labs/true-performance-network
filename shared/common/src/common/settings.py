@@ -1,4 +1,5 @@
 import os
+import sys
 from dotenv import load_dotenv
 from loguru import logger
 
@@ -11,23 +12,42 @@ if TPN_DOTENV_PATH:
 else:
     load_dotenv()  # silently try default .env; no warning if absent
 
+# Logging — DEBUG is dev-only (set via .env.localnet); prod stays at INFO.
+LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO")
+
 # Bittensor
 BITTENSOR = os.getenv("BITTENSOR", "True") == "True"
 NETUID = int(os.getenv("NETUID", 0))
 NETWORK = os.getenv("NETWORK", "finney")
 
-# Competition config index — points directly at index.json
-COMPETITION_INDEX_URL = os.getenv(
-    "COMPETITION_INDEX_URL",
-    "https://raw.githubusercontent.com/taofu-labs/tao-performance-network/main/competitions/index.json",
-)
-COMPETITION_REFRESH_INTERVAL = int(os.getenv("COMPETITION_REFRESH_INTERVAL", 600))
+# Validator role: "leader" runs chain scan/precheck/benchmark/score and serves the read API.
+# "follower" reads scoring results from a leader validator and sets weights from them.
+VALIDATOR_MODE: str = os.getenv("VALIDATOR_MODE", "leader")
 
 # HuggingFace — optional, only set on the validator that publishes the registry
 # If unset, registry publication is skipped silently
 HF_TOKEN: str | None = os.getenv("HF_TOKEN") or None
 HF_ORG: str | None = os.getenv("HF_ORG") or None
 
-# Minimum locked alpha a coldkey must have on the subnet hotkey to be eligible for scoring.
-# Compared against LockState.locked_mass (Balance in subnet alpha units).
-MIN_ALPHA_LOCK: float = float(os.getenv("MIN_ALPHA_LOCK", 100.0))
+# Benchmark coordinator
+BENCHMARK_BACKEND: str = os.getenv("BENCHMARK_BACKEND", "mock")  # "mock" | "http"
+COORDINATOR_BASE_URL: str = os.getenv("COORDINATOR_BASE_URL", "https://bench.trueperformancenetwork.com/api/coordinator")
+COORDINATOR_API_KEY: str | None = os.getenv("COORDINATOR_API_KEY") or None
+
+# Precheck container (provenance + RAM check)
+PRECHECK_IMAGE: str = os.getenv("PRECHECK_IMAGE", "ghcr.io/taofulabs/tpn-precheck")
+PRECHECK_HOST_PORT: int = int(os.getenv("PRECHECK_HOST_PORT", "8081"))
+RAM_CHECK_LYING_TOLERANCE: float = float(os.getenv("RAM_CHECK_LYING_TOLERANCE", "0.01"))
+
+# Max wall-clock seconds to poll a single benchmark run before giving up (skip, not fail-fast)
+BENCHMARK_POLL_TIMEOUT_SECONDS: int = int(os.getenv("BENCHMARK_POLL_TIMEOUT_SECONDS", "5400"))
+
+
+def configure_logging() -> None:
+    """Point loguru's default stderr handler at LOG_LEVEL.
+
+    Call once from a process entrypoint (validator/CLI main), not on import —
+    logging setup is a process-level side effect, not a settings default.
+    """
+    logger.remove()
+    logger.add(sys.stderr, level=LOG_LEVEL)

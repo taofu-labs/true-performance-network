@@ -1,4 +1,3 @@
-pyrightconfig.json
 *.csv
 */losses*.csv
 */activation_stats*.csv
@@ -26,11 +25,7 @@ wheels/
 .installed.cfg
 *.egg
 MANIFEST
-.env
-.env.*
-!.env.example
-.env.localnet
-wallets/
+.env*
 weights_log.csv
 *weight_cache*
 # UV package manager
@@ -38,6 +33,7 @@ weights_log.csv
 .venv/
 venv/
 ENV/
+pyrightconfig.json
 
 # Jupyter Notebook
 .ipynb_checkpoints
@@ -86,19 +82,14 @@ coverage.xml
 ehthumbs.db
 Thumbs.db
 
-# Activation storage
-activation_cache/
-activation_log.csv
-losses/
 *.csv
 *.log
 *.pt
-validated_activations/
+
 
 # Bittensor wallets
 ~/
 .bittensor/
 
-# Generated docker compose files
-compose.miners.yaml
-compose.validators.yaml
+/wallets
+/models/

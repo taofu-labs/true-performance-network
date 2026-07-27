@@ -4,7 +4,7 @@ from rich.console import Console
 from rich.panel import Panel
 from cli.utils.config import load_competition_config, identity_dir
 from cli.utils.context import get as get_ctx
-from competition.github_config import get_active_competitions, is_competition
+from competition.leader_config_client import get_active_competitions, is_competition
 
 console = Console()
 
@@ -17,18 +17,18 @@ def status(
     """Show your current submission status."""
     ctx = get_ctx()
 
-    if competition_id is not None and not is_competition(ctx.competition_url, competition_id):
+    if competition_id is not None and not is_competition(ctx.leader_url, competition_id):
         console.print(f"[red]Competition '{competition_id}' not found.[/red]")
         raise typer.Exit(1)
 
     current_block = 0
     try:
         from common.chain import get_subtensor
-        current_block = get_subtensor(ctx.network).get_current_block()
+        current_block = get_subtensor(ctx.network).block()
     except Exception:
         pass
 
-    active_specs = get_active_competitions(index_url=ctx.competition_url, current_block=current_block)
+    active_specs = get_active_competitions(base_url=ctx.leader_url, current_block=current_block)
     lines = [
         f"[dim]Wallet:[/dim]        {coldkey} / {hotkey_name}",
         f"[dim]Current block:[/dim] {current_block}",

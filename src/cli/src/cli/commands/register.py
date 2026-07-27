@@ -37,13 +37,14 @@ def register(
 
     cmd = [
         "btcli", "subnet", "register",
-        "--wallet.name", coldkey,
-        "--wallet.hotkey", hotkey,
+        "--wallet", coldkey,
+        "--wallet-hotkey", hotkey,
         "--netuid", str(ctx.netuid),
-        "--subtensor.network", ctx.network,
+        "--network", ctx.network,
+        "--yes",
     ]
     if ctx.wallet_path:
-        cmd += ["--wallet.path", ctx.wallet_path]
+        cmd += ["--wallet-path", ctx.wallet_path]
 
     console.print(f"[blue]Running: {' '.join(cmd)}[/blue]")
     result = subprocess.run(cmd)

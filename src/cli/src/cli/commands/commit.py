@@ -12,7 +12,7 @@ from cli.utils.config import load_competition_config, save_competition_config
 from cli.utils.context import get as get_ctx
 from common.chain import timelocked_commit, is_hotkey_registered, get_subtensor, get_wallet
 from common.models.submission import Claim, build_reveal_payload
-from competition.github_config import get_competition_by_id
+from competition.leader_config_client import get_competition_by_id
 
 console = Console()
 
@@ -33,7 +33,7 @@ def commit(
     coldkey_ss58 = wallet.coldkey.ss58_address
 
     subtensor = get_subtensor(ctx.network)
-    current_block = subtensor.get_current_block()
+    current_block = subtensor.block()
 
     # ── Registration ─────────────────────────────────────────────────
     if not is_hotkey_registered(subtensor, hotkey_ss58, ctx.netuid):
@@ -44,7 +44,7 @@ def commit(
         raise typer.Exit(1)
 
     # ── Competition valid + OPEN ─────────────────────────────────────
-    spec = get_competition_by_id(index_url=ctx.competition_url, competition_id=competition_id)
+    spec = get_competition_by_id(base_url=ctx.leader_url, competition_id=competition_id)
     if spec is None:
         console.print(f"[red]Competition '{competition_id}' not found.[/red]")
         raise typer.Exit(1)
@@ -67,7 +67,7 @@ def commit(
         cfg = load_competition_config(coldkey, hotkey_name, competition_id)
 
     # ── Validate upload fields ────────────────────────────────────────────────
-    missing = [f for f in ("repository", "file", "file_sha256", "file_size") if not cfg.get(f)]
+    missing = [f for f in ("repository", "file", "file_sha256", "huggingface_revision") if not cfg.get(f)]
     if missing:
         console.print(
             f"[red]Missing upload data: {', '.join(missing)}[/red]\n"
@@ -80,6 +80,14 @@ def commit(
     if parsed_claims is None:
         raise typer.Exit(1)
 
+    # ── Max memory — prompt if not already in config ──────────────────
+    max_memory = cfg.get("max_memory")
+    if not max_memory:
+        max_memory = typer.prompt("Max memory usage during inference (KB)", type=int)
+        while max_memory <= 0:
+            console.print("[red]max_memory must be > 0[/red]")
+            max_memory = typer.prompt("Max memory usage during inference (KB)", type=int)
+
     # ── Summary + confirmation ────────────────────────────────────────────────
     claims_display = ", ".join(f"{c.b}:{c.s}" for c in parsed_claims)
     console.print(Panel(
@@ -88,8 +96,9 @@ def commit(
         f"Competition:      [cyan]{competition_id}[/cyan] — {spec.name}\n"
         f"Repo:             [cyan]{cfg['repository']}[/cyan]\n"
         f"File:             [dim]{cfg['file']}[/dim]\n"
+        f"Rev:              [dim]{cfg['huggingface_revision']}[/dim]\n"
         f"SHA256:           [dim]{cfg['file_sha256'][:24]}...[/dim]\n"
-        f"Size:             [dim]{cfg['file_size']:,} bytes[/dim]\n"
+        f"Max memory:       [dim]{max_memory:,} KB[/dim]\n"
         f"Claims:           [dim]{claims_display}[/dim]\n"
         f"Auto-reveal at:   block [cyan]{spec.commit_end_block}[/cyan]",
         title="TimeLocked Commit",
@@ -105,17 +114,20 @@ def commit(
         repository=cfg["repository"],
         file=cfg["file"],
         file_sha256=cfg["file_sha256"],
-        file_size=cfg["file_size"],
+        max_memory=max_memory,
         claims=parsed_claims,
+        huggingface_revision=cfg["huggingface_revision"],
     )
 
     # ── Persist state ─────────────────────────────────────────────────────────
     cfg["claims"] = [{"b": c.b, "s": c.s} for c in parsed_claims]
+    cfg["max_memory"] = max_memory
     cfg["commit_end_block"] = spec.commit_end_block
     save_competition_config(coldkey, hotkey_name, competition_id, cfg)
 
     # ── Submit ────────────────────────────────────────────────────────────────
     if not dry_run:
+        current_block = subtensor.block()
         blocks_until_reveal = max(1, spec.commit_end_block - current_block)
         success = timelocked_commit(
             subtensor=subtensor,

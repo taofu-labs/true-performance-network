@@ -5,16 +5,40 @@ description = "TPN"
 authors = [{ name = "taofu.xyz" }]
 readme = "README.md"
 requires-python = ">=3.12"
-dependencies = []
+dependencies = ["common", "competition", "cli", "validator", "validation"]
 
 [tool.uv.sources]
 common = { workspace = true }
 competition = { workspace = true }
 cli = { workspace = true }
 validator = { workspace = true }
+validation = { workspace = true }
 
 [tool.uv.workspace]
 members = ["shared/*", "src/*"]
 
 [tool.uv]
 package = false
+
+[dependency-groups]
+dev = [
+    "pytest>=8.4.1",
+    "pytest-asyncio>=1.0.0",
+    "pytest-mock>=3.14.1",
+    "fastapi>=0.110.0",
+    "uvicorn>=0.29.0",
+    "huggingface_hub>=0.23.0",
+    "requests>=2.31.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = [
+    "shared/common/tests",
+    "shared/competition/tests",
+    "shared/validation/tests",
+    "src/validator/tests",
+    "src/cli/tests",
+]
+markers = [
+    "integration: exercises real external deps (docker/localnet); run manually, not part of default suite",
+]

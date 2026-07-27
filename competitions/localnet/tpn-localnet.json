@@ -5,15 +5,17 @@
   "description": "Local development competition. Block numbers adjusted for localnet.",
 
   "start_block": 0,
-  "commit_end_block": 200,
-  "scoring_end_block": 1000,
+  "commit_end_block": 100,
+  "scoring_end_block": 1200,
+  "reveal_grace_blocks": 10,
+  "score_tolerance": 0.02,
 
-  "start_date": "2026-06-02T00:00:00Z",
-  "commit_end_date": "2026-06-02T01:00:00Z",
-  "scoring_end_date": "2026-06-02T02:00:00Z",
+  "competition_type": "benchmark_floor",
 
   "top_n": 2,
   "emission_distribution": [0.60, 0.40],
+  "emission_weight": 0.5,
+  "distribution_blocks": 10000,
 
   "benchmarks": [
     { "name": "mmlu",      "min_score": 0.60, "weight": 0.5 },
@@ -22,13 +24,5 @@
 
   "model_requirements": {
     "format": "gguf"
-  },
-
-  "reveal_grace_blocks": 10,
-  "score_tolerance": 0.02,
-
-  "eval": {
-    "backend": "stub",
-    "note": "Stub scoring only."
   }
 }

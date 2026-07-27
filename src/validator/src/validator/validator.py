@@ -8,12 +8,26 @@ from loguru import logger
 from common import settings as common_settings
 from common.chain import get_subtensor, get_wallet
 from validator.validator_health import HealthServerMixin
+from validator.api import LeaderApiMixin
 from validator import settings as validator_settings
+from validator import store
 
 
-class Validator(HealthServerMixin):
-    def __init__(self, coldkey: str | None = None, wallet_hotkey: str | None = None, wallet=None):
+class Validator(HealthServerMixin, LeaderApiMixin):
+    def __init__(
+        self,
+        coldkey: str | None = None,
+        wallet_hotkey: str | None = None,
+        wallet=None,
+        subtensor=None,
+        metagraph=None,
+    ):
         super().__init__()
+
+        self.mode = common_settings.VALIDATOR_MODE
+        if self.mode not in ("leader", "follower"):
+            raise ValueError(f"VALIDATOR_MODE must be 'leader' or 'follower', got {self.mode!r}")
+
         self.wallet = wallet or get_wallet(
             coldkey=coldkey,
             hotkey=wallet_hotkey,
@@ -26,18 +40,23 @@ class Validator(HealthServerMixin):
         self._tasks_failed: int = 0
         self._last_heartbeat: float = time.time()
 
-        from validator.storage import PersistentSet, validator_storage_dir
-        self._scored: PersistentSet = PersistentSet(validator_storage_dir() / "scored.json")
+        self._db = store.init_db()
+
+        if self.mode == "follower":
+            from validator.leader_client import LeaderClient
+            self._leader_client = LeaderClient(validator_settings.LEADER_VALIDATOR_URL)
 
         logger.info(
-            f"Running Validator. Bittensor: {common_settings.BITTENSOR}. "
+            f"Running Validator (mode={self.mode}). Bittensor: {common_settings.BITTENSOR}. "
             f"Network: {common_settings.NETWORK}. Netuid: {common_settings.NETUID}"
         )
-        self.subtensor = get_subtensor()
-
-        self.metagraph = bt.Metagraph(netuid=common_settings.NETUID, lite=False, network=common_settings.NETWORK)
-
+        self.subtensor = subtensor
+        self.metagraph = metagraph
         if common_settings.BITTENSOR:
+            self.subtensor = subtensor or get_subtensor()
+            self.metagraph = metagraph or self.subtensor.subnets.metagraph(common_settings.NETUID)
+
+        if common_settings.BITTENSOR and self.metagraph is not None:
             try:
                 self.metagraph.hotkeys.index(self.wallet.hotkey.ss58_address)
             except ValueError:
@@ -46,19 +65,35 @@ class Validator(HealthServerMixin):
                     f"(network: {common_settings.NETWORK})"
                 )
 
-    async def _validator_loop(self):
-        """TPN validator loop — scans chain, scores models, sets weights."""
-        logger.info(f"🔄 Starting TPN validator loop for {self.hotkey[:8]}")
+    def _get_active_competitions(self, current_block: int):
+        """Active competitions from this validator's own source of truth.
+
+        Leader reads its local SQLite store directly (it owns the data).
+        Follower fetches from the leader's public /v1/competitions API.
+        """
+        from common.models.competition import CompetitionSpec
+
+        if self.mode == "leader":
+            specs = [CompetitionSpec.model_validate(s) for s in store.list_competitions(self._db)]
+            return [s for s in specs if s.is_active(current_block)]
+
+        from competition.leader_config_client import get_active_competitions
+        return get_active_competitions(
+            base_url=validator_settings.LEADER_VALIDATOR_URL, current_block=current_block
+        )
+
+    async def _leader_loop(self):
+        """Leader loop — scans chain, scores models, persists results, sets weights."""
+        logger.info(f"🔄 Starting leader loop for {self.hotkey[:8]}")
 
         while True:
             try:
-                current_block = self.subtensor.get_current_block()
-                self.metagraph.sync(subtensor=self.subtensor, lite=False)
+                current_block = self.subtensor.block()
+                self.metagraph = self.subtensor.subnets.metagraph(common_settings.NETUID)
 
-                from competition.github_config import get_active_competitions
                 from common.models.competition import CompetitionPhase
 
-                specs = get_active_competitions(index_url=common_settings.COMPETITION_INDEX_URL, current_block=current_block)
+                specs = self._get_active_competitions(current_block)
 
                 if not specs:
                     logger.info("No active competitions. Sleeping.")
@@ -66,6 +101,10 @@ class Validator(HealthServerMixin):
 
                 for spec in specs:
                     phase = spec.phase(current_block)
+
+                    if phase == CompetitionPhase.COMPLETE:
+                        continue
+
                     remaining = spec.blocks_until_next_phase(current_block)
                     logger.info(f"Block {current_block} | {spec.id} | {phase.value} | {remaining} blocks left")
 
@@ -73,65 +112,204 @@ class Validator(HealthServerMixin):
                         logger.debug(f"OPEN phase — waiting for commit_end_block {spec.commit_end_block}")
 
                     elif phase == CompetitionPhase.SCORING:
-                        if current_block >= spec.scoring_starts_at() and spec.id not in self._scored:
-                            await self._run_scoring(spec)
-                            self._scored.add(spec.id)
-
-                    elif phase == CompetitionPhase.COMPLETE:
-                        if spec.id not in self._scored:
-                            await self._run_scoring(spec)
-                            self._scored.add(spec.id)
+                        if current_block >= spec.scoring_starts_at() and not store.is_scored(self._db, spec.id):
+                            await self._run_scoring(spec, current_block)
+                            store.mark_scored(self._db, spec.id)
 
             except Exception as e:
-                logger.exception(f"Validator loop error: {e}")
+                logger.exception(f"Leader loop error: {e}")
             finally:
                 await asyncio.sleep(validator_settings.VALIDATOR_LOOP_INTERVAL)
 
-    async def _run_scoring(self, spec):
+    async def _follower_loop(self):
+        """Follower loop — parses competitions, reads scoring results from the leader, sets weights."""
+        logger.info(f"🔄 Starting follower loop for {self.hotkey[:8]} (leader={validator_settings.LEADER_VALIDATOR_URL})")
+
+        while True:
+            try:
+                self.metagraph = self.subtensor.subnets.metagraph(common_settings.NETUID)
+
+                from common.models.competition import CompetitionPhase
+                from competition.scoring import compute_emission_weights
+                from common.models.submission import ScoringResult
+
+                current_block = self.subtensor.block()
+                specs = self._get_active_competitions(current_block)
+
+                for spec in specs:
+                    if store.is_scored(self._db, spec.id):
+                        continue
+                    phase = spec.phase(current_block)
+                    if phase not in (CompetitionPhase.SCORING, CompetitionPhase.DISTRIBUTING, CompetitionPhase.COMPLETE):
+                        continue
+
+                    runs = self._leader_client.get_scoring_results(spec.id)
+                    if not runs:
+                        logger.debug(f"{spec.id}: no scoring results from leader yet")
+                        continue
+
+                    latest = runs[-1]
+                    ranked = sorted(
+                        [ScoringResult(**r) for r in latest["results"]],
+                        key=lambda r: r.final_score,
+                        reverse=True,
+                    )
+                    hotkey_weights = compute_emission_weights(ranked, spec.emission_distribution)
+
+                    logger.info(f"{spec.id}: following leader run {latest['run_id']} — weights: "
+                                f"{[(k[:8], v) for k, v in hotkey_weights.items() if v > 0]}")
+                    store.record_weights(self._db, spec.id, hotkey_weights)
+                    store.mark_scored(self._db, spec.id)
+
+            except Exception as e:
+                logger.exception(f"Follower loop error: {e}")
+            finally:
+                await asyncio.sleep(validator_settings.FOLLOWER_POLL_INTERVAL)
+
+    async def _run_scoring(self, spec, current_block: int):
         from validator.chain_scanner import scan_reveals
-        from validator.scorer import score_model
+        from validator.scorer import precheck_one, benchmark_one, PrecheckPass, ScoringOutcome
+        from competition.benchmark_client import make_coordinator
+        from competition.precheck_client import PrecheckContainer
         from competition.scoring import sort_by_self_reported, compute_emission_weights
+        from validator import settings as validator_settings
 
         logger.info(f"🏆 Scoring competition {spec.id}")
 
-        reveals = scan_reveals(self.subtensor, spec)
+        reveals = scan_reveals(self.subtensor, spec, self._db)
+        logger.debug(f"scan_reveals returned {len(reveals)} reveal(s): {list(reveals.keys())}")
         if not reveals:
             logger.warning("No valid reveals. Skipping weight update.")
             return
 
-        # Filter: only hotkeys registered on subnet
         registered = set(self.metagraph.hotkeys)
         reveals = {hk: sub for hk, sub in reveals.items() if hk in registered}
+        logger.debug(f"{len(reveals)} reveal(s) from registered hotkeys: {list(reveals.keys())}")
         if not reveals:
             logger.warning("No reveals from registered hotkeys. Skipping weight update.")
             return
 
-        top_n = sort_by_self_reported(reveals, spec)[: spec.top_n]
-        results = [score_model(hotkey, submission, spec) for hotkey, submission in top_n]
-        ranked = sorted(results, key=lambda r: r.final_score, reverse=True)
+        ranked_candidates = sort_by_self_reported(reveals, spec)
+        logger.debug(f"Ranked candidates by self-reported score: {[hk[:12] for hk, _ in ranked_candidates]}")
+        coordinator = make_coordinator()
+
+        try:
+            available = await asyncio.to_thread(coordinator.list_benchmarks)
+            logger.debug(f"Coordinator available benchmarks: {available}")
+            missing = {t.name for t in spec.benchmarks} - available
+            if missing:
+                logger.error(f"Coordinator missing benchmarks {missing} — aborting scoring")
+                return
+        except Exception as e:
+            logger.error(f"Cannot reach coordinator: {e} — aborting scoring")
+            return
+
+        precheck_ctr: PrecheckContainer | None = PrecheckContainer(base_repo=spec.model_repo)
+        try:
+            await asyncio.to_thread(precheck_ctr.start)
+        except Exception as e:
+            logger.error(f"Precheck container failed to start: {e} — skipping precheck")
+            precheck_ctr = None
+
+        # Phase 1: sequential precheck — backfill on skip OR disqualify until top_n pass
+        passed: list[PrecheckPass] = []
+        all_outcomes: list[ScoringOutcome] = []
+        try:
+            for hotkey, submission in ranked_candidates:
+                result = await asyncio.to_thread(precheck_one, hotkey, submission, spec, precheck_ctr, self._db)
+                if isinstance(result, PrecheckPass):
+                    passed.append(result)
+                    if len(passed) == spec.top_n:
+                        break
+                else:
+                    all_outcomes.append(result)
+                    logger.info(f"{result.kind.name} {hotkey[:12]}: {result.reason} — backfilling")
+        finally:
+            if precheck_ctr:
+                try:
+                    await asyncio.to_thread(precheck_ctr.stop)
+                except Exception as e:
+                    logger.warning(f"Precheck container stop error: {e}")
+
+        logger.debug(f"Precheck done: {len(passed)} passed, {len(all_outcomes)} skipped/disqualified so far")
+        if not passed:
+            logger.warning("No submissions passed precheck. Skipping weight update.")
+            return
+
+        # Phase 2: parallel benchmark — all passed miners run concurrently
+        poll_interval = getattr(validator_settings, "BENCHMARK_POLL_INTERVAL", 30.0)
+        benchmark_outcomes = await asyncio.gather(*[
+            benchmark_one(p, spec, coordinator, poll_interval)
+            for p in passed
+        ])
+        all_outcomes.extend(benchmark_outcomes)
+        logger.debug(f"Benchmark done: {len(benchmark_outcomes)} outcome(s)")
+
+        all_results = [o.result for o in all_outcomes]
+        ranked = sorted(all_results, key=lambda r: r.final_score, reverse=True)
         hotkey_weights = compute_emission_weights(ranked, spec.emission_distribution)
+        logger.debug(f"Final ranking: {[(r.hotkey[:12], r.final_score) for r in ranked]}")
+        logger.debug(f"Emission weights: {hotkey_weights}")
 
-        # Convert hotkey → UID for set_weights (process_weights_for_netuid expects int UIDs)
-        hotkey_to_uid = {hk: int(uid) for uid, hk in zip(self.metagraph.uids.tolist(), self.metagraph.hotkeys)}
-        uid_weights = {
-            hotkey_to_uid[hk]: w
-            for hk, w in hotkey_weights.items()
-            if hk in hotkey_to_uid
-        }
+        store.record_scoring_run(self._db, spec.id, current_block, all_outcomes, reveals)
+        store.record_weights(self._db, spec.id, hotkey_weights)
 
-        logger.info(f"Weights: {[(k[:8], v) for k, v in hotkey_weights.items() if v > 0]}")
+        logger.info(f"Weights computed: {[(k[:8], v) for k, v in hotkey_weights.items() if v > 0]}")
+
+    async def _compute_and_set_aggregate_weights(self, current_block: int) -> bool:
+        """
+        Find every competition currently in its post-scoring distribution
+        window, sum their recorded per-hotkey weights (scaled by each
+        competition's emission_weight), and push the result to chain.
+
+        Returns True if weights were set (at least one competition was
+        distributing), False if there was nothing to distribute this tick
+        (caller should fall back to copy_weights_from_chain in that case).
+        """
+        from competition.scoring import aggregate_competition_weights
+
+        specs = self._get_active_competitions(current_block)
+        distributing = []
+        for spec in specs:
+            if not spec.is_distributing(current_block):
+                continue
+            weights = store.latest_weights_for_competition(self._db, spec.id)
+            if weights is None:
+                logger.warning(f"{spec.id} is distributing but has no recorded weights yet — skipping")
+                continue
+            distributing.append((spec, weights))
+
+        if not distributing:
+            return False
+
+        registered = set(self.metagraph.hotkeys)
+        hotkey_weights = aggregate_competition_weights(distributing, registered)
+
+        hotkey_to_uid = {hk: uid for uid, hk in enumerate(self.metagraph.hotkeys)}
+        uid_weights = {hotkey_to_uid[hk]: w for hk, w in hotkey_weights.items() if hk in hotkey_to_uid}
+
+        if not uid_weights:
+            return False
+
+        logger.info(f"Aggregated weights across {len(distributing)} competitions: "
+                    f"{[(k[:8], round(v, 4)) for k, v in hotkey_weights.items() if v > 0]}")
+
+        # bt.set_weights only rescales among submitted uids — it never tops up
+        # a shortfall on its own, so any unallocated share must be burned to
+        # uid 0 explicitly or the miners present silently inherit it.
+        total = sum(uid_weights.values())
+        remainder = 1.0 - total
+        if remainder > 1e-9:
+            uid_weights[0] = uid_weights.get(0, 0.0) + remainder
+            logger.info(f"Burning unallocated weight {remainder:.4f} to uid 0")
+
         await self.set_weights(weights=uid_weights)
-
-        # Registry publication — only runs if HF_TOKEN and HF_ORG are configured
-        from common import settings as common_settings
-        if common_settings.HF_TOKEN and common_settings.HF_ORG:
-            logger.info(f"Publishing registry for {spec.id} to {common_settings.HF_ORG}")
-            # TODO: implement registry publication
-        else:
-            logger.debug("HF_TOKEN/HF_ORG not set — skipping registry publication")
+        return True
 
     async def weight_loop(self):
-        """Weight loop — periodically copies weights from chain as fallback."""
+        """Weight loop — pushes aggregated competition weights to chain, falling
+        back to copying weights from other validators when nothing is currently
+        distributing."""
         loop_count = 0
         logger.info(f"🔄 Starting weight loop for validator {self.hotkey[:8]}")
 
@@ -139,9 +317,14 @@ class Validator(HealthServerMixin):
             loop_count += 1
             try:
                 logger.debug(f"Weight loop iteration {loop_count} starting")
-                self.metagraph.sync(subtensor=self.subtensor, lite=False)
-                logger.debug("VALIDATOR: WEIGHT LOOP RUNNING — copying weights from chain")
-                await self.set_weights(weights=self.copy_weights_from_chain())
+                self.metagraph = self.subtensor.subnets.metagraph(common_settings.NETUID)
+                current_block = self.subtensor.block()
+
+                distributed = await self._compute_and_set_aggregate_weights(current_block)
+                if not distributed:
+                    logger.debug("No competitions currently distributing — falling back to copy_weights_from_chain")
+                    await self.set_weights(weights=self.copy_weights_from_chain())
+
                 logger.debug(f"Weight loop iteration {loop_count} completed successfully")
 
             except Exception as e:
@@ -158,7 +341,7 @@ class Validator(HealthServerMixin):
                 await asyncio.sleep(validator_settings.WEIGHT_SUBMIT_INTERVAL)
 
     async def run_validator(self):
-        logger.info("🚀 Starting validator")
+        logger.info(f"🚀 Starting validator (mode={self.mode})")
         # Start the healthcheck server
         if validator_settings.LAUNCH_HEALTH:
             await self._start_health_server()
@@ -167,6 +350,11 @@ class Validator(HealthServerMixin):
             logger.warning(
                 "⚠️ Validator healthcheck API not configured in settings (VALIDATOR_HEALTH_PORT missing). Skipping."
             )
+
+        if self.mode == "leader":
+            await self._start_leader_api()
+
+        scoring_loop = self._leader_loop if self.mode == "leader" else self._follower_loop
 
         # Task management state
         self._weight_task = None
@@ -226,7 +414,7 @@ class Validator(HealthServerMixin):
                     logger.info(
                         f"🔄 Starting/restarting validator loop task (attempt {task_restart_count['validator_loop'] + 1})"
                     )
-                    self._validator_task = asyncio.create_task(self._validator_loop())
+                    self._validator_task = asyncio.create_task(scoring_loop())
 
                 # Wait for either task to complete (indicating failure since they run forever)
                 logger.debug("🔍 Monitoring tasks for failures...")
@@ -285,9 +473,12 @@ class Validator(HealthServerMixin):
             logger.warning("Metagraph not initialized, skipping weight submission")
             return
 
+        if not weights:
+            logger.warning("No weights to submit, skipping")
+            return
+
         try:
             uids, scores = zip(*weights.items())
-            uids = np.array(uids)
             scores = np.array(scores)
 
             if np.isnan(scores).any():
@@ -298,55 +489,53 @@ class Validator(HealthServerMixin):
                 logger.warning("All scores are zero, skipping weight submission")
                 return
 
-            (
-                processed_weight_uids,
-                processed_weights,
-            ) = bt.utils.weight_utils.process_weights_for_netuid(
-                uids=uids,
-                weights=scores,
-                netuid=int(common_settings.NETUID),
-                subtensor=self.subtensor,
-                metagraph=self.metagraph,
-            )
-
-            weight_dict = dict(zip(processed_weight_uids.tolist(), processed_weights.tolist()))
+            weight_dict = dict(zip(uids, scores.tolist()))
             logger.info(f"Setting weights for {len(weight_dict)} miners")
             logger.debug(f"Weight details: {weight_dict}")
 
-            success, response = self.subtensor.set_weights(
+            result = bt.set_weights(
+                int(common_settings.NETUID),
+                weight_dict,
                 wallet=self.wallet,
-                netuid=int(common_settings.NETUID),
-                uids=processed_weight_uids,
-                weights=processed_weights,
-                wait_for_finalization=False,
+                network=common_settings.NETWORK,
                 version_key=common_settings.__SPEC_VERSION__,
             )
 
-            if success:
+            if result.success:
                 logger.success("Successfully submitted weights to Bittensor.")
-                logger.debug(f"Response: {response}")
+                logger.debug(f"Response: {result}")
             else:
                 logger.error("Failed to submit weights to Bittensor")
-                logger.error(f"Response: {response}")
+                logger.error(f"Response: {result}")
 
         except Exception as e:
             logger.exception(f"Error submitting weights to Bittensor: {e}")
 
     def copy_weights_from_chain(self) -> dict[int, float]:
-        """Copy weights from the chain to the validator."""
-        self.metagraph.sync(subtensor=self.subtensor, lite=False)
+        """Copy weights from the chain to the validator: each validator's submitted
+        weight row, stake-weighted-averaged across validators into one consensus
+        weight per miner uid."""
+        self.metagraph = self.subtensor.subnets.metagraph(common_settings.NETUID)
+        validators = self.metagraph.validators
 
-        valid_indices = np.where(self.metagraph.validator_permit)[0]
-        valid_weights = self.metagraph.weights[valid_indices]
-        valid_stakes = self.metagraph.stake[valid_indices]
-        normalized_stakes = valid_stakes / np.sum(valid_stakes)
-        stake_weighted_average = np.dot(normalized_stakes, valid_weights).astype(float).tolist()
-
-        if len(self.metagraph.uids) == 0:
+        if not validators:
             logger.warning("No valid indices found in metagraph, returning empty weights")
             return {}
 
-        return dict(zip(self.metagraph.uids, list(stake_weighted_average)))
+        weight_rows = self.subtensor.weights.weights(int(common_settings.NETUID))
+        total_stake = sum(v.total_stake.alpha for v in validators)
+        if total_stake == 0:
+            logger.warning("Validators have zero total stake, returning empty weights")
+            return {}
+
+        consensus: dict[int, float] = {}
+        for validator in validators:
+            row = weight_rows.get(validator.uid, {})
+            stake_fraction = validator.total_stake.alpha / total_stake
+            for miner_uid, fraction in row.items():
+                consensus[miner_uid] = consensus.get(miner_uid, 0.0) + stake_fraction * fraction
+
+        return consensus
 
     async def get_validator_status(self) -> dict:
         """Get current validator status for monitoring, including task states."""

@@ -5,7 +5,7 @@ from rich.panel import Panel
 from cli.utils.config import load_competition_config
 from cli.utils.context import get as get_ctx
 from cli.utils.hf_auth import ensure_hf_auth
-from competition.github_config import is_competition
+from competition.leader_config_client import is_competition
 
 console = Console()
 
@@ -17,7 +17,7 @@ def publish(
 ):
     """Make your HuggingFace repo public so validators can download your model."""
     ctx = get_ctx()
-    if not is_competition(ctx.competition_url, competition_id):
+    if not is_competition(ctx.leader_url, competition_id):
         console.print(f"[red]Competition '{competition_id}' not found.[/red]")
         raise typer.Exit(1)
 

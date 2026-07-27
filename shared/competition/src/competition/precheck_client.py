@@ -119,7 +119,7 @@ class PrecheckContainer:
             raise RuntimeError("PrecheckContainer already started")
 
         name = f"tpn-precheck-{uuid.uuid4().hex[:8]}"
-        cmd = ["docker", "run", "-d", "--name", name, "-p", f"{self._host_port}:8080", "--rm",
+        cmd = ["docker", "run", "-d", "--name", name, "-p", f"127.0.0.1:{self._host_port}:8080", "--rm",
                "-e", f"PRECHECK_LOG_LEVEL={LOG_LEVEL}"]
         if self._base_repo:
             cmd += ["-e", f"BASE_MODEL_REPO={self._base_repo}",

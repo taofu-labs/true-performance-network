@@ -18,7 +18,8 @@ Start a fast-runtime subtensor localnet, create dev wallets, register subnet and
 This does in order:
 1. Starts subtensor via `docker/localnet/docker-compose.yml`
 2. Runs `scripts/setup-localnet.sh` — creates wallets (alice/bob/charlie), creates subnet on netuid 2, registers validator (bob) and miner (charlie), starts emissions
-3. Starts the validator with `TPN_DOTENV_PATH=.env.localnet`
+3. Starts the validator with `TPN_DOTENV_PATH=.env.localnet --clean`, waits for its health endpoint (port 9100)
+4. Seeds the reference competition via `scripts/push_competition.py`, then leaves the validator running
 
 Dev wallets are stored in `./wallets/` (not `~/.bittensor/wallets`).
 
@@ -51,13 +52,19 @@ Start validator manually against localnet:
 TPN_DOTENV_PATH=.env.localnet uv run --package validator python src/validator/main.py --clean
 ```
 
-Seed it with the reference competition (one-time, or after `--clean`):
+Seed it with the reference competition (one-time, or after `--clean`) — this is what
+`dev.sh` runs automatically, `push_competition.py` upserts a single spec file by `id`:
 
 ```bash
-ADMIN_API_KEY=localnet-dev-key python scripts/seed_competitions.py \
+ADMIN_API_KEY=localnet-dev-key uv run scripts/push_competition.py \
   --leader-url http://localhost:9200 \
-  --dir competitions/localnet
+  competitions/localnet/tpn-localnet.json
 ```
+
+`scripts/seed_competitions.py` is a separate, one-time bulk-migration script — it reads
+an `index.json` and POSTs every listed spec in a directory. Use it only when seeding a
+leader from scratch with the full mainnet competition set (`--dir competitions`), not
+for the single-file localnet iteration loop.
 
 ## CLI against localnet
 
@@ -94,7 +101,8 @@ served over `GET /v1/competitions` and written via the bearer-token-gated
 `competitions/localnet/`) is kept only as historical/seed reference — no running code
 reads it anymore.
 
-To change a competition's parameters, re-POST its spec:
+To change a competition's parameters, re-POST its spec (equivalent to
+`push_competition.py`, shown above, or raw curl):
 
 ```bash
 curl -X POST http://localhost:9200/v1/competitions \
@@ -116,8 +124,10 @@ docker/                Docker configs (localnet subtensor)
 scripts/               Operational scripts (autoupdater, dev setup)
 shared/common/         Chain, models, settings shared by all packages
 shared/competition/    Competition specs, scoring, model store
+shared/validation/     Provenance + RAM precheck service (Docker)
 src/cli/               Miner CLI (tpn)
 src/validator/         Validator
+install_cli.sh         Installs uv + the tpn CLI
 wallets/               Dev wallets (git-ignored)
 ```
 

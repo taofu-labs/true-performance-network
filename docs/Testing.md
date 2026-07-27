@@ -23,9 +23,14 @@ HTTP call.
 The localnet setup in `docker/localnet/` + `scripts/setup-localnet.sh` +
 `scripts/dev.sh` (see `docs/Contributor.md`) is the way to exercise real
 chain behavior end to end — commits, reveals, weight-setting — against a
-fast-runtime subtensor. This is not wired into the pytest suite; run it
-manually when you need to validate real chain interaction, not as part of
-routine test runs.
+fast-runtime subtensor. This is not wired into the default pytest suite;
+run it manually when you need to validate real chain interaction, not as
+part of routine test runs.
+
+`pyproject.toml` registers an `integration` pytest marker ("exercises real
+external deps (docker/localnet); run manually, not part of default suite")
+for tests that need this kind of real dependency — use it to tag any test
+that shouldn't run in the fast unit suite.
 
 ## Precheck/validation Docker service
 

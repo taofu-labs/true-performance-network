@@ -21,13 +21,45 @@ Key env vars:
 | `BITTENSOR` | `True` | Set `False` to run without chain |
 | `NETUID` | `0` | Subnet UID |
 | `NETWORK` | `finney` | Chain endpoint or `ws://...` |
-| `WALLET_COLDKEY` | `my-validator` | Coldkey name in `~/.bittensor/wallets` |
-| `WALLET_HOTKEY` | `default` | Hotkey name |
+| `WALLET_COLDKEY` | `test` | Coldkey name in `~/.bittensor/wallets` |
+| `WALLET_HOTKEY` | `m1` | Hotkey name |
 | `WALLET_PATH` | (bittensor default) | Override wallet directory |
-| `LAUNCH_HEALTH` | `True` | Enable health endpoint on port 9100 |
+| `LAUNCH_HEALTH` | `False` | Set `True` to enable health endpoint on port 9100 |
 | `VALIDATOR_MODE` | `leader` | `leader` or `follower` |
-| `LEADER_VALIDATOR_URL` | (none) | Follower mode only — leader's API base URL |
-| `ADMIN_API_KEY` | (none) | Leader mode only — bearer token gating `POST /v1/competitions`. Unset disables the write endpoint |
+
+**Leader mode:**
+
+| Variable | Default | Description |
+|---|---|---|
+| `LEADER_API_HOST` | `0.0.0.0` | Bind host for the leader read/admin API |
+| `LEADER_API_PORT` | `9200` | Bind port for the leader read/admin API |
+| `ADMIN_API_KEY` | (none) | Bearer token gating `POST /v1/competitions`. Unset makes the write endpoint refuse all requests (503) rather than being open |
+
+**Follower mode:**
+
+| Variable | Default | Description |
+|---|---|---|
+| `LEADER_VALIDATOR_URL` | (none) | Leader's API base URL to follow |
+| `FOLLOWER_POLL_INTERVAL` | `60` | Seconds between polls of the leader's scoring results |
+
+**Scoring / precheck tuning:**
+
+| Variable | Default | Description |
+|---|---|---|
+| `RAM_CHECK_LYING_TOLERANCE` | `0.01` | Allowed relative diff between self-reported and measured `max_memory` before disqualification |
+| `BENCHMARK_BACKEND` | `mock` | `mock` (in-process fake) or `http` (real coordinator) |
+| `COORDINATOR_BASE_URL` | (taofulabs bench endpoint) | Benchmark coordinator base URL, `http` backend only |
+| `COORDINATOR_API_KEY` | (none) | Auth for the benchmark coordinator, `http` backend only |
+| `PRECHECK_IMAGE` | `ghcr.io/taofulabs/tpn-precheck` | Docker image used for provenance/RAM precheck |
+| `PRECHECK_HOST_PORT` | `8081` | Host port the precheck container binds to (loopback-only) |
+| `BENCHMARK_POLL_TIMEOUT_SECONDS` | `5400` | Max wall-clock time to poll one benchmark run before giving up |
+
+**Loop timing:**
+
+| Variable | Default | Description |
+|---|---|---|
+| `VALIDATOR_LOOP_INTERVAL` | `60` (`10` if `BITTENSOR=False`) | Seconds between leader scoring-loop iterations |
+| `WEIGHT_SUBMIT_INTERVAL` | `1260` (`10` if `BITTENSOR=False`) | Seconds between on-chain weight submissions |
 
 Competition configs live in the leader's SQLite store now, not GitHub. Leader mode
 reads/writes them directly; follower mode and the CLI read them over the leader's
@@ -51,24 +83,6 @@ Pass extra args after `--`:
 ./scripts/start_autoupdater_pm2.sh -- --clean
 ```
 
-**Direct (no autoupdate):**
-
-```bash
-./start_validator.sh
-```
-
-Passes all extra args to the validator:
-```bash
-./start_validator.sh --clean
-```
-
-**Custom `.env` path:**
-
-```bash
-TPN_DOTENV_PATH=/etc/tpn/prod.env ./start_validator.sh
-TPN_DOTENV_PATH=/etc/tpn/prod.env ./scripts/start_autoupdater_pm2.sh
-```
-
 ## Health endpoint
 
 When `LAUNCH_HEALTH=True`, the validator exposes:
@@ -86,7 +100,7 @@ The validator stores persistent state in:
 - Linux/macOS: `~/.tpn/validator-storage/`
 - Windows: `%APPDATA%/tpn/validator-storage/`
 
-This includes ban records and scored submission history, used to avoid rescoring and enforce bans across restarts. Wipe with `--clean` flag on startup.
+This includes ban records, scored submission history, and — in leader mode — full scoring run history and weights history, used to avoid rescoring, enforce bans across restarts, and serve the leader's read API. Wipe with `--clean` flag on startup.
 
 ## pm2 management
 

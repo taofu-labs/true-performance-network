@@ -23,7 +23,7 @@ tpn --help
 ### 1. Register on subnet
 
 ```bash
-tpn register --wallet <coldkey> --hotkey default
+tpn register --coldkey <coldkey> --hotkey default
 ```
 
 ### 2. List competitions
@@ -89,7 +89,7 @@ Created on `register`. Each competition file holds the uploaded repo, filename, 
 
 ```
 tpn register      Register hotkey on subnet
-tpn competitions  List competitions
+tpn competitions  List competitions (--refresh/-r to bypass the 10 min cache)
 tpn upload        Upload GGUF to HuggingFace
 tpn commit        Submit TimeLocked Commit to chain
 tpn publish       Make HF repo public
@@ -104,9 +104,9 @@ For local development or non-standard setups, all commands accept these global f
 | Flag | Default | Description |
 |---|---|---|
 | `--network` | `finney` | Chain endpoint |
-| `--netuid` | subnet UID | Subnet UID |
+| `--netuid` | `65` | Subnet UID |
 | `--wallet-path` | `~/.bittensor/wallets` | Override wallet directory |
-| `--leader-url` | leader validator's public URL | Override leader validator API (serves competition configs) |
+| `--leader-url` | `https://leader.tpn.internal` | Override leader validator API (serves competition configs) |
 | `--block-time` | `12.0` | Seconds per block (use `0.300` for localnet) |
 
 Example:

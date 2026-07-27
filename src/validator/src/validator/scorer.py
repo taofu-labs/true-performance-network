@@ -52,6 +52,7 @@ class PrecheckPass:
     hotkey: str
     submission: MinerSubmission
     gguf_file: str
+    measured_memory_kb: int
 
 
 # ---------------------------------------------------------------------------
@@ -70,6 +71,9 @@ def precheck_one(
     Returns PrecheckPass on success, ScoringOutcome on skip/disqualify.
     Blocking — call via asyncio.to_thread.
     """
+    if precheck_ctr is None:
+        return _skip(hotkey, submission, "precheck container unavailable")
+
     if not check_repo_public(submission.repository):
         return _skip(hotkey, submission, "repo not publicly accessible")
 
@@ -85,54 +89,58 @@ def precheck_one(
     if not gguf_file:
         return _skip(hotkey, submission, "no .gguf file found at revision")
 
-    if precheck_ctr:
-        download_url = _HF_RESOLVE.format(
-            repo=submission.repository,
-            revision=submission.huggingface_revision,
-            file=gguf_file,
-        )
-        logger.debug(f"{hotkey[:12]} starting precheck | url={download_url} | context_length={spec.ram_check_context_length}")
-        started = time.monotonic()
-        verdict = precheck_ctr.check(download_url, spec.ram_check_context_length)
-        logger.debug(f"{hotkey[:12]} precheck call took {time.monotonic() - started:.1f}s")
+    download_url = _HF_RESOLVE.format(
+        repo=submission.repository,
+        revision=submission.huggingface_revision,
+        file=gguf_file,
+    )
+    logger.debug(f"{hotkey[:12]} starting precheck | url={download_url} | context_length={spec.ram_check_context_length}")
+    started = time.monotonic()
+    verdict = precheck_ctr.check(download_url, spec.ram_check_context_length)
+    logger.debug(f"{hotkey[:12]} precheck call took {time.monotonic() - started:.1f}s")
 
-        if verdict.error:
-            logger.warning(f"{hotkey[:12]} precheck error: {verdict.error}")
-            return _skip(hotkey, submission, f"precheck error: {verdict.error}")
+    if verdict.error:
+        logger.warning(f"{hotkey[:12]} precheck error: {verdict.error}")
+        return _skip(hotkey, submission, f"precheck error: {verdict.error}")
 
-        if verdict.provenance and not verdict.provenance.is_derivative:
-            notes = "; ".join(verdict.provenance.notes) or "CKA below threshold"
-            logger.warning(f"{hotkey[:12]} provenance fail: {notes}")
-            return _skip(hotkey, submission, f"provenance fail: {notes}")
+    if verdict.provenance and not verdict.provenance.is_derivative:
+        notes = "; ".join(verdict.provenance.notes) or "CKA below threshold"
+        logger.warning(f"{hotkey[:12]} provenance fail: {notes}")
+        return _skip(hotkey, submission, f"provenance fail: {notes}")
 
-        if verdict.sha256 and verdict.sha256.lower() != submission.file_sha256:
-            reason = f"sha256 mismatch: revealed={submission.file_sha256[:12]} actual={verdict.sha256[:12]}"
-            store.ban(conn, hotkey, reason)
-            logger.warning(f"{hotkey[:12]} BANNED — {reason}")
-            return _skip(hotkey, submission, f"{reason} (hotkey banned)")
+    if verdict.sha256 and verdict.sha256.lower() != submission.file_sha256:
+        reason = f"sha256 mismatch: revealed={submission.file_sha256[:12]} actual={verdict.sha256[:12]}"
+        store.ban(conn, hotkey, reason)
+        logger.warning(f"{hotkey[:12]} BANNED — {reason}")
+        return _skip(hotkey, submission, f"{reason} (hotkey banned)")
 
-        if verdict.ram:
-            if not verdict.ram.passed:
-                return _skip(hotkey, submission, "llama-cli load failed")
+    if not verdict.ram:
+        return _skip(hotkey, submission, "no RAM measurement returned by precheck")
 
-            reported_bytes = submission.max_memory * 1024
-            measured_bytes = verdict.ram.ram_bytes
-            tolerance = getattr(common_settings, "RAM_CHECK_LYING_TOLERANCE", 0.01)
-            if reported_bytes > 0 and abs(measured_bytes - reported_bytes) / reported_bytes > tolerance:
-                diff = abs(measured_bytes - reported_bytes) / reported_bytes
-                logger.warning(f"{hotkey[:12]} max_memory lie: reported={reported_bytes} measured={measured_bytes} diff={diff:.1%}")
-                return _disqualify(
-                    hotkey, submission,
-                    f"max_memory lie: reported {reported_bytes}B measured {measured_bytes}B ({diff:.1%})",
-                )
+    if not verdict.ram.passed:
+        return _skip(hotkey, submission, "llama-cli load failed")
 
-        logger.info(
-            f"{hotkey[:12]} precheck OK"
-            + (f" ram={verdict.ram.ram_bytes:,}B" if verdict.ram else "")
-            + (f" CKA={verdict.provenance.cka:.3f}" if verdict.provenance else "")
+    reported_bytes = submission.max_memory * 1024
+    measured_bytes = verdict.ram.ram_bytes
+    tolerance = getattr(common_settings, "RAM_CHECK_LYING_TOLERANCE", 0.01)
+    if reported_bytes > 0 and abs(measured_bytes - reported_bytes) / reported_bytes > tolerance:
+        diff = abs(measured_bytes - reported_bytes) / reported_bytes
+        logger.warning(f"{hotkey[:12]} max_memory lie: reported={reported_bytes} measured={measured_bytes} diff={diff:.1%}")
+        return _disqualify(
+            hotkey, submission,
+            f"max_memory lie: reported {reported_bytes}B measured {measured_bytes}B ({diff:.1%})",
         )
 
-    return PrecheckPass(hotkey=hotkey, submission=submission, gguf_file=gguf_file)
+    logger.info(
+        f"{hotkey[:12]} precheck OK"
+        f" ram={verdict.ram.ram_bytes:,}B"
+        + (f" CKA={verdict.provenance.cka:.3f}" if verdict.provenance else "")
+    )
+
+    return PrecheckPass(
+        hotkey=hotkey, submission=submission, gguf_file=gguf_file,
+        measured_memory_kb=measured_bytes // 1024,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -204,7 +212,7 @@ async def benchmark_one(
             actual_scores=actual_scores,
         )
 
-    final = final_score(actual_scores, submission.max_memory, spec)
+    final = final_score(actual_scores, p.measured_memory_kb, spec)
     logger.info(f"{hotkey[:12]} SCORED final={final:.6f} scores={actual_scores}")
     return ScoringOutcome(
         kind=OutcomeKind.SCORED,
@@ -215,7 +223,7 @@ async def benchmark_one(
             disqualified=False,
             actual_scores=actual_scores,
             final_score=final,
-            max_memory_kb=submission.max_memory,
+            max_memory_kb=p.measured_memory_kb,
             lying_detected=False,
             eval_backend="coordinator",
         ),

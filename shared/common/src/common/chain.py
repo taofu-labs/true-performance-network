@@ -66,7 +66,7 @@ def timelocked_commit(
     The chain auto-decrypts at the corresponding drand round and stores
     the plaintext in RevealedCommitments storage.
     """
-    import bittensor
+    import bittensor_core
     from bittensor import calls
     from bittensor.intents.plan import Policy
 
@@ -75,10 +75,22 @@ def timelocked_commit(
         f"| blocks_until_reveal={blocks_until_reveal}"
     )
 
-    sealed = bittensor.timelock.encrypt(reveal_payload, reveal_in=blocks_until_reveal * block_time)
+    # bittensor.timelock.encrypt() wraps the ciphertext in a SCALE `UserData`
+    # envelope meant for other consumers; pallet-commitments expects the raw
+    # compressed TLE ciphertext, so it silently fails to decode and the
+    # commitment is dropped with no reveal. get_encrypted_commitment produces
+    # the unwrapped ciphertext the pallet actually expects.
+    ciphertext, reveal_round = bittensor_core.get_encrypted_commitment(
+        reveal_payload, blocks_until_reveal, block_time
+    )
+    logger.debug(
+        f"Encrypted commit | blocks_until_reveal={blocks_until_reveal} "
+        f"| block_time={block_time} | reveal_round={reveal_round} "
+        f"| ciphertext_len={len(ciphertext)} | payload={reveal_payload}"
+    )
     info = {
         "fields": [[{
-            "TimelockEncrypted": {"encrypted": sealed.ciphertext, "reveal_round": sealed.reveal_round}
+            "TimelockEncrypted": {"encrypted": ciphertext, "reveal_round": reveal_round}
         }]]
     }
     call = calls.Commitments.set_commitment(netuid, info)
@@ -88,6 +100,7 @@ def timelocked_commit(
     subtensor.policy = Policy(allow_raw_calls=True)
     try:
         result = subtensor.submit_call(call, wallet, signer="hotkey")
+        logger.debug(f"submit_call result: success={result.success} extrinsic_id={getattr(result, 'extrinsic_id', None)}")
         return result.success
     except Exception as e:
         logger.error(f"timelocked_commit failed: {e}")
@@ -124,6 +137,7 @@ def read_revealed_commitments(
         result: dict[str, list[tuple[str, int]]] = {}
         if metagraph is None:
             return result
+        logger.debug(f"Read {len(metagraph.commitments)} commitments from metagraph: {list(metagraph.commitments.values())}")
         for commitment in metagraph.commitments.values():
             if commitment and commitment.revealed:
                 result[commitment.hotkey] = [

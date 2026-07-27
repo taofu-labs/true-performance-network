@@ -120,3 +120,63 @@ async def test_compute_and_set_aggregate_weights_no_distributing_competitions(mo
     monkeypatch.setattr(v, "_get_active_competitions", lambda current_block: [])
     distributed = await v._compute_and_set_aggregate_weights(current_block=123)
     assert distributed is False
+
+
+class FakeSpec:
+    def __init__(self, id, emission_weight, distributing=True):
+        self.id = id
+        self.emission_weight = emission_weight
+        self._distributing = distributing
+
+    def is_distributing(self, current_block):
+        return self._distributing
+
+
+@pytest.mark.asyncio
+async def test_compute_and_set_aggregate_weights_burns_shortfall_to_uid0(monkeypatch):
+    metagraph = FakeMetagraph(
+        hotkeys=["hk0", "hk1"], uids=[0, 1], stake=[1.0], weights=[[1.0]], validator_permit=[True],
+    )
+    v = make_validator(monkeypatch, metagraph=metagraph)
+    spec = FakeSpec(id="comp", emission_weight=0.5)
+    monkeypatch.setattr(v, "_get_active_competitions", lambda current_block: [spec])
+    monkeypatch.setattr(
+        "validator.store.latest_weights_for_competition",
+        lambda db, comp_id: {"hk1": 0.6},
+    )
+    captured = {}
+
+    async def fake_set_weights(weights):
+        captured.update(weights)
+    monkeypatch.setattr(v, "set_weights", fake_set_weights)
+
+    distributed = await v._compute_and_set_aggregate_weights(current_block=123)
+    assert distributed is True
+    # hk1 -> uid 1 gets emission_weight * share = 0.5 * 0.6 = 0.3; shortfall 0.7 burned to uid 0
+    assert captured[1] == pytest.approx(0.3)
+    assert captured[0] == pytest.approx(0.7)
+    assert sum(captured.values()) == pytest.approx(1.0)
+
+
+@pytest.mark.asyncio
+async def test_compute_and_set_aggregate_weights_no_burn_when_full(monkeypatch):
+    metagraph = FakeMetagraph(
+        hotkeys=["hk0", "hk1"], uids=[0, 1], stake=[1.0], weights=[[1.0]], validator_permit=[True],
+    )
+    v = make_validator(monkeypatch, metagraph=metagraph)
+    spec = FakeSpec(id="comp", emission_weight=1.0)
+    monkeypatch.setattr(v, "_get_active_competitions", lambda current_block: [spec])
+    monkeypatch.setattr(
+        "validator.store.latest_weights_for_competition",
+        lambda db, comp_id: {"hk1": 1.0},
+    )
+    captured = {}
+
+    async def fake_set_weights(weights):
+        captured.update(weights)
+    monkeypatch.setattr(v, "set_weights", fake_set_weights)
+
+    distributed = await v._compute_and_set_aggregate_weights(current_block=123)
+    assert distributed is True
+    assert captured == {1: pytest.approx(1.0)}
+    assert 0 not in captured

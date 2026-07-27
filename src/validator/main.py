@@ -1,9 +1,12 @@
 import argparse
 import asyncio
 
+from common.settings import configure_logging
 from validator import settings as validator_settings
 from validator.validator import Validator
 import validator.store as store
+
+configure_logging()
 
 
 def _parse_args() -> argparse.Namespace:

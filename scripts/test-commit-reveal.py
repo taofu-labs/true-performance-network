@@ -12,6 +12,7 @@ import argparse
 import time
 
 import bittensor as bt
+import bittensor_core
 from bittensor import calls
 from bittensor.intents.plan import Policy
 
@@ -41,12 +42,19 @@ def main():
         raise SystemExit(1)
     print(f"Registered as uid {uid} on netuid {args.netuid}")
 
-    sealed = bt.timelock.encrypt(args.payload, reveal_in=args.reveal_in)
-    print(f"Sealed payload: {len(sealed.ciphertext)} bytes, reveal_round={sealed.reveal_round}")
+    # bt.timelock.encrypt() wraps the ciphertext in a SCALE `UserData` envelope
+    # that pallet-commitments can't decode (it expects a raw compressed TLE
+    # ciphertext), silently dropping the commitment with no reveal.
+    # get_encrypted_commitment produces the unwrapped bytes the pallet expects.
+    blocks_until_reveal = max(1, round(args.reveal_in / 12.0))
+    ciphertext, reveal_round = bittensor_core.get_encrypted_commitment(
+        args.payload, blocks_until_reveal, 12.0
+    )
+    print(f"Sealed payload: {len(ciphertext)} bytes, reveal_round={reveal_round}")
 
     info = {
         "fields": [[{
-            "TimelockEncrypted": {"encrypted": sealed.ciphertext, "reveal_round": sealed.reveal_round}
+            "TimelockEncrypted": {"encrypted": ciphertext, "reveal_round": reveal_round}
         }]]
     }
     call = calls.Commitments.set_commitment(args.netuid, info)

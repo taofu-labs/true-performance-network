@@ -1,4 +1,5 @@
 import os
+import sys
 from dotenv import load_dotenv
 from loguru import logger
 
@@ -10,6 +11,9 @@ if TPN_DOTENV_PATH:
         logger.warning(f"No .env file found at {TPN_DOTENV_PATH}")
 else:
     load_dotenv()  # silently try default .env; no warning if absent
+
+# Logging — DEBUG is dev-only (set via .env.localnet); prod stays at INFO.
+LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO")
 
 # Bittensor
 BITTENSOR = os.getenv("BITTENSOR", "True") == "True"
@@ -31,9 +35,19 @@ COORDINATOR_BASE_URL: str = os.getenv("COORDINATOR_BASE_URL", "https://bench.tru
 COORDINATOR_API_KEY: str | None = os.getenv("COORDINATOR_API_KEY") or None
 
 # Precheck container (provenance + RAM check)
-PRECHECK_IMAGE: str = os.getenv("PRECHECK_IMAGE", "tpn-precheck")
+PRECHECK_IMAGE: str = os.getenv("PRECHECK_IMAGE", "ghcr.io/taofulabs/tpn-precheck")
 PRECHECK_HOST_PORT: int = int(os.getenv("PRECHECK_HOST_PORT", "8081"))
 RAM_CHECK_LYING_TOLERANCE: float = float(os.getenv("RAM_CHECK_LYING_TOLERANCE", "0.01"))
 
 # Max wall-clock seconds to poll a single benchmark run before giving up (skip, not fail-fast)
 BENCHMARK_POLL_TIMEOUT_SECONDS: int = int(os.getenv("BENCHMARK_POLL_TIMEOUT_SECONDS", "5400"))
+
+
+def configure_logging() -> None:
+    """Point loguru's default stderr handler at LOG_LEVEL.
+
+    Call once from a process entrypoint (validator/CLI main), not on import —
+    logging setup is a process-level side effect, not a settings default.
+    """
+    logger.remove()
+    logger.add(sys.stderr, level=LOG_LEVEL)

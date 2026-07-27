@@ -127,6 +127,7 @@ def commit(
 
     # ── Submit ────────────────────────────────────────────────────────────────
     if not dry_run:
+        current_block = subtensor.block()
         blocks_until_reveal = max(1, spec.commit_end_block - current_block)
         success = timelocked_commit(
             subtensor=subtensor,

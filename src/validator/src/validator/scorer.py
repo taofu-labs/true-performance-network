@@ -91,7 +91,10 @@ def precheck_one(
             revision=submission.huggingface_revision,
             file=gguf_file,
         )
+        logger.debug(f"{hotkey[:12]} starting precheck | url={download_url} | context_length={spec.ram_check_context_length}")
+        started = time.monotonic()
         verdict = precheck_ctr.check(download_url, spec.ram_check_context_length)
+        logger.debug(f"{hotkey[:12]} precheck call took {time.monotonic() - started:.1f}s")
 
         if verdict.error:
             logger.warning(f"{hotkey[:12]} precheck error: {verdict.error}")

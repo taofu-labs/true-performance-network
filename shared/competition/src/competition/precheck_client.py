@@ -16,7 +16,8 @@ Or use as context manager:
         verdict = ctr.check(url)
 
 Config (env):
-    PRECHECK_IMAGE          Docker image tag  (default: tpn-precheck)
+    PRECHECK_IMAGE          Docker image tag  (default: ghcr.io/taofulabs/tpn-precheck; set to
+                            a bare local tag like "tpn-precheck" to use a locally built image)
     PRECHECK_HOST_PORT      Host port to bind  (default: 8081)
     PRECHECK_HEALTH_TIMEOUT Wall-clock seconds to wait for base model ready (default: 7200)
     PRECHECK_HEALTH_POLL    Seconds between /health polls (default: 15)
@@ -33,11 +34,13 @@ from typing import List, Optional
 import requests
 from loguru import logger
 
+from common.settings import LOG_LEVEL
+
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
 
-_IMAGE          = os.environ.get("PRECHECK_IMAGE", "tpn-precheck")
+_IMAGE          = os.environ.get("PRECHECK_IMAGE", "ghcr.io/taofulabs/tpn-precheck")
 _HOST_PORT      = int(os.environ.get("PRECHECK_HOST_PORT", "8081"))
 _HEALTH_TIMEOUT = int(os.environ.get("PRECHECK_HEALTH_TIMEOUT", "7200"))
 _HEALTH_POLL    = int(os.environ.get("PRECHECK_HEALTH_POLL", "15"))
@@ -116,7 +119,8 @@ class PrecheckContainer:
             raise RuntimeError("PrecheckContainer already started")
 
         name = f"tpn-precheck-{uuid.uuid4().hex[:8]}"
-        cmd = ["docker", "run", "-d", "--name", name, "-p", f"{self._host_port}:8080", "--rm"]
+        cmd = ["docker", "run", "-d", "--name", name, "-p", f"{self._host_port}:8080", "--rm",
+               "-e", f"PRECHECK_LOG_LEVEL={LOG_LEVEL}"]
         if self._base_repo:
             cmd += ["-e", f"BASE_MODEL_REPO={self._base_repo}",
                     "-e", f"BASE_MODEL_DOWNLOAD_TIMEOUT_SECONDS={_BASE_DL_TIMEOUT}"]

@@ -4,9 +4,10 @@ from pydantic import BaseModel, model_validator
 
 
 class CompetitionPhase(str, Enum):
-    OPEN = "open"        # start_block → commit_end_block
-    SCORING = "scoring"  # commit_end_block + grace → scoring_end_block
-    COMPLETE = "complete"
+    OPEN = "open"                  # start_block → commit_end_block
+    SCORING = "scoring"            # commit_end_block + grace → scoring_end_block
+    DISTRIBUTING = "distributing"  # scoring_end_block → distribution_end_block
+    COMPLETE = "complete"          # distribution_end_block reached
 
 
 class CompetitionType(str, Enum):
@@ -80,6 +81,8 @@ class CompetitionSpec(BaseModel):
             return CompetitionPhase.OPEN
         if current_block < self.scoring_end_block:
             return CompetitionPhase.SCORING
+        if current_block < self.distribution_end_block():
+            return CompetitionPhase.DISTRIBUTING
         return CompetitionPhase.COMPLETE
 
     def scoring_starts_at(self) -> int:
@@ -100,6 +103,8 @@ class CompetitionSpec(BaseModel):
             return max(0, self.commit_end_block - current_block)
         if phase == CompetitionPhase.SCORING:
             return max(0, self.scoring_end_block - current_block)
+        if phase == CompetitionPhase.DISTRIBUTING:
+            return max(0, self.distribution_end_block() - current_block)
         return 0
 
     def is_active(self, current_block: int) -> bool:

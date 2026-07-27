@@ -1,6 +1,6 @@
 services:
   subtensor-localnet:
-    image: ghcr.io/raofoundation/subtensor-localnet
+    image: ghcr.io/raofoundation/subtensor-localnet:sha-0a95fac7a090e580176414692586b00f3ae83831
     container_name: subtensor-localnet
     ports:
       - "9944:9944"
@@ -9,6 +9,8 @@ services:
     # "True"  = fast-runtime: 250ms blocks (good for dev — fast epoch iteration)
     # "False" = non-fast-runtime: 12s blocks
     command: ["True"]
+    # environment:
+    #   - RUST_LOG=info,pallet_commitments=debug,pallet_drand=debug
     restart: unless-stopped
     sysctls:
       - net.ipv6.conf.all.disable_ipv6=1

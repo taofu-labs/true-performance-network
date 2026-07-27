@@ -101,6 +101,10 @@ class Validator(HealthServerMixin, LeaderApiMixin):
 
                 for spec in specs:
                     phase = spec.phase(current_block)
+
+                    if phase == CompetitionPhase.COMPLETE:
+                        continue
+
                     remaining = spec.blocks_until_next_phase(current_block)
                     logger.info(f"Block {current_block} | {spec.id} | {phase.value} | {remaining} blocks left")
 
@@ -109,11 +113,6 @@ class Validator(HealthServerMixin, LeaderApiMixin):
 
                     elif phase == CompetitionPhase.SCORING:
                         if current_block >= spec.scoring_starts_at() and not store.is_scored(self._db, spec.id):
-                            await self._run_scoring(spec, current_block)
-                            store.mark_scored(self._db, spec.id)
-
-                    elif phase == CompetitionPhase.COMPLETE:
-                        if not store.is_scored(self._db, spec.id):
                             await self._run_scoring(spec, current_block)
                             store.mark_scored(self._db, spec.id)
 
@@ -141,7 +140,7 @@ class Validator(HealthServerMixin, LeaderApiMixin):
                     if store.is_scored(self._db, spec.id):
                         continue
                     phase = spec.phase(current_block)
-                    if phase not in (CompetitionPhase.SCORING, CompetitionPhase.COMPLETE):
+                    if phase not in (CompetitionPhase.SCORING, CompetitionPhase.DISTRIBUTING, CompetitionPhase.COMPLETE):
                         continue
 
                     runs = self._leader_client.get_scoring_results(spec.id)
@@ -178,21 +177,25 @@ class Validator(HealthServerMixin, LeaderApiMixin):
         logger.info(f"🏆 Scoring competition {spec.id}")
 
         reveals = scan_reveals(self.subtensor, spec, self._db)
+        logger.debug(f"scan_reveals returned {len(reveals)} reveal(s): {list(reveals.keys())}")
         if not reveals:
             logger.warning("No valid reveals. Skipping weight update.")
             return
 
         registered = set(self.metagraph.hotkeys)
         reveals = {hk: sub for hk, sub in reveals.items() if hk in registered}
+        logger.debug(f"{len(reveals)} reveal(s) from registered hotkeys: {list(reveals.keys())}")
         if not reveals:
             logger.warning("No reveals from registered hotkeys. Skipping weight update.")
             return
 
         ranked_candidates = sort_by_self_reported(reveals, spec)
+        logger.debug(f"Ranked candidates by self-reported score: {[hk[:12] for hk, _ in ranked_candidates]}")
         coordinator = make_coordinator()
 
         try:
             available = await asyncio.to_thread(coordinator.list_benchmarks)
+            logger.debug(f"Coordinator available benchmarks: {available}")
             missing = {t.name for t in spec.benchmarks} - available
             if missing:
                 logger.error(f"Coordinator missing benchmarks {missing} — aborting scoring")
@@ -228,6 +231,7 @@ class Validator(HealthServerMixin, LeaderApiMixin):
                 except Exception as e:
                     logger.warning(f"Precheck container stop error: {e}")
 
+        logger.debug(f"Precheck done: {len(passed)} passed, {len(all_outcomes)} skipped/disqualified so far")
         if not passed:
             logger.warning("No submissions passed precheck. Skipping weight update.")
             return
@@ -239,10 +243,13 @@ class Validator(HealthServerMixin, LeaderApiMixin):
             for p in passed
         ])
         all_outcomes.extend(benchmark_outcomes)
+        logger.debug(f"Benchmark done: {len(benchmark_outcomes)} outcome(s)")
 
         all_results = [o.result for o in all_outcomes]
         ranked = sorted(all_results, key=lambda r: r.final_score, reverse=True)
         hotkey_weights = compute_emission_weights(ranked, spec.emission_distribution)
+        logger.debug(f"Final ranking: {[(r.hotkey[:12], r.final_score) for r in ranked]}")
+        logger.debug(f"Emission weights: {hotkey_weights}")
 
         store.record_scoring_run(self._db, spec.id, current_block, all_outcomes, reveals)
         store.record_weights(self._db, spec.id, hotkey_weights)
@@ -286,6 +293,16 @@ class Validator(HealthServerMixin, LeaderApiMixin):
 
         logger.info(f"Aggregated weights across {len(distributing)} competitions: "
                     f"{[(k[:8], round(v, 4)) for k, v in hotkey_weights.items() if v > 0]}")
+
+        # bt.set_weights only rescales among submitted uids — it never tops up
+        # a shortfall on its own, so any unallocated share must be burned to
+        # uid 0 explicitly or the miners present silently inherit it.
+        total = sum(uid_weights.values())
+        remainder = 1.0 - total
+        if remainder > 1e-9:
+            uid_weights[0] = uid_weights.get(0, 0.0) + remainder
+            logger.info(f"Burning unallocated weight {remainder:.4f} to uid 0")
+
         await self.set_weights(weights=uid_weights)
         return True
 

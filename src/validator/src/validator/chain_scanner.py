@@ -32,8 +32,11 @@ def scan_reveals(
     is_fast_blocks = subtensor.is_fast_blocks()
     results: Dict[str, MinerSubmission] = {}
 
+    logger.debug(f"scan_reveals | {competition.id} | commit_end_block={competition.commit_end_block} | fast_blocks={is_fast_blocks} | {len(all_reveals)} hotkeys with reveals: {all_reveals}")
+
     for hotkey, entries in all_reveals.items():
         if store.is_banned(conn, hotkey):
+            logger.debug(f"Skipping banned hotkey {hotkey[:12]}")
             continue
         # Only accept reveals at the competition's commit_end_block
         for raw, reveal_block in entries:
@@ -45,8 +48,11 @@ def scan_reveals(
                 if submission.competition_id != competition.id:
                     logger.debug(f"Wrong competition_id in reveal for {hotkey[:12]}")
                     continue
+                logger.debug(f"Accepted submission from {hotkey[:12]}: {submission}")
                 results[hotkey] = submission
                 break  # one submission per hotkey
+            else:
+                logger.debug(f"reveal_block={reveal_block} outside window for commit_end_block={competition.commit_end_block} (hotkey={hotkey[:12]})")
 
     logger.info(f"Found {len(results)} valid reveals for competition {competition.id}")
     return results
@@ -57,6 +63,6 @@ def _matches_block(
     commit_end_block: int,
     is_fast_blocks: bool,
 ) -> bool:
-    if is_fast_blocks: 
+    if is_fast_blocks:
         return reveal_block > commit_end_block - 5 and reveal_block < commit_end_block + 5
     return reveal_block == commit_end_block

@@ -69,6 +69,12 @@ CKA_THRESHOLD: float = float(os.environ.get("CKA_THRESHOLD", "0.80"))
 N_TOKENS: int = int(os.environ.get("N_TOKENS", "4096"))
 RAM_CHECK_TIMEOUT_SECONDS: int = int(os.environ.get("RAM_CHECK_TIMEOUT_SECONDS", "600"))
 LLAMA_THREADS: int = int(os.environ.get("LLAMA_THREADS", "8"))
+PRECHECK_LOG_LEVEL: str = os.environ.get("PRECHECK_LOG_LEVEL", "INFO")
+
+
+def _debug(msg: str) -> None:
+    if PRECHECK_LOG_LEVEL == "DEBUG":
+        print(f"DEBUG: {msg}", file=sys.stderr, flush=True)
 
 # ---------------------------------------------------------------------------
 # App + state
@@ -156,7 +162,9 @@ def check(req: CheckRequest) -> JSONResponse:
         tmp_fd, tmp_path = tempfile.mkstemp(suffix=".gguf")
         os.close(tmp_fd)
         try:
+            print(f"Downloading {url}", flush=True)
             _download_url(url, tmp_path)
+            _debug(f"Downloaded {Path(tmp_path).stat().st_size:,} bytes to {tmp_path}")
         except _DownloadError as e:
             raise HTTPException(status_code=422, detail=f"download failed: {e}")
 
@@ -191,12 +199,16 @@ def _run_checks(gguf_path: str, context_length: int, run_provenance: bool) -> di
     ram_result = None
     error = None
 
+    size_bytes = Path(gguf_path).stat().st_size
+    print(f"Running checks on {gguf_path} ({size_bytes:,} bytes, context_length={context_length}, provenance={run_provenance})", flush=True)
+
     # Provenance check
     if run_provenance and BASE_MODEL_REPO:
         base_ggufs = sorted(BASE_MODEL_DIR.rglob("*.gguf"))
         if not base_ggufs:
             error = "base model GGUF missing"
         else:
+            _debug(f"Provenance check: base={base_ggufs[0]} candidate={gguf_path}")
             try:
                 result = check_provenance(
                     path_a=str(base_ggufs[0]),
@@ -214,12 +226,15 @@ def _run_checks(gguf_path: str, context_length: int, run_provenance: bool) -> di
                     "cka": result.embeddings.cka if result.embeddings else 0.0,
                     "notes": notes,
                 }
+                _debug(f"Provenance result: is_derivative={result.is_derivative} cka={provenance_result['cka']:.3f} notes={notes}")
             except Exception as e:
                 error = f"provenance check error: {e}"
 
     # RAM check (always, even if provenance errored — independent gate)
+    _debug(f"Starting RAM check (context_length={context_length})")
     try:
         ram_result = _run_llama_cli(gguf_path, context_length)
+        _debug(f"RAM check result: {ram_result}")
     except Exception as e:
         ram_result = {"passed": False, "ram_bytes": 0, "weights_bytes": 0, "kv_cache_bytes": 0}
         if not error:
@@ -228,11 +243,14 @@ def _run_checks(gguf_path: str, context_length: int, run_provenance: bool) -> di
     # sha256 (always, independent of provenance/ram outcome)
     sha256_result = None
     try:
+        _debug("Computing sha256")
         sha256_result = _sha256_file(gguf_path)
+        _debug(f"sha256={sha256_result}")
     except Exception as e:
         if not error:
             error = f"sha256 check error: {e}"
 
+    print(f"Checks complete for {gguf_path}: error={error}", flush=True)
     return {"provenance": provenance_result, "ram": ram_result, "sha256": sha256_result, "error": error}
 
 
@@ -265,18 +283,22 @@ def _run_llama_cli(gguf_path: str, context_length: int) -> dict:
         "--no-warmup",
         "-p", "hi",
     ]
+    _debug(f"llama-cli command: {' '.join(cmd)}")
 
     try:
         result = subprocess.run(
             cmd,
             capture_output=True,
-            text=True,
             timeout=RAM_CHECK_TIMEOUT_SECONDS,
         )
     except subprocess.TimeoutExpired:
+        print(f"llama-cli timed out after {RAM_CHECK_TIMEOUT_SECONDS}s", file=sys.stderr)
         return {"passed": False, "ram_bytes": 0, "weights_bytes": 0, "kv_cache_bytes": 0}
 
-    combined = result.stdout + result.stderr
+    # llama-cli's generated output (--verbose logs the inference response) can
+    # contain non-UTF-8 bytes from garbage token decodes; only the weight/KV
+    # buffer-size log lines matter here, so replace rather than fail on those.
+    combined = (result.stdout + result.stderr).decode("utf-8", errors="replace")
 
     if result.returncode != 0:
         print(f"llama-cli exit {result.returncode}: {combined[-500:]}", file=sys.stderr)
@@ -291,6 +313,7 @@ def _run_llama_cli(gguf_path: str, context_length: int) -> dict:
 
     weights_bytes = int(float(w_matches[-1]) * 1024 * 1024)
     kv_bytes      = int(float(kv_matches[-1]) * 1024 * 1024)
+    _debug(f"Parsed weights_bytes={weights_bytes:,} kv_cache_bytes={kv_bytes:,}")
     return {
         "passed": True,
         "ram_bytes": weights_bytes + kv_bytes,

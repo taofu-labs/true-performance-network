@@ -113,8 +113,20 @@ class Validator(HealthServerMixin, LeaderApiMixin):
 
                     elif phase == CompetitionPhase.SCORING:
                         if current_block >= spec.scoring_starts_at() and not store.is_scored(self._db, spec.id):
-                            await self._run_scoring(spec, current_block)
-                            store.mark_scored(self._db, spec.id)
+                            done = await self._run_scoring(spec, current_block)
+                            if done:
+                                store.mark_scored(self._db, spec.id)
+                            else:
+                                attempts = store.bump_reveal_attempts(self._db, spec.id)
+                                if attempts >= store.MAX_REVEAL_ATTEMPTS:
+                                    logger.warning(
+                                        f"{spec.id}: giving up after {attempts} attempts — marking scored with no result"
+                                    )
+                                    store.mark_scored(self._db, spec.id)
+                                else:
+                                    logger.info(
+                                        f"{spec.id}: retryable scoring failure, attempt {attempts}/{store.MAX_REVEAL_ATTEMPTS}"
+                                    )
 
             except Exception as e:
                 logger.exception(f"Leader loop error: {e}")
@@ -166,7 +178,11 @@ class Validator(HealthServerMixin, LeaderApiMixin):
             finally:
                 await asyncio.sleep(validator_settings.FOLLOWER_POLL_INTERVAL)
 
-    async def _run_scoring(self, spec, current_block: int):
+    async def _run_scoring(self, spec, current_block: int) -> bool:
+        """Returns True if scoring reached a terminal state (success, or a
+        non-retryable abort) and the competition should be marked scored.
+        Returns False for a retryable failure (no reveals yet, coordinator
+        unreachable) so the caller can retry on a later tick."""
         from validator.chain_scanner import scan_reveals
         from validator.scorer import precheck_one, benchmark_one, PrecheckPass, ScoringOutcome
         from competition.benchmark_client import make_coordinator
@@ -180,14 +196,14 @@ class Validator(HealthServerMixin, LeaderApiMixin):
         logger.debug(f"scan_reveals returned {len(reveals)} reveal(s): {list(reveals.keys())}")
         if not reveals:
             logger.warning("No valid reveals. Skipping weight update.")
-            return
+            return False
 
         registered = set(self.metagraph.hotkeys)
         reveals = {hk: sub for hk, sub in reveals.items() if hk in registered}
         logger.debug(f"{len(reveals)} reveal(s) from registered hotkeys: {list(reveals.keys())}")
         if not reveals:
             logger.warning("No reveals from registered hotkeys. Skipping weight update.")
-            return
+            return False
 
         ranked_candidates = sort_by_self_reported(reveals, spec)
         logger.debug(f"Ranked candidates by self-reported score: {[hk[:12] for hk, _ in ranked_candidates]}")
@@ -199,10 +215,10 @@ class Validator(HealthServerMixin, LeaderApiMixin):
             missing = {t.name for t in spec.benchmarks} - available
             if missing:
                 logger.error(f"Coordinator missing benchmarks {missing} — aborting scoring")
-                return
+                return False
         except Exception as e:
             logger.error(f"Cannot reach coordinator: {e} — aborting scoring")
-            return
+            return False
 
         precheck_ctr: PrecheckContainer | None = PrecheckContainer(base_repo=spec.model_repo)
         try:
@@ -234,7 +250,7 @@ class Validator(HealthServerMixin, LeaderApiMixin):
         logger.debug(f"Precheck done: {len(passed)} passed, {len(all_outcomes)} skipped/disqualified so far")
         if not passed:
             logger.warning("No submissions passed precheck. Skipping weight update.")
-            return
+            return True
 
         # Phase 2: parallel benchmark — all passed miners run concurrently
         poll_interval = getattr(validator_settings, "BENCHMARK_POLL_INTERVAL", 30.0)
@@ -255,6 +271,7 @@ class Validator(HealthServerMixin, LeaderApiMixin):
         store.record_weights(self._db, spec.id, hotkey_weights)
 
         logger.info(f"Weights computed: {[(k[:8], v) for k, v in hotkey_weights.items() if v > 0]}")
+        return True
 
     async def _compute_and_set_aggregate_weights(self, current_block: int) -> bool:
         """

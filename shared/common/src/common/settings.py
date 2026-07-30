@@ -35,7 +35,7 @@ COORDINATOR_BASE_URL: str = os.getenv("COORDINATOR_BASE_URL", "https://bench.tru
 COORDINATOR_API_KEY: str | None = os.getenv("COORDINATOR_API_KEY") or None
 
 # Precheck container (provenance + RAM check)
-PRECHECK_IMAGE: str = os.getenv("PRECHECK_IMAGE", "ghcr.io/taofulabs/tpn-precheck")
+PRECHECK_IMAGE: str = os.getenv("PRECHECK_IMAGE", "ghcr.io/taofu-labs/tpn-precheck")
 PRECHECK_HOST_PORT: int = int(os.getenv("PRECHECK_HOST_PORT", "8081"))
 RAM_CHECK_LYING_TOLERANCE: float = float(os.getenv("RAM_CHECK_LYING_TOLERANCE", "0.01"))
 

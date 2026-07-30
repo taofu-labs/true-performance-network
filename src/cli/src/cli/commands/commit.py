@@ -119,6 +119,12 @@ def commit(
         huggingface_revision=cfg["huggingface_revision"],
     )
 
+    # previous_reveal_round of the last commit for THIS competition, so a
+    # republish (updating the submission before it reveals) replaces that
+    # field on-chain instead of adding a second pending field for the same
+    # competition.
+    previous_reveal_round = cfg.get("reveal_round")
+
     # ── Persist state ─────────────────────────────────────────────────────────
     cfg["claims"] = [{"b": c.b, "s": c.s} for c in parsed_claims]
     cfg["max_memory"] = max_memory
@@ -129,15 +135,19 @@ def commit(
     if not dry_run:
         current_block = subtensor.block()
         blocks_until_reveal = max(1, spec.commit_end_block - current_block)
-        success = timelocked_commit(
+        result = timelocked_commit(
             subtensor=subtensor,
             wallet=wallet,
             netuid=ctx.netuid,
             reveal_payload=reveal_payload,
             blocks_until_reveal=blocks_until_reveal,
             block_time=ctx.block_time,
+            previous_reveal_round=previous_reveal_round,
         )
-        status = "[green]✓ TimeLocked Commit submitted[/green]" if success else "[red]✗ Chain write failed[/red]"
+        if result.success:
+            cfg["reveal_round"] = result.reveal_round
+            save_competition_config(coldkey, hotkey_name, competition_id, cfg)
+        status = "[green]✓ TimeLocked Commit submitted[/green]" if result.success else "[red]✗ Chain write failed[/red]"
     else:
         status = "[yellow]Dry run — not written to chain[/yellow]"
 

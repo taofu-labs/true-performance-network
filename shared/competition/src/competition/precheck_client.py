@@ -16,7 +16,7 @@ Or use as context manager:
         verdict = ctr.check(url)
 
 Config (env):
-    PRECHECK_IMAGE          Docker image tag  (default: ghcr.io/taofulabs/tpn-precheck; set to
+    PRECHECK_IMAGE          Docker image tag  (default: ghcr.io/taofu-labs/tpn-precheck; set to
                             a bare local tag like "tpn-precheck" to use a locally built image)
     PRECHECK_HOST_PORT      Host port to bind  (default: 8081)
     PRECHECK_HEALTH_TIMEOUT Wall-clock seconds to wait for base model ready (default: 7200)
@@ -40,7 +40,7 @@ from common.settings import LOG_LEVEL
 # Config
 # ---------------------------------------------------------------------------
 
-_IMAGE          = os.environ.get("PRECHECK_IMAGE", "ghcr.io/taofulabs/tpn-precheck")
+_IMAGE          = os.environ.get("PRECHECK_IMAGE", "ghcr.io/taofu-labs/tpn-precheck")
 _HOST_PORT      = int(os.environ.get("PRECHECK_HOST_PORT", "8081"))
 _HEALTH_TIMEOUT = int(os.environ.get("PRECHECK_HEALTH_TIMEOUT", "7200"))
 _HEALTH_POLL    = int(os.environ.get("PRECHECK_HEALTH_POLL", "15"))

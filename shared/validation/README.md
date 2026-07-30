@@ -50,6 +50,7 @@ Exit code `0` = plausible derivative, `1` = not a plausible derivative, `2` = in
 
 The threshold MUST be calibrated: measure CKA for a few known-independent models that share the same tokenizer, then set the gate above that baseline.
 
+
 ---
 
 ## Limitations

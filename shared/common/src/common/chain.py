@@ -6,6 +6,7 @@ bittensor is imported lazily (inside functions) to prevent its arg-parser
 from hijacking sys.argv when the CLI loads.
 """
 from __future__ import annotations
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
 from loguru import logger
 import tenacity
@@ -15,6 +16,14 @@ from common import settings as common_settings
 if TYPE_CHECKING:
     from bittensor import Subtensor
     from bittensor import Wallet
+
+
+@dataclass
+class TimelockedCommitResult:
+    """Result of a timelocked_commit call."""
+
+    success: bool
+    reveal_round: int
 
 
 def _log_subtensor_retry(retry_state):
@@ -53,6 +62,9 @@ def get_wallet(
     return Wallet(**kwargs)
 
 
+MAX_COMMITMENT_FIELDS = 3  # pallet-commitments MaxFields (runtime MaxCommitFieldsInner)
+
+
 def timelocked_commit(
     subtensor: "Subtensor",
     wallet: "Wallet",
@@ -60,14 +72,28 @@ def timelocked_commit(
     reveal_payload: str,
     blocks_until_reveal: int,
     block_time: float = 12.0,
-) -> bool:
+    previous_reveal_round: Optional[int] = None,
+) -> "TimelockedCommitResult":
     """
     Encrypt reveal_payload with TLE and submit to chain.
     The chain auto-decrypts at the corresponding drand round and stores
     the plaintext in RevealedCommitments storage.
+
+    set_commitment REPLACES the whole CommitmentOf.info.fields list (capped at
+    MAX_COMMITMENT_FIELDS), so a naive single-field call would silently drop
+    any other pending (not-yet-revealed) commitment for this hotkey/subnet —
+    e.g. an overlapping competition committed earlier. To keep those alive we
+    read the existing fields first and append.
+
+    If `previous_reveal_round` is given and matches the reveal_round of an
+    existing pending field, that field is replaced in place instead of
+    appended — this is the republish-same-competition case (caller updating
+    their submission before it reveals) and must not count twice against
+    MAX_COMMITMENT_FIELDS or produce two reveals for the same competition.
     """
     import bittensor_core
     from bittensor import calls
+    from bittensor._generated import storage as st
     from bittensor.intents.plan import Policy
 
     logger.info(
@@ -75,24 +101,44 @@ def timelocked_commit(
         f"| blocks_until_reveal={blocks_until_reveal}"
     )
 
-    # bittensor.timelock.encrypt() wraps the ciphertext in a SCALE `UserData`
-    # envelope meant for other consumers; pallet-commitments expects the raw
-    # compressed TLE ciphertext, so it silently fails to decode and the
-    # commitment is dropped with no reveal. get_encrypted_commitment produces
-    # the unwrapped ciphertext the pallet actually expects.
+    existing = subtensor.query(st.Commitments.CommitmentOf, [netuid, wallet.hotkey.ss58_address])
+    existing_fields = list((existing.get("info") or {}).get("fields") or []) if existing else []
+
+    def _reveal_round(field: dict) -> Optional[int]:
+        return (field.get("TimelockEncrypted") or {}).get("reveal_round")
+
+    replace_index = None
+    if previous_reveal_round is not None:
+        for i, field in enumerate(existing_fields):
+            if _reveal_round(field) == previous_reveal_round:
+                replace_index = i
+                break
+
+    if replace_index is None and len(existing_fields) >= MAX_COMMITMENT_FIELDS:
+        raise ValueError(
+            f"Cannot submit commit: hotkey already has {len(existing_fields)} pending "
+            f"commitment(s) on subnet {netuid} (max {MAX_COMMITMENT_FIELDS}). "
+            "Wait for an existing commit to reveal before submitting another."
+        )
+
     ciphertext, reveal_round = bittensor_core.get_encrypted_commitment(
         reveal_payload, blocks_until_reveal, block_time
     )
     logger.debug(
         f"Encrypted commit | blocks_until_reveal={blocks_until_reveal} "
         f"| block_time={block_time} | reveal_round={reveal_round} "
-        f"| ciphertext_len={len(ciphertext)} | payload={reveal_payload}"
+        f"| ciphertext_len={len(ciphertext)} | payload={reveal_payload} "
+        f"| existing_pending={len(existing_fields)} | replace_index={replace_index}"
     )
-    info = {
-        "fields": [[{
-            "TimelockEncrypted": {"encrypted": ciphertext, "reveal_round": reveal_round}
-        }]]
+    new_field = {
+        "TimelockEncrypted": {"encrypted": ciphertext, "reveal_round": reveal_round}
     }
+    if replace_index is not None:
+        fields = list(existing_fields)
+        fields[replace_index] = new_field
+    else:
+        fields = existing_fields + [new_field]
+    info = {"fields": fields}
     call = calls.Commitments.set_commitment(netuid, info)
 
     # submit_call is policy-gated; temporarily allow raw calls on this connection.
@@ -101,10 +147,10 @@ def timelocked_commit(
     try:
         result = subtensor.submit_call(call, wallet, signer="hotkey")
         logger.debug(f"submit_call result: success={result.success} extrinsic_id={getattr(result, 'extrinsic_id', None)}")
-        return result.success
+        return TimelockedCommitResult(success=result.success, reveal_round=reveal_round)
     except Exception as e:
         logger.error(f"timelocked_commit failed: {e}")
-        return False
+        return TimelockedCommitResult(success=False, reveal_round=reveal_round)
     finally:
         subtensor.policy = original_policy
 

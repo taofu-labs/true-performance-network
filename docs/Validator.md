@@ -50,7 +50,7 @@ Key env vars:
 | `BENCHMARK_BACKEND` | `mock` | `mock` (in-process fake) or `http` (real coordinator) |
 | `COORDINATOR_BASE_URL` | (taofulabs bench endpoint) | Benchmark coordinator base URL, `http` backend only |
 | `COORDINATOR_API_KEY` | (none) | Auth for the benchmark coordinator, `http` backend only |
-| `PRECHECK_IMAGE` | `ghcr.io/taofulabs/tpn-precheck` | Docker image used for provenance/RAM precheck |
+| `PRECHECK_IMAGE` | `ghcr.io/taofu-labs/tpn-precheck` | Docker image used for provenance/RAM precheck |
 | `PRECHECK_HOST_PORT` | `8081` | Host port the precheck container binds to (loopback-only) |
 | `BENCHMARK_POLL_TIMEOUT_SECONDS` | `5400` | Max wall-clock time to poll one benchmark run before giving up |
 

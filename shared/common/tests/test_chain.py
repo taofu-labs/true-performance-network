@@ -43,14 +43,18 @@ class FakeSubnets:
 
 
 class FakeSubtensor:
-    def __init__(self, submit_success=True, registered_uid=1, commitments=None):
+    def __init__(self, submit_success=True, registered_uid=1, commitments=None, existing_commitment=None):
         self._submit_success = submit_success
         self.neurons = FakeNeurons(registered_uid)
         self.subnets = FakeSubnets(FakeMetagraph(commitments or {}))
         self.policy = None
+        self._existing_commitment = existing_commitment
 
     def submit_call(self, call, wallet, signer=None):
         return FakeResult(self._submit_success)
+
+    def query(self, item, params=None):
+        return self._existing_commitment
 
 
 def test_get_subtensor_raises_when_bittensor_disabled(monkeypatch):
@@ -66,14 +70,16 @@ def test_get_subtensor_raises_when_bittensor_disabled(monkeypatch):
 def test_timelocked_commit_returns_result_success():
     wallet = FakeWallet("5FakeHotkey")
     subtensor = FakeSubtensor(submit_success=True)
-    assert chain.timelocked_commit(subtensor, wallet, netuid=2, reveal_payload="{}", blocks_until_reveal=10) is True
+    result = chain.timelocked_commit(subtensor, wallet, netuid=2, reveal_payload="{}", blocks_until_reveal=10)
+    assert result.success is True
     assert subtensor.policy is None  # restored after the call
 
 
 def test_timelocked_commit_returns_false_on_failure():
     wallet = FakeWallet("5FakeHotkey")
     subtensor = FakeSubtensor(submit_success=False)
-    assert chain.timelocked_commit(subtensor, wallet, netuid=2, reveal_payload="{}", blocks_until_reveal=10) is False
+    result = chain.timelocked_commit(subtensor, wallet, netuid=2, reveal_payload="{}", blocks_until_reveal=10)
+    assert result.success is False
 
 
 def test_timelocked_commit_swallows_exceptions():
@@ -83,8 +89,82 @@ def test_timelocked_commit_swallows_exceptions():
 
     wallet = FakeWallet("5FakeHotkey")
     subtensor = RaisingSubtensor()
-    assert chain.timelocked_commit(subtensor, wallet, netuid=2, reveal_payload="{}", blocks_until_reveal=10) is False
+    result = chain.timelocked_commit(subtensor, wallet, netuid=2, reveal_payload="{}", blocks_until_reveal=10)
+    assert result.success is False
     assert subtensor.policy is None  # restored even on failure
+
+
+def test_timelocked_commit_appends_to_existing_pending_field():
+    wallet = FakeWallet("5FakeHotkey")
+    existing = {"info": {"fields": [{"TimelockEncrypted": {"encrypted": [1, 2, 3], "reveal_round": 111}}]}}
+    subtensor = FakeSubtensor(submit_success=True, existing_commitment=existing)
+    captured = {}
+
+    from bittensor import calls as calls_mod
+    original_set_commitment = calls_mod.Commitments.set_commitment
+
+    def capture_set_commitment(netuid, info):
+        captured["info"] = info
+        return original_set_commitment(netuid, info)
+
+    import unittest.mock
+    with unittest.mock.patch.object(calls_mod.Commitments, "set_commitment", staticmethod(capture_set_commitment)):
+        result = chain.timelocked_commit(subtensor, wallet, netuid=2, reveal_payload="{}", blocks_until_reveal=10)
+
+    assert result.success is True
+    assert len(captured["info"]["fields"]) == 2
+    assert captured["info"]["fields"][0]["TimelockEncrypted"]["reveal_round"] == 111
+
+
+def test_timelocked_commit_raises_when_max_fields_reached():
+    wallet = FakeWallet("5FakeHotkey")
+    existing = {
+        "info": {
+            "fields": [
+                {"TimelockEncrypted": {"encrypted": [1], "reveal_round": 111}},
+                {"TimelockEncrypted": {"encrypted": [2], "reveal_round": 222}},
+                {"TimelockEncrypted": {"encrypted": [3], "reveal_round": 333}},
+            ]
+        }
+    }
+    subtensor = FakeSubtensor(submit_success=True, existing_commitment=existing)
+    wallet2 = FakeWallet("5FakeHotkey")
+    try:
+        chain.timelocked_commit(subtensor, wallet2, netuid=2, reveal_payload="{}", blocks_until_reveal=10)
+        assert False, "expected ValueError"
+    except ValueError as e:
+        assert "max 3" in str(e) or "3 pending" in str(e)
+
+
+def test_timelocked_commit_replaces_matching_reveal_round():
+    wallet = FakeWallet("5FakeHotkey")
+    existing = {
+        "info": {
+            "fields": [
+                {"TimelockEncrypted": {"encrypted": [9, 9, 9], "reveal_round": 555}},
+            ]
+        }
+    }
+    subtensor = FakeSubtensor(submit_success=True, existing_commitment=existing)
+    captured = {}
+
+    from bittensor import calls as calls_mod
+    original_set_commitment = calls_mod.Commitments.set_commitment
+
+    def capture_set_commitment(netuid, info):
+        captured["info"] = info
+        return original_set_commitment(netuid, info)
+
+    import unittest.mock
+    with unittest.mock.patch.object(calls_mod.Commitments, "set_commitment", staticmethod(capture_set_commitment)):
+        result = chain.timelocked_commit(
+            subtensor, wallet, netuid=2, reveal_payload="{}", blocks_until_reveal=10,
+            previous_reveal_round=555,
+        )
+
+    assert result.success is True
+    assert len(captured["info"]["fields"]) == 1
+    assert captured["info"]["fields"][0]["TimelockEncrypted"]["encrypted"] != [9, 9, 9]
 
 
 def test_is_hotkey_registered_true_and_false():

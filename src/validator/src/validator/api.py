@@ -78,7 +78,10 @@ class LeaderApiMixin:
             return web.json_response({"error": "competition_id is required"}, status=400)
         since_run_id = int(request.query.get("since_run_id", 0))
         runs = store.scoring_results_since(self._db, competition_id, since_run_id)
-        return web.json_response({"runs": runs})
+        return web.json_response({
+            "runs": runs,
+            "scored_status": store.scored_status(self._db, competition_id),
+        })
 
     # ── /v1/state/* ────────────────────────────────────────────────────
 

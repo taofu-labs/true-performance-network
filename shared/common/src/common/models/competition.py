@@ -5,6 +5,7 @@ from pydantic import BaseModel, model_validator
 
 class CompetitionPhase(str, Enum):
     OPEN = "open"                  # start_block → commit_end_block
+    REVEALING = "revealing"        # commit_end_block → commit_end_block + reveal_grace_blocks
     SCORING = "scoring"            # commit_end_block + grace → scoring_end_block
     DISTRIBUTING = "distributing"  # scoring_end_block → distribution_end_block
     COMPLETE = "complete"          # distribution_end_block reached
@@ -79,6 +80,8 @@ class CompetitionSpec(BaseModel):
     def phase(self, current_block: int) -> CompetitionPhase:
         if current_block < self.commit_end_block:
             return CompetitionPhase.OPEN
+        if current_block < self.scoring_starts_at():
+            return CompetitionPhase.REVEALING
         if current_block < self.scoring_end_block:
             return CompetitionPhase.SCORING
         if current_block < self.distribution_end_block():
@@ -101,6 +104,8 @@ class CompetitionSpec(BaseModel):
         phase = self.phase(current_block)
         if phase == CompetitionPhase.OPEN:
             return max(0, self.commit_end_block - current_block)
+        if phase == CompetitionPhase.REVEALING:
+            return max(0, self.scoring_starts_at() - current_block)
         if phase == CompetitionPhase.SCORING:
             return max(0, self.scoring_end_block - current_block)
         if phase == CompetitionPhase.DISTRIBUTING:

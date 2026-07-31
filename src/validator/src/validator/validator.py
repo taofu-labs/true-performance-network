@@ -111,8 +111,11 @@ class Validator(HealthServerMixin, LeaderApiMixin):
                     if phase == CompetitionPhase.OPEN:
                         logger.debug(f"OPEN phase — waiting for commit_end_block {spec.commit_end_block}")
 
+                    elif phase == CompetitionPhase.REVEALING:
+                        logger.debug(f"REVEALING phase — waiting for reveal grace to end at {spec.scoring_starts_at()}")
+
                     elif phase == CompetitionPhase.SCORING:
-                        if current_block >= spec.scoring_starts_at() and not store.is_scored(self._db, spec.id):
+                        if not store.is_scored(self._db, spec.id):
                             done = await self._run_scoring(spec, current_block)
                             if done:
                                 store.mark_scored(self._db, spec.id)
@@ -122,7 +125,7 @@ class Validator(HealthServerMixin, LeaderApiMixin):
                                     logger.warning(
                                         f"{spec.id}: giving up after {attempts} attempts — marking scored with no result"
                                     )
-                                    store.mark_scored(self._db, spec.id)
+                                    store.mark_scored(self._db, spec.id, status="failed_no_reveals")
                                 else:
                                     logger.info(
                                         f"{spec.id}: retryable scoring failure, attempt {attempts}/{store.MAX_REVEAL_ATTEMPTS}"
@@ -155,9 +158,13 @@ class Validator(HealthServerMixin, LeaderApiMixin):
                     if phase not in (CompetitionPhase.SCORING, CompetitionPhase.DISTRIBUTING, CompetitionPhase.COMPLETE):
                         continue
 
-                    runs = self._leader_client.get_scoring_results(spec.id)
+                    runs, scored_status = self._leader_client.get_scoring_results(spec.id)
                     if not runs:
-                        logger.debug(f"{spec.id}: no scoring results from leader yet")
+                        if scored_status == "failed_no_reveals":
+                            logger.warning(f"{spec.id}: leader gave up with no reveals — marking scored, no weights")
+                            store.mark_scored(self._db, spec.id, status="failed_no_reveals")
+                        else:
+                            logger.debug(f"{spec.id}: no scoring results from leader yet")
                         continue
 
                     latest = runs[-1]

@@ -1,7 +1,7 @@
 """
 Follower validator's HTTP client for the leader validator's read API.
 """
-from typing import List
+from typing import List, Optional
 
 import requests
 
@@ -13,12 +13,13 @@ class LeaderClient:
         self._base = base_url.rstrip("/")
         self._timeout = timeout
 
-    def get_scoring_results(self, competition_id: str, since_run_id: int = 0) -> List[dict]:
-        """Returns list of {run_id, competition_id, block, scored_at, results: [...]}."""
+    def get_scoring_results(self, competition_id: str, since_run_id: int = 0) -> tuple[List[dict], Optional[str]]:
+        """Returns (runs, scored_status). scored_status is 'scored', 'failed_no_reveals', or None if not yet scored."""
         resp = requests.get(
             f"{self._base}/v1/follower/scoring-results",
             params={"competition_id": competition_id, "since_run_id": since_run_id},
             timeout=self._timeout,
         )
         resp.raise_for_status()
-        return resp.json().get("runs", [])
+        body = resp.json()
+        return body.get("runs", []), body.get("scored_status")

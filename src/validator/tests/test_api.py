@@ -67,7 +67,7 @@ async def test_follower_scoring_results_empty_for_unknown_competition(conn):
         resp = await client.get("/v1/follower/scoring-results", params={"competition_id": "comp1"})
         assert resp.status == 200
         body = await resp.json()
-        assert body == {"runs": []}
+        assert body == {"runs": [], "scored_status": None}
 
 
 @pytest.mark.asyncio

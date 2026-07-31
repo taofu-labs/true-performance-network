@@ -32,12 +32,8 @@ def make_payload(competition_id="comp1") -> str:
 
 
 class FakeSubtensor:
-    def __init__(self, reveals, fast_blocks=False):
+    def __init__(self, reveals):
         self._reveals = reveals
-        self._fast_blocks = fast_blocks
-
-    def is_fast_blocks(self):
-        return self._fast_blocks
 
 
 def make_db():
@@ -56,7 +52,7 @@ def test_scan_reveals_accepts_exact_block_match(monkeypatch):
     assert set(result) == {"hk1"}
 
 
-def test_scan_reveals_rejects_wrong_block(monkeypatch):
+def test_scan_reveals_rejects_block_before_window(monkeypatch):
     spec = make_spec(commit_end_block=100)
     reveals = {"hk1": [(make_payload(), 99)]}
     monkeypatch.setattr("validator.chain_scanner.read_revealed_commitments", lambda subtensor, netuid: reveals)
@@ -65,13 +61,22 @@ def test_scan_reveals_rejects_wrong_block(monkeypatch):
     assert result == {}
 
 
-def test_scan_reveals_fast_blocks_tolerance_window(monkeypatch):
+def test_scan_reveals_accepts_within_grace_window(monkeypatch):
     spec = make_spec(commit_end_block=100)
     reveals = {"hk1": [(make_payload(), 103)]}
     monkeypatch.setattr("validator.chain_scanner.read_revealed_commitments", lambda subtensor, netuid: reveals)
 
-    result = scan_reveals(FakeSubtensor(reveals, fast_blocks=True), spec, make_db())
+    result = scan_reveals(FakeSubtensor(reveals), spec, make_db())
     assert set(result) == {"hk1"}
+
+
+def test_scan_reveals_rejects_block_after_window(monkeypatch):
+    spec = make_spec(commit_end_block=100)
+    reveals = {"hk1": [(make_payload(), 105)]}
+    monkeypatch.setattr("validator.chain_scanner.read_revealed_commitments", lambda subtensor, netuid: reveals)
+
+    result = scan_reveals(FakeSubtensor(reveals), spec, make_db())
+    assert result == {}
 
 
 def test_scan_reveals_skips_banned_hotkey(monkeypatch):

@@ -96,7 +96,8 @@ CREATE TABLE IF NOT EXISTS weights_history (
 CREATE TABLE IF NOT EXISTS scored_competitions (
     competition_id TEXT PRIMARY KEY,
     scored_at REAL NOT NULL,
-    reveal_attempts INTEGER NOT NULL DEFAULT 0
+    reveal_attempts INTEGER NOT NULL DEFAULT 0,
+    status TEXT NOT NULL DEFAULT 'scored'
 );
 
 CREATE TABLE IF NOT EXISTS banned_hotkeys (
@@ -272,6 +273,7 @@ def full_state_for_competition(conn: sqlite3.Connection, competition_id: str) ->
         "competition_id": competition_id,
         "runs": run_details,
         "weights_history": weights_history_for_competition(conn, competition_id),
+        "scored_status": scored_status(conn, competition_id),
     }
 
 
@@ -297,10 +299,13 @@ def _result_row_to_dict(r: sqlite3.Row) -> dict:
 MAX_REVEAL_ATTEMPTS = 3  # 1 initial + 2 retries
 
 
-def mark_scored(conn: sqlite3.Connection, competition_id: str) -> None:
+def mark_scored(conn: sqlite3.Connection, competition_id: str, status: str = "scored") -> None:
+    """status: 'scored' (normal completion) or 'failed_no_reveals' (gave up after retries)."""
     conn.execute(
-        "INSERT OR REPLACE INTO scored_competitions (competition_id, scored_at) VALUES (?, ?)",
-        (competition_id, time.time()),
+        "INSERT INTO scored_competitions (competition_id, scored_at, status) "
+        "VALUES (?, ?, ?) "
+        "ON CONFLICT(competition_id) DO UPDATE SET scored_at = excluded.scored_at, status = excluded.status",
+        (competition_id, time.time(), status),
     )
     conn.commit()
 
@@ -310,6 +315,13 @@ def is_scored(conn: sqlite3.Connection, competition_id: str) -> bool:
         "SELECT scored_at FROM scored_competitions WHERE competition_id = ?", (competition_id,)
     ).fetchone()
     return row is not None and row["scored_at"] > 0
+
+
+def scored_status(conn: sqlite3.Connection, competition_id: str) -> Optional[str]:
+    row = conn.execute(
+        "SELECT status FROM scored_competitions WHERE competition_id = ?", (competition_id,)
+    ).fetchone()
+    return row["status"] if row else None
 
 
 def bump_reveal_attempts(conn: sqlite3.Connection, competition_id: str) -> int:

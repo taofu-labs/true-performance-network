@@ -29,18 +29,18 @@ def scan_reveals(
     Returns {hotkey: MinerSubmission} — one valid submission per hotkey (newest wins).
     """
     all_reveals = read_revealed_commitments(subtensor, settings.NETUID)
-    is_fast_blocks = subtensor.is_fast_blocks()
     results: Dict[str, MinerSubmission] = {}
 
-    logger.debug(f"scan_reveals | {competition.id} | commit_end_block={competition.commit_end_block} | fast_blocks={is_fast_blocks} | {len(all_reveals)} hotkeys with reveals: {all_reveals}")
+    logger.debug(f"scan_reveals | {competition.id} | commit_end_block={competition.commit_end_block} | {len(all_reveals)} hotkeys with reveals: {all_reveals}")
 
     for hotkey, entries in all_reveals.items():
         if store.is_banned(conn, hotkey):
             logger.debug(f"Skipping banned hotkey {hotkey[:12]}")
             continue
-        # Only accept reveals at the competition's commit_end_block
+        # Accept reveals landing within a small window after commit_end_block —
+        # the chain's TLE auto-decrypt lands within ~5 blocks, not exactly on it.
         for raw, reveal_block in entries:
-            if _matches_block(reveal_block, competition.commit_end_block, is_fast_blocks):
+            if _matches_block(reveal_block, competition.commit_end_block):
                 submission = parse_reveal_payload(raw)
                 if submission is None:
                     logger.debug(f"Malformed reveal payload for {hotkey[:12]}")
@@ -58,11 +58,5 @@ def scan_reveals(
     return results
 
 
-def _matches_block(
-    reveal_block: int,
-    commit_end_block: int,
-    is_fast_blocks: bool,
-) -> bool:
-    if is_fast_blocks:
-        return reveal_block > commit_end_block - 5 and reveal_block < commit_end_block + 5
-    return reveal_block == commit_end_block
+def _matches_block(reveal_block: int, commit_end_block: int) -> bool:
+    return commit_end_block <= reveal_block < commit_end_block + 5

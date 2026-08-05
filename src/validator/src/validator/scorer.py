@@ -46,6 +46,32 @@ class ScoringOutcome:
     reason: str = ""
 
 
+def dedup_winner(
+    seen: Dict[str, "tuple[str, int]"],
+    hotkey: str,
+    file_sha256: str,
+    reveal_block: int,
+) -> Optional["tuple[str, int]"]:
+    """
+    Cross-hotkey sha256 dedup, keyed on self-reported file_sha256, tiebroken
+    by reveal_block (chain-native, unforgeable) then hotkey (deterministic).
+
+    `seen` maps file_sha256 -> (hotkey, reveal_block) of the current in-run
+    winner for that hash. Returns None if there's no collision (or this
+    candidate is the new winner — caller should update `seen`), or
+    (winner_hotkey, winner_block) if this candidate loses.
+    """
+    existing = seen.get(file_sha256)
+    if existing is None:
+        return None
+    existing_hotkey, existing_block = existing
+    if reveal_block < existing_block:
+        return None
+    if reveal_block == existing_block and hotkey < existing_hotkey:
+        return None
+    return existing_hotkey, existing_block
+
+
 @dataclass
 class PrecheckPass:
     """Carries everything benchmark_one needs — produced by precheck_one on success."""
@@ -151,6 +177,7 @@ async def benchmark_one(
     p: PrecheckPass,
     spec: CompetitionSpec,
     coordinator: Coordinator,
+    conn: sqlite3.Connection,
     poll_interval: float = 30.0,
     max_wait_seconds: float = None,
 ) -> ScoringOutcome:
@@ -196,6 +223,23 @@ async def benchmark_one(
                 logger.debug(f"{hotkey[:12]} {bname}={actual_scores[bname]:.4f}")
             elif status.status == RunStatusCode.FAILED:
                 return _skip(hotkey, submission, f"benchmark {bname} failed: {status.failure_reason or 'unknown'}")
+
+    # Score-mismatch check: miner claimed a benchmark score in its reveal
+    # higher than what the coordinator actually measured. Only under-delivery
+    # is a lie worth banning — actual scoring higher than claimed is not
+    # penalized (e.g. non-determinism, claim rounded down).
+    claimed_scores = submission.self_reported_scores
+    tolerance = common_settings.SCORE_LYING_TOLERANCE
+    for bname, actual in actual_scores.items():
+        claim = claimed_scores.get(bname)
+        if claim is None or claim == 0:
+            continue
+        shortfall = (claim - actual) / claim
+        if shortfall > tolerance:
+            reason = f"score mismatch on {bname}: claimed={claim:.4f} actual={actual:.4f} ({shortfall:.1%} lower)"
+            store.ban(conn, hotkey, reason)
+            logger.warning(f"{hotkey[:12]} BANNED — {reason}")
+            return _skip(hotkey, submission, f"{reason} (hotkey banned)", actual_scores=actual_scores)
 
     # Floor check
     passed, failures = passes_floors(actual_scores, spec.benchmarks)

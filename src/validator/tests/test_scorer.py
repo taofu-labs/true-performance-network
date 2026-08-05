@@ -107,11 +107,66 @@ def test_precheck_one_bans_on_sha256_mismatch(monkeypatch):
     assert store.is_banned(conn, "hk1") is True
 
 
+def test_dedup_winner_no_collision_when_hash_unseen():
+    result = scorer.dedup_winner({}, "hk1", "a" * 64, 100)
+    assert result is None
+
+
+def test_dedup_winner_later_reveal_block_loses():
+    seen = {"a" * 64: ("hkA", 100)}
+    result = scorer.dedup_winner(seen, "hkB", "a" * 64, 105)
+    assert result == ("hkA", 100)
+
+
+def test_dedup_winner_earlier_reveal_block_wins():
+    seen = {"a" * 64: ("hkA", 105)}
+    result = scorer.dedup_winner(seen, "hkB", "a" * 64, 100)
+    assert result is None
+
+
+def test_dedup_winner_tie_break_by_hotkey():
+    seen = {"a" * 64: ("hkB", 100)}
+    # "hkA" < "hkB" lexicographically — challenger wins the tie
+    assert scorer.dedup_winner(seen, "hkA", "a" * 64, 100) is None
+    # "hkC" > "hkB" lexicographically — challenger loses the tie
+    assert scorer.dedup_winner(seen, "hkC", "a" * 64, 100) == ("hkB", 100)
+
+
+def _mock_score(repo: str, revision: str, benchmark: str) -> float:
+    """Mirror MockCoordinator's deterministic score derivation so tests can
+    submit a matching claim and avoid tripping the score-mismatch ban."""
+    import hashlib
+    import uuid
+    seed = f"{repo}:{revision}:{benchmark}"
+    run_id = str(uuid.UUID(hashlib.md5(seed.encode()).hexdigest()))
+    h = int(hashlib.sha256(run_id.encode()).hexdigest(), 16)
+    return round(0.55 + (h % 10000) / 10000 * 0.30, 4)
+
+
+def make_submission_matching_mock(**overrides) -> MinerSubmission:
+    """Like make_submission(), but claims the score MockCoordinator will
+    actually produce, so tests that exercise benchmark_one's floor/score
+    checks don't spuriously trip the score-mismatch ban."""
+    score = _mock_score("user/repo", "a" * 40, "mmlu")
+    kwargs = dict(
+        competition_id="comp1",
+        claims=[Claim(b="mmlu", s=score)],
+        repository="user/repo",
+        file="model.gguf",
+        file_sha256="a" * 64,
+        max_memory=1000,
+        huggingface_revision="a" * 40,
+    )
+    kwargs.update(overrides)
+    return MinerSubmission(**kwargs)
+
+
 @pytest.mark.asyncio
 async def test_benchmark_one_scores_with_mock_coordinator():
     coordinator = MockCoordinator()
-    p = scorer.PrecheckPass(hotkey="hk1", submission=make_submission(), gguf_file="model.gguf", measured_memory_kb=999)
-    outcome = await scorer.benchmark_one(p, make_spec(), coordinator, poll_interval=0)
+    submission = make_submission_matching_mock()
+    p = scorer.PrecheckPass(hotkey="hk1", submission=submission, gguf_file="model.gguf", measured_memory_kb=999)
+    outcome = await scorer.benchmark_one(p, make_spec(), coordinator, conn=make_db(), poll_interval=0)
     assert outcome.kind == scorer.OutcomeKind.SCORED
     assert outcome.result.hotkey == "hk1"
     assert "mmlu" in outcome.result.actual_scores
@@ -126,7 +181,34 @@ async def test_benchmark_one_skips_below_floor():
         benchmarks=[BenchmarkTask(name="mmlu", min_score=0.999, weight=1.0)],
     )
     coordinator = MockCoordinator()
-    p = scorer.PrecheckPass(hotkey="hk1", submission=make_submission(), gguf_file="model.gguf", measured_memory_kb=999)
-    outcome = await scorer.benchmark_one(p, spec, coordinator, poll_interval=0)
+    submission = make_submission_matching_mock()
+    p = scorer.PrecheckPass(hotkey="hk1", submission=submission, gguf_file="model.gguf", measured_memory_kb=999)
+    outcome = await scorer.benchmark_one(p, spec, coordinator, conn=make_db(), poll_interval=0)
     assert outcome.kind == scorer.OutcomeKind.SKIPPED
     assert "failed floors" in outcome.reason
+
+
+@pytest.mark.asyncio
+async def test_benchmark_one_bans_when_actual_lower_than_claimed():
+    coordinator = MockCoordinator()
+    # Claim well above the mock's actual deterministic score (~0.7388).
+    submission = make_submission_matching_mock(claims=[Claim(b="mmlu", s=0.99)])
+    p = scorer.PrecheckPass(hotkey="hk1", submission=submission, gguf_file="model.gguf", measured_memory_kb=999)
+    conn = make_db()
+    outcome = await scorer.benchmark_one(p, make_spec(), coordinator, conn=conn, poll_interval=0)
+    assert outcome.kind == scorer.OutcomeKind.SKIPPED
+    assert "hotkey banned" in outcome.reason
+    assert store.is_banned(conn, "hk1") is True
+
+
+@pytest.mark.asyncio
+async def test_benchmark_one_does_not_ban_when_actual_higher_than_claimed():
+    coordinator = MockCoordinator()
+    # Claim well below the mock's actual deterministic score (~0.7388) —
+    # over-delivery is not a lie and must not be banned.
+    submission = make_submission_matching_mock(claims=[Claim(b="mmlu", s=0.01)])
+    p = scorer.PrecheckPass(hotkey="hk1", submission=submission, gguf_file="model.gguf", measured_memory_kb=999)
+    conn = make_db()
+    outcome = await scorer.benchmark_one(p, make_spec(), coordinator, conn=conn, poll_interval=0)
+    assert outcome.kind == scorer.OutcomeKind.SCORED
+    assert store.is_banned(conn, "hk1") is False

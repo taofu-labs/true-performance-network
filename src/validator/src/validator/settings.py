@@ -22,6 +22,12 @@ CLIENT_REQUEST_TIMEOUT = int(os.getenv("CLIENT_REQUEST_TIMEOUT", 30))
 
 BENCHMARK_POLL_INTERVAL: float = float(os.getenv("BENCHMARK_POLL_INTERVAL", 30.0))
 
+# Minimum alpha a hotkey must have locked as miner collateral to be scored
+# this run. Not a ban — a miner below threshold is simply skipped for the
+# current scoring pass; topping up collateral before the next pass restores
+# scoring. 0 = disabled.
+COLLATERAL_MIN_THRESHOLD: float = float(os.getenv("COLLATERAL_MIN_THRESHOLD", 0))
+
 # Leader API (mode=leader only) — serves read-only scoring state to followers/dashboards
 LEADER_API_HOST = os.getenv("LEADER_API_HOST", "0.0.0.0")
 LEADER_API_PORT = int(os.getenv("LEADER_API_PORT", 9200))

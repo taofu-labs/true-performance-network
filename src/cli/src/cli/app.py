@@ -5,6 +5,7 @@ from cli.commands.upload import upload
 from cli.commands.commit import commit
 from cli.commands.publish import publish
 from cli.commands.status import status
+from cli.commands.collateral_status import collateral_status
 from cli.commands.version import get_version
 from typing import Optional
 from cli.utils.context import (
@@ -57,6 +58,7 @@ app.command("upload")(upload)
 app.command("commit")(commit)
 app.command("publish")(publish)
 app.command("status")(status)
+app.command("collateral-status")(collateral_status)
 app.command("version")(get_version)
 
 if __name__ == "__main__":

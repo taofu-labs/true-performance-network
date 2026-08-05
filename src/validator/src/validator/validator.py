@@ -191,13 +191,15 @@ class Validator(HealthServerMixin, LeaderApiMixin):
         Returns False for a retryable failure (no reveals yet, coordinator
         unreachable) so the caller can retry on a later tick."""
         from validator.chain_scanner import scan_reveals
-        from validator.scorer import precheck_one, benchmark_one, PrecheckPass, ScoringOutcome
+        from validator.scorer import precheck_one, benchmark_one, dedup_winner, _skip, PrecheckPass, ScoringOutcome
         from competition.benchmark_client import make_coordinator
         from competition.precheck_client import PrecheckContainer
         from competition.scoring import sort_by_self_reported, compute_emission_weights
         from validator import settings as validator_settings
 
         logger.info(f"🏆 Scoring competition {spec.id}")
+
+        all_outcomes: list[ScoringOutcome] = []
 
         reveals = scan_reveals(self.subtensor, spec, self._db)
         logger.debug(f"scan_reveals returned {len(reveals)} reveal(s): {list(reveals.keys())}")
@@ -212,7 +214,59 @@ class Validator(HealthServerMixin, LeaderApiMixin):
             logger.warning("No reveals from registered hotkeys. Skipping weight update.")
             return False
 
-        ranked_candidates = sort_by_self_reported(reveals, spec)
+        # Collateral skip: a hotkey below COLLATERAL_MIN_THRESHOLD is excluded
+        # from this scoring run only — not a ban, no persistent state change.
+        # `None` (runtime doesn't report collateral yet) never skips.
+        collateral_by_hotkey = {n.hotkey: n.collateral_locked for n in self.metagraph.neurons}
+        min_collateral = validator_settings.COLLATERAL_MIN_THRESHOLD
+        if min_collateral > 0:
+            def _has_collateral(hotkey: str) -> bool:
+                collateral = collateral_by_hotkey.get(hotkey)
+                if collateral is None:
+                    return True
+                return collateral.amount >= min_collateral
+
+            skipped = {hk for hk in reveals if not _has_collateral(hk)}
+            for hk in skipped:
+                logger.info(f"{hk[:12]} skipped — collateral below threshold ({collateral_by_hotkey[hk]} < {min_collateral})")
+            reveals = {hk: sub for hk, sub in reveals.items() if hk not in skipped}
+            if not reveals:
+                logger.warning("No reveals left after collateral skip. Skipping weight update.")
+                return False
+
+        # sha256 dedup: when two reveals share the same self-reported file_sha256,
+        # only the earlier reveal_block (chain-native, unforgeable) is eligible.
+        # Filtered out here, before precheck, so a losing duplicate never costs a
+        # Docker container run. Safe to key on self-reported hash: a hotkey that
+        # falsely claims another's hash gets banned by precheck's existing
+        # sha256-mismatch check if it wins the slot, or is simply skipped if it
+        # loses — no incentive either way.
+        seen_hashes: dict[str, tuple[str, int]] = {}
+        dedup_losers: dict[str, tuple[str, int]] = {}
+        for hotkey, (submission, block) in sorted(reveals.items(), key=lambda kv: kv[1][1]):
+            loser = dedup_winner(seen_hashes, hotkey, submission.file_sha256, block)
+            if loser is not None:
+                dedup_losers[hotkey] = loser
+            else:
+                seen_hashes[submission.file_sha256] = (hotkey, block)
+
+        if dedup_losers:
+            for hotkey, (winner_hotkey, winner_block) in dedup_losers.items():
+                submission, block = reveals[hotkey]
+                reason = (
+                    f"duplicate file_sha256={submission.file_sha256[:12]} — earlier reveal by "
+                    f"{winner_hotkey[:12]} at block {winner_block} (this reveal at block {block})"
+                )
+                all_outcomes.append(_skip(hotkey, submission, reason))
+                logger.info(f"SKIPPED {hotkey[:12]}: {reason} — dedup loss")
+            reveals = {hk: v for hk, v in reveals.items() if hk not in dedup_losers}
+            if not reveals:
+                logger.warning("No reveals left after dedup filtering. Skipping weight update.")
+                return True
+
+        ranked_candidates = sort_by_self_reported(
+            {hk: sub for hk, (sub, _block) in reveals.items()}, spec
+        )
         logger.debug(f"Ranked candidates by self-reported score: {[hk[:12] for hk, _ in ranked_candidates]}")
         coordinator = make_coordinator()
 
@@ -236,7 +290,6 @@ class Validator(HealthServerMixin, LeaderApiMixin):
 
         # Phase 1: sequential precheck — backfill on skip OR disqualify until top_n pass
         passed: list[PrecheckPass] = []
-        all_outcomes: list[ScoringOutcome] = []
         try:
             for hotkey, submission in ranked_candidates:
                 result = await asyncio.to_thread(precheck_one, hotkey, submission, spec, precheck_ctr, self._db)
@@ -262,7 +315,7 @@ class Validator(HealthServerMixin, LeaderApiMixin):
         # Phase 2: parallel benchmark — all passed miners run concurrently
         poll_interval = getattr(validator_settings, "BENCHMARK_POLL_INTERVAL", 30.0)
         benchmark_outcomes = await asyncio.gather(*[
-            benchmark_one(p, spec, coordinator, poll_interval)
+            benchmark_one(p, spec, coordinator, self._db, poll_interval)
             for p in passed
         ])
         all_outcomes.extend(benchmark_outcomes)
@@ -274,7 +327,10 @@ class Validator(HealthServerMixin, LeaderApiMixin):
         logger.debug(f"Final ranking: {[(r.hotkey[:12], r.final_score) for r in ranked]}")
         logger.debug(f"Emission weights: {hotkey_weights}")
 
-        store.record_scoring_run(self._db, spec.id, current_block, all_outcomes, reveals)
+        store.record_scoring_run(
+            self._db, spec.id, current_block, all_outcomes,
+            {hk: sub for hk, (sub, _block) in reveals.items()},
+        )
         store.record_weights(self._db, spec.id, hotkey_weights)
 
         logger.info(f"Weights computed: {[(k[:8], v) for k, v in hotkey_weights.items() if v > 0]}")

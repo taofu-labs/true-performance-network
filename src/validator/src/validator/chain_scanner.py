@@ -6,7 +6,7 @@ plaintext in RevealedCommitments storage. Validators read that storage directly.
 """
 from __future__ import annotations
 import sqlite3
-from typing import TYPE_CHECKING, Dict
+from typing import TYPE_CHECKING, Dict, Tuple
 from loguru import logger
 
 if TYPE_CHECKING:
@@ -23,13 +23,16 @@ def scan_reveals(
     subtensor: Subtensor,
     competition: CompetitionSpec,
     conn: sqlite3.Connection,
-) -> Dict[str, MinerSubmission]:
+) -> Dict[str, Tuple[MinerSubmission, int]]:
     """
     Read auto-revealed payloads from RevealedCommitments storage.
-    Returns {hotkey: MinerSubmission} — one valid submission per hotkey (newest wins).
+    Returns {hotkey: (MinerSubmission, reveal_block)} — one valid submission per
+    hotkey (newest wins). reveal_block is the chain block at which this reveal's
+    TLE commitment was auto-decrypted — sourced from chain storage, not
+    self-reported, used by callers for sha256-dedup tiebreaking.
     """
     all_reveals = read_revealed_commitments(subtensor, settings.NETUID)
-    results: Dict[str, MinerSubmission] = {}
+    results: Dict[str, Tuple[MinerSubmission, int]] = {}
 
     logger.debug(f"scan_reveals | {competition.id} | commit_end_block={competition.commit_end_block} | {len(all_reveals)} hotkeys with reveals: {all_reveals}")
 
@@ -49,7 +52,7 @@ def scan_reveals(
                     logger.debug(f"Wrong competition_id in reveal for {hotkey[:12]}")
                     continue
                 logger.debug(f"Accepted submission from {hotkey[:12]}: {submission}")
-                results[hotkey] = submission
+                results[hotkey] = (submission, reveal_block)
                 break  # one submission per hotkey
             else:
                 logger.debug(f"reveal_block={reveal_block} outside window for commit_end_block={competition.commit_end_block} (hotkey={hotkey[:12]})")

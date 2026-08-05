@@ -236,30 +236,31 @@ wheels = [
 
 [[package]]
 name = "bittensor"
-version = "11.0.0"
+version = "11.0.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "bittensor-core" },
     { name = "eth-account" },
+    { name = "qrcode" },
     { name = "rich" },
     { name = "typer" },
     { name = "websockets" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/00/14/51265fd57e4d6ca662cf8ad28c7b92bcd5ca50ce171e544fe2ab537dfbbe/bittensor-11.0.0.tar.gz", hash = "sha256:b53c5030d88fac9888f7acbca8069985d7f609021ce634c11f5db14af4e788d5", size = 1054078, upload-time = "2026-07-17T09:08:03.736Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/b7/97/56d2f9f2a50f4a55d342707e56b281d5f2cc4634c8f18f9b147198e41d16/bittensor-11.0.1.tar.gz", hash = "sha256:810164fb5fe2c3530ffdf67c0d188e5a61883841cf9874d9cb41b9aa1ecfe69b", size = 1102546, upload-time = "2026-07-23T21:22:06.729Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/c9/52/31638552c3e0cb2447057935c88ab932607ff97d0975a46c30a631453ff0/bittensor-11.0.0-py3-none-any.whl", hash = "sha256:63ba0fc1b50a006bfb3d20fcde894ae555da3751016902ec28b6225997d03423", size = 558551, upload-time = "2026-07-17T09:07:54.827Z" },
+    { url = "https://files.pythonhosted.org/packages/98/0d/8bb37e2a7b0ac889685a31863605fa9c65034ed6b8d3e47449a1cff1fe7d/bittensor-11.0.1-py3-none-any.whl", hash = "sha256:43039533353927b50d2684758744c9570aae7ae6e6d50d618bc44189a289a398", size = 609099, upload-time = "2026-07-23T21:21:55.33Z" },
 ]
 
 [[package]]
 name = "bittensor-core"
-version = "0.1.0"
+version = "0.1.1"
 source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/89/32/6da6e44aa3ec7283fd75376f0f5cbc0601dc007c5d91b07d167df92b9861/bittensor_core-0.1.0.tar.gz", hash = "sha256:dd7cd31b0ca7cb3d236bb6bb66827f81be054d502e223ff8a440cffd3f03db29", size = 277107, upload-time = "2026-07-17T09:08:04.936Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/1a/99/d37584bd0e88f7d166d58881c099fdb5c322ac1ec0fbb08da32c558466d1/bittensor_core-0.1.1.tar.gz", hash = "sha256:c40c34b99863734ba887fe9bcc5169e08beac95eef73a70f9eb8e430b22f8cb5", size = 277715, upload-time = "2026-07-23T21:22:08.22Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/26/5a/970c93f7ce39d400a2bacfb53dc70cedd6e381a57ee6a77e410562c1e50c/bittensor_core-0.1.0-cp310-abi3-macosx_10_12_x86_64.whl", hash = "sha256:508180b636fd21c0a2ef960178ccee5155410f1f7344e12a5fd8a96d870391a4", size = 4564799, upload-time = "2026-07-17T09:07:56.468Z" },
-    { url = "https://files.pythonhosted.org/packages/7a/3a/51b03dca274c600a2150f925aeb283ce73dd8bf3c8a0beb425f142a23169/bittensor_core-0.1.0-cp310-abi3-macosx_11_0_arm64.whl", hash = "sha256:7dbdd31cd1989f530c4af9a66379a16c9cd462c316d59d28e251ef42381eb632", size = 4718558, upload-time = "2026-07-17T09:07:58.367Z" },
-    { url = "https://files.pythonhosted.org/packages/21/97/0ed6570c74cf78dbd589ab4d90b3693bd095672dba3b23d961a7917eb332/bittensor_core-0.1.0-cp310-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:6f556b663125ee50d42cce4fd984b3c5059e564784703b1dfde2b9111a017b01", size = 5189146, upload-time = "2026-07-17T09:08:00.149Z" },
-    { url = "https://files.pythonhosted.org/packages/69/03/516b05256aede0b79810ee3f146558bd9bae0ad7ea1b1726f21cf5ded446/bittensor_core-0.1.0-cp310-abi3-manylinux_2_28_aarch64.whl", hash = "sha256:714ca56864f4a5038d7e380a86d090a53c320b3bb4a6df530d6f1ea09c278eeb", size = 5211327, upload-time = "2026-07-17T09:08:02.032Z" },
+    { url = "https://files.pythonhosted.org/packages/4e/e8/76339f0d4b9c2047d2ef0dae0dc6d014ef9ad54d160aadcf2f765a55e85f/bittensor_core-0.1.1-cp310-abi3-macosx_10_12_x86_64.whl", hash = "sha256:362d8b39977a9f49fb53b518833ccda614eab32ceb51836f9c0abbb3dc3f5bc0", size = 4565454, upload-time = "2026-07-23T21:21:57.806Z" },
+    { url = "https://files.pythonhosted.org/packages/f1/a0/1c17771061c7573f33bcdad56368d5a07be2f5585905f75a3719079e8fe6/bittensor_core-0.1.1-cp310-abi3-macosx_11_0_arm64.whl", hash = "sha256:1bfd0c2efaff9d3d91953fcd6f01f48db237fe6dc72404f61ceefd2cac90cd9c", size = 4718552, upload-time = "2026-07-23T21:22:00.141Z" },
+    { url = "https://files.pythonhosted.org/packages/47/b2/ba0818dcb613a90472973ae6e88ccf814801e7ad278c637450d5bb78858a/bittensor_core-0.1.1-cp310-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:c8e95a4a7622fe302e7e82fc30549da0e9ec9f57ae2fd744c60594255ee322af", size = 5189213, upload-time = "2026-07-23T21:22:02.409Z" },
+    { url = "https://files.pythonhosted.org/packages/45/d3/e2c1df812561ff2af5cebbacfbe786e848c632c098fa51f142c9e12b2408/bittensor_core-0.1.1-cp310-abi3-manylinux_2_28_aarch64.whl", hash = "sha256:9a3ee3009c80d640ec95b8a3644c299f32238fbc36b806451ee8e512253e9d73", size = 5211209, upload-time = "2026-07-23T21:22:04.818Z" },
 ]
 
 [[package]]
@@ -399,7 +400,7 @@ dependencies = [
 
 [package.metadata]
 requires-dist = [
-    { name = "bittensor", specifier = "==11.0.0" },
+    { name = "bittensor", specifier = ">=11.0.1" },
     { name = "common", editable = "shared/common" },
     { name = "competition", editable = "shared/competition" },
     { name = "huggingface-hub", specifier = ">=0.23.0" },
@@ -450,7 +451,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "bittensor", specifier = "==11.0.0" },
+    { name = "bittensor", specifier = ">=11.0.1" },
     { name = "loguru", specifier = ">=0.7.3" },
     { name = "pydantic", specifier = ">=2.11.3" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.4.1" },
@@ -1507,6 +1508,18 @@ wheels = [
 ]
 
 [[package]]
+name = "qrcode"
+version = "8.2"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "colorama", marker = "sys_platform == 'win32'" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/8f/b2/7fc2931bfae0af02d5f53b174e9cf701adbb35f39d69c2af63d4a39f81a9/qrcode-8.2.tar.gz", hash = "sha256:35c3f2a4172b33136ab9f6b3ef1c00260dd2f66f858f24d88418a015f446506c", size = 43317, upload-time = "2025-05-01T15:44:24.726Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/dd/b8/d2d6d731733f51684bbf76bf34dab3b70a9148e8f2cef2bb544fccec681a/qrcode-8.2-py3-none-any.whl", hash = "sha256:16e64e0716c14960108e85d853062c9e8bba5ca8252c0b4d0231b9df4060ff4f", size = 45986, upload-time = "2025-05-01T15:44:22.781Z" },
+]
+
+[[package]]
 name = "regex"
 version = "2026.7.19"
 source = { registry = "https://pypi.org/simple" }
@@ -1868,7 +1881,7 @@ dependencies = [
 [package.metadata]
 requires-dist = [
     { name = "aiohttp", specifier = ">=3.9.0" },
-    { name = "bittensor", specifier = "==11.0.0" },
+    { name = "bittensor", specifier = ">=11.0.1" },
     { name = "common", editable = "shared/common" },
     { name = "competition", editable = "shared/competition" },
 ]

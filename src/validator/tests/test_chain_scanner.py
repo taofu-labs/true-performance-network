@@ -106,3 +106,14 @@ def test_scan_reveals_skips_malformed_payload(monkeypatch):
 
     result = scan_reveals(FakeSubtensor(reveals), spec, make_db())
     assert result == {}
+
+
+def test_scan_reveals_returns_reveal_block(monkeypatch):
+    spec = make_spec(commit_end_block=100)
+    reveals = {"hk1": [(make_payload(), 103)]}
+    monkeypatch.setattr("validator.chain_scanner.read_revealed_commitments", lambda subtensor, netuid: reveals)
+
+    result = scan_reveals(FakeSubtensor(reveals), spec, make_db())
+    submission, reveal_block = result["hk1"]
+    assert reveal_block == 103
+    assert submission.competition_id == "comp1"

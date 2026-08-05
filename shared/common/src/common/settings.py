@@ -38,6 +38,7 @@ COORDINATOR_API_KEY: str | None = os.getenv("COORDINATOR_API_KEY") or None
 PRECHECK_IMAGE: str = os.getenv("PRECHECK_IMAGE", "ghcr.io/taofu-labs/tpn-precheck")
 PRECHECK_HOST_PORT: int = int(os.getenv("PRECHECK_HOST_PORT", "8081"))
 RAM_CHECK_LYING_TOLERANCE: float = float(os.getenv("RAM_CHECK_LYING_TOLERANCE", "0.01"))
+SCORE_LYING_TOLERANCE: float = float(os.getenv("SCORE_LYING_TOLERANCE", "0.01"))
 
 # Max wall-clock seconds to poll a single benchmark run before giving up (skip, not fail-fast)
 BENCHMARK_POLL_TIMEOUT_SECONDS: int = int(os.getenv("BENCHMARK_POLL_TIMEOUT_SECONDS", "5400"))

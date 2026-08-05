@@ -9,7 +9,7 @@ requires-python = ">=3.12"
 dependencies = [
     "common",
     "competition",
-    "bittensor==11.0.0",
+    "bittensor>=11.0.1",
     "huggingface_hub>=0.23.0",
     "rich>=14.2.0",
     "typer>=0.20.0",

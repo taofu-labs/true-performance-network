@@ -57,6 +57,19 @@ class FakeSubtensor:
         return self._existing_commitment
 
 
+def test_current_block_calls_when_callable():
+    class OldSubtensor:
+        def block(self):
+            return 123
+    assert chain.current_block(OldSubtensor()) == 123
+
+
+def test_current_block_reads_when_property():
+    class NewSubtensor:
+        block = 456
+    assert chain.current_block(NewSubtensor()) == 456
+
+
 def test_get_subtensor_raises_when_bittensor_disabled(monkeypatch):
     monkeypatch.setattr(common_settings, "BITTENSOR", False)
     monkeypatch.setattr(chain.get_subtensor.retry, "stop", tenacity.stop_after_attempt(1))

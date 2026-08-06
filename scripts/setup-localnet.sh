@@ -140,6 +140,24 @@ print(max(matches))
 ")
 echo "==> Using netuid $NETUID"
 
+# ── Helper: retry a btcli extrinsic that can hit "ancient birth block" ─────────
+# Localnet runs fast-runtime (250ms blocks) — an extrinsic's mortal era can
+# expire between build and submission if anything (a metagraph query, python
+# startup) delays it, causing invalid_argument: "Transaction has an ancient
+# birth block". Transient — just resubmit.
+
+register_with_retry() {
+  local attempt
+  for attempt in 1 2 3; do
+    if "${BTCLI[@]}" subnet register "$@"; then
+      return 0
+    fi
+    echo "    register attempt $attempt failed (likely ancient birth block on fast-runtime) — retrying..."
+    sleep 1
+  done
+  return 1
+}
+
 # ── Helper: check if hotkey is registered on NETUID ───────────────────────────
 
 is_registered() {
@@ -160,7 +178,7 @@ if is_registered "$VALIDATOR"; then
   echo "==> Validator (Bob) already registered on netuid $NETUID, skipping"
 else
   echo "==> Registering validator (Bob) on netuid $NETUID..."
-  "${BTCLI[@]}" subnet register \
+  register_with_retry \
     --wallet "$VALIDATOR" \
     --wallet-path "$WALLET_PATH" \
     --wallet-hotkey default \
@@ -175,7 +193,7 @@ if is_registered "$MINER"; then
   echo "==> Miner (Charlie) already registered on netuid $NETUID, skipping"
 else
   echo "==> Registering miner (Charlie) on netuid $NETUID..."
-  "${BTCLI[@]}" subnet register \
+  register_with_retry \
     --wallet "$MINER" \
     --wallet-path "$WALLET_PATH" \
     --wallet-hotkey default \

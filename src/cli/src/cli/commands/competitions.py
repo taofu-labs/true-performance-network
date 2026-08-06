@@ -16,8 +16,8 @@ def competitions(
 
     current_block = 0
     try:
-        from common.chain import get_subtensor
-        current_block = get_subtensor(ctx.network).block()
+        from common.chain import current_block as get_current_block, get_subtensor
+        current_block = get_current_block(get_subtensor(ctx.network))
     except Exception:
         pass
 

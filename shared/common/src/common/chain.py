@@ -49,6 +49,16 @@ def get_subtensor(network: Optional[str] = None) -> "Subtensor":
     return Subtensor(network=target)
 
 
+def current_block(subtensor: "Subtensor") -> int:
+    """
+    Return the current chain block.
+    bittensor's `Subtensor.block` is a callable on <11.0.1 and a plain int
+    property on >=11.0.1 — this works with either.
+    """
+    block = subtensor.block
+    return block() if callable(block) else block
+
+
 def get_wallet(
     coldkey: str,
     hotkey: str,

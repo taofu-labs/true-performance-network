@@ -6,7 +6,7 @@ import numpy as np
 from loguru import logger
 
 from common import settings as common_settings
-from common.chain import get_subtensor, get_wallet
+from common.chain import current_block as get_current_block, get_subtensor, get_wallet
 from validator.validator_health import HealthServerMixin
 from validator.api import LeaderApiMixin
 from validator import settings as validator_settings
@@ -88,7 +88,7 @@ class Validator(HealthServerMixin, LeaderApiMixin):
 
         while True:
             try:
-                current_block = self.subtensor.block()
+                current_block = get_current_block(self.subtensor)
                 self.metagraph = self.subtensor.subnets.metagraph(common_settings.NETUID)
 
                 from common.models.competition import CompetitionPhase
@@ -148,7 +148,7 @@ class Validator(HealthServerMixin, LeaderApiMixin):
                 from competition.scoring import compute_emission_weights
                 from common.models.submission import ScoringResult
 
-                current_block = self.subtensor.block()
+                current_block = get_current_block(self.subtensor)
                 specs = self._get_active_competitions(current_block)
 
                 for spec in specs:
@@ -398,7 +398,7 @@ class Validator(HealthServerMixin, LeaderApiMixin):
             try:
                 logger.debug(f"Weight loop iteration {loop_count} starting")
                 self.metagraph = self.subtensor.subnets.metagraph(common_settings.NETUID)
-                current_block = self.subtensor.block()
+                current_block = get_current_block(self.subtensor)
 
                 distributed = await self._compute_and_set_aggregate_weights(current_block)
                 if not distributed:

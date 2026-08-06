@@ -21,6 +21,7 @@ import hmac
 from aiohttp import web
 from loguru import logger
 
+from common.chain import current_block as get_current_block
 from common.models.competition import CompetitionSpec
 from validator import store
 from validator import settings as validator_settings
@@ -106,7 +107,7 @@ class LeaderApiMixin:
         specs = store.list_competitions(self._db)
         if request.query.get("active") == "true":
             block_param = request.query.get("block")
-            current_block = int(block_param) if block_param else self.subtensor.block()
+            current_block = int(block_param) if block_param else get_current_block(self.subtensor)
             specs = [s for s in specs if CompetitionSpec.model_validate(s).is_active(current_block)]
         return web.json_response({"competitions": specs})
 

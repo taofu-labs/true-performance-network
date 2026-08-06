@@ -10,7 +10,7 @@ from rich.console import Console
 from rich.panel import Panel
 from cli.utils.config import load_competition_config, save_competition_config
 from cli.utils.context import get as get_ctx
-from common.chain import timelocked_commit, is_hotkey_registered, get_subtensor, get_wallet
+from common.chain import current_block as get_current_block, timelocked_commit, is_hotkey_registered, get_subtensor, get_wallet
 from common.models.submission import Claim, build_reveal_payload
 from competition.leader_config_client import get_competition_by_id
 
@@ -33,7 +33,7 @@ def commit(
     coldkey_ss58 = wallet.coldkey.ss58_address
 
     subtensor = get_subtensor(ctx.network)
-    current_block = subtensor.block()
+    current_block = get_current_block(subtensor)
 
     # ── Registration ─────────────────────────────────────────────────
     if not is_hotkey_registered(subtensor, hotkey_ss58, ctx.netuid):
@@ -133,7 +133,7 @@ def commit(
 
     # ── Submit ────────────────────────────────────────────────────────────────
     if not dry_run:
-        current_block = subtensor.block()
+        current_block = get_current_block(subtensor)
         blocks_until_reveal = max(1, spec.commit_end_block - current_block)
         result = timelocked_commit(
             subtensor=subtensor,

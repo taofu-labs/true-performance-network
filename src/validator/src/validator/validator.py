@@ -1,5 +1,6 @@
 import asyncio
 import time
+from typing import Dict, Optional
 
 import bittensor as bt
 import numpy as np
@@ -41,6 +42,10 @@ class Validator(HealthServerMixin, LeaderApiMixin):
         self._last_heartbeat: float = time.time()
 
         self._db = store.init_db()
+
+        if self.mode == "leader":
+            from competition.precheck_client import cleanup_stale_containers
+            cleanup_stale_containers()
 
         if self.mode == "follower":
             from validator.leader_client import LeaderClient
@@ -115,20 +120,35 @@ class Validator(HealthServerMixin, LeaderApiMixin):
                         logger.debug(f"REVEALING phase — waiting for reveal grace to end at {spec.scoring_starts_at()}")
 
                     elif phase == CompetitionPhase.SCORING:
+                        # Reconcile drift left by a process kill (autoupdater
+                        # SIGKILLs roughly every 15 min, mid-scoring-window)
+                        # between a committed scoring_runs row and a
+                        # never-applied mark_scored — catch up without
+                        # re-scoring rather than leaving it stuck forever.
+                        if not store.is_scored(self._db, spec.id) and store.has_scoring_run(self._db, spec.id):
+                            logger.warning(f"{spec.id}: found committed scoring_runs row with no scored_competitions status — reconciling")
+                            store.mark_scored(self._db, spec.id)
+
                         if not store.is_scored(self._db, spec.id):
-                            done = await self._run_scoring(spec, current_block)
-                            if done:
+                            retry_reason = await self._run_scoring(spec, current_block)
+                            if retry_reason is None:
                                 store.mark_scored(self._db, spec.id)
                             else:
                                 attempts = store.bump_reveal_attempts(self._db, spec.id)
                                 if attempts >= store.MAX_REVEAL_ATTEMPTS:
-                                    logger.warning(
-                                        f"{spec.id}: giving up after {attempts} attempts — marking scored with no result"
+                                    terminal_status = (
+                                        "failed_no_reveals" if retry_reason == "no_reveals"
+                                        else "failed_no_participants"
                                     )
-                                    store.mark_scored(self._db, spec.id, status="failed_no_reveals")
+                                    logger.warning(
+                                        f"{spec.id}: giving up after {attempts} attempts ({retry_reason}) — "
+                                        f"marking scored with no result"
+                                    )
+                                    store.mark_scored(self._db, spec.id, status=terminal_status)
                                 else:
                                     logger.info(
-                                        f"{spec.id}: retryable scoring failure, attempt {attempts}/{store.MAX_REVEAL_ATTEMPTS}"
+                                        f"{spec.id}: retryable scoring failure ({retry_reason}), "
+                                        f"attempt {attempts}/{store.MAX_REVEAL_ATTEMPTS}"
                                     )
 
             except Exception as e:
@@ -160,9 +180,9 @@ class Validator(HealthServerMixin, LeaderApiMixin):
 
                     runs, scored_status = self._leader_client.get_scoring_results(spec.id)
                     if not runs:
-                        if scored_status == "failed_no_reveals":
-                            logger.warning(f"{spec.id}: leader gave up with no reveals — marking scored, no weights")
-                            store.mark_scored(self._db, spec.id, status="failed_no_reveals")
+                        if scored_status in ("failed_no_reveals", "failed_no_participants"):
+                            logger.warning(f"{spec.id}: leader gave up ({scored_status}) — marking scored, no weights")
+                            store.mark_scored(self._db, spec.id, status=scored_status)
                         else:
                             logger.debug(f"{spec.id}: no scoring results from leader yet")
                         continue
@@ -185,11 +205,14 @@ class Validator(HealthServerMixin, LeaderApiMixin):
             finally:
                 await asyncio.sleep(validator_settings.FOLLOWER_POLL_INTERVAL)
 
-    async def _run_scoring(self, spec, current_block: int) -> bool:
-        """Returns True if scoring reached a terminal state (success, or a
-        non-retryable abort) and the competition should be marked scored.
-        Returns False for a retryable failure (no reveals yet, coordinator
-        unreachable) so the caller can retry on a later tick."""
+    async def _run_scoring(self, spec, current_block: int) -> Optional[str]:
+        """Returns None if scoring reached a terminal state (success) and the
+        competition should be marked scored. Returns a retry-reason string
+        for a retryable failure so the caller can retry on a later tick and,
+        after MAX_REVEAL_ATTEMPTS, pick the right terminal failure status:
+        'no_reveals' (nobody ever revealed / registered / had collateral) or
+        'no_participants' (reveals existed but nothing survived dedup,
+        precheck, or coordinator/infra failures)."""
         from validator.chain_scanner import scan_reveals
         from validator.scorer import precheck_one, benchmark_one, dedup_winner, _skip, PrecheckPass, ScoringOutcome
         from competition.benchmark_client import make_coordinator
@@ -205,14 +228,14 @@ class Validator(HealthServerMixin, LeaderApiMixin):
         logger.debug(f"scan_reveals returned {len(reveals)} reveal(s): {list(reveals.keys())}")
         if not reveals:
             logger.warning("No valid reveals. Skipping weight update.")
-            return False
+            return "no_reveals"
 
         registered = set(self.metagraph.hotkeys)
         reveals = {hk: sub for hk, sub in reveals.items() if hk in registered}
         logger.debug(f"{len(reveals)} reveal(s) from registered hotkeys: {list(reveals.keys())}")
         if not reveals:
             logger.warning("No reveals from registered hotkeys. Skipping weight update.")
-            return False
+            return "no_reveals"
 
         # Collateral skip: a hotkey below COLLATERAL_MIN_THRESHOLD is excluded
         # from this scoring run only — not a ban, no persistent state change.
@@ -232,7 +255,7 @@ class Validator(HealthServerMixin, LeaderApiMixin):
             reveals = {hk: sub for hk, sub in reveals.items() if hk not in skipped}
             if not reveals:
                 logger.warning("No reveals left after collateral skip. Skipping weight update.")
-                return False
+                return "no_participants"
 
         # sha256 dedup: when two reveals share the same self-reported file_sha256,
         # only the earlier reveal_block (chain-native, unforgeable) is eligible.
@@ -261,8 +284,8 @@ class Validator(HealthServerMixin, LeaderApiMixin):
                 logger.info(f"SKIPPED {hotkey[:12]}: {reason} — dedup loss")
             reveals = {hk: v for hk, v in reveals.items() if hk not in dedup_losers}
             if not reveals:
-                logger.warning("No reveals left after dedup filtering. Skipping weight update.")
-                return True
+                logger.warning("No reveals left after dedup filtering. Retrying next tick.")
+                return "no_participants"
 
         ranked_candidates = sort_by_self_reported(
             {hk: sub for hk, (sub, _block) in reveals.items()}, spec
@@ -276,10 +299,10 @@ class Validator(HealthServerMixin, LeaderApiMixin):
             missing = {t.name for t in spec.benchmarks} - available
             if missing:
                 logger.error(f"Coordinator missing benchmarks {missing} — aborting scoring")
-                return False
+                return "no_participants"
         except Exception as e:
             logger.error(f"Cannot reach coordinator: {e} — aborting scoring")
-            return False
+            return "no_participants"
 
         precheck_ctr: PrecheckContainer | None = PrecheckContainer(base_repo=spec.model_repo)
         try:
@@ -309,13 +332,25 @@ class Validator(HealthServerMixin, LeaderApiMixin):
 
         logger.debug(f"Precheck done: {len(passed)} passed, {len(all_outcomes)} skipped/disqualified so far")
         if not passed:
-            logger.warning("No submissions passed precheck. Skipping weight update.")
-            return True
+            logger.warning("No submissions passed precheck. Retrying next tick (may be transient infra failure).")
+            return "no_participants"
 
-        # Phase 2: parallel benchmark — all passed miners run concurrently
+        # Phase 2: parallel benchmark — all passed miners run concurrently.
+        # Resume any run_ids already submitted/persisted for these hotkeys in
+        # a prior (killed) process instead of resubmitting from scratch.
         poll_interval = getattr(validator_settings, "BENCHMARK_POLL_INTERVAL", 30.0)
+        pending_runs = store.pending_benchmark_runs(self._db, spec.id)
+        resumable: dict[str, Dict[str, str]] = {}
+        for row in pending_runs:
+            resumable.setdefault(row["hotkey"], {})[row["benchmark_name"]] = row["coordinator_run_id"]
+
+        submit_semaphore = asyncio.Semaphore(max(1, validator_settings.BENCHMARK_SUBMIT_CONCURRENCY))
         benchmark_outcomes = await asyncio.gather(*[
-            benchmark_one(p, spec, coordinator, self._db, poll_interval)
+            benchmark_one(
+                p, spec, coordinator, self._db, poll_interval,
+                current_block=current_block, run_ids=resumable.get(p.hotkey),
+                submit_semaphore=submit_semaphore,
+            )
             for p in passed
         ])
         all_outcomes.extend(benchmark_outcomes)
@@ -334,7 +369,7 @@ class Validator(HealthServerMixin, LeaderApiMixin):
         store.record_weights(self._db, spec.id, hotkey_weights)
 
         logger.info(f"Weights computed: {[(k[:8], v) for k, v in hotkey_weights.items() if v > 0]}")
-        return True
+        return None
 
     async def _compute_and_set_aggregate_weights(self, current_block: int) -> bool:
         """

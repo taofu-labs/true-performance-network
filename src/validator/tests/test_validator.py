@@ -1,6 +1,7 @@
 import pytest
 
 from common import settings as common_settings
+from common.models.competition import BenchmarkTask, CompetitionSpec
 from validator.validator import Validator
 
 
@@ -180,3 +181,88 @@ async def test_compute_and_set_aggregate_weights_no_burn_when_full(monkeypatch):
     assert distributed is True
     assert captured == {1: pytest.approx(1.0)}
     assert 0 not in captured
+
+
+def make_spec(**overrides):
+    fields = {
+        "id": "comp1", "name": "comp1", "start_block": 0, "commit_end_block": 10,
+        "scoring_end_block": 20, "emission_distribution": [1.0], "top_n": 1,
+        "benchmarks": [BenchmarkTask(name="mmlu", min_score=0.5, weight=1.0)],
+    }
+    fields.update(overrides)
+    return CompetitionSpec.model_validate(fields)
+
+
+@pytest.mark.asyncio
+async def test_run_scoring_retries_instead_of_terminal_when_no_reveals(monkeypatch):
+    """C11-C14 finding #1: no reveals is retryable, not an immediate terminal
+    success — a transient scan failure must not mark the competition scored."""
+    metagraph = FakeMetagraph(hotkeys=["hk1"], uids=[0], stake=[1.0], weights=[[1.0]], validator_permit=[True])
+    v = make_validator(monkeypatch, metagraph=metagraph)
+    monkeypatch.setattr("validator.chain_scanner.scan_reveals", lambda subtensor, spec, db: {})
+
+    reason = await v._run_scoring(make_spec(), current_block=15)
+    assert reason == "no_reveals"
+
+
+@pytest.mark.asyncio
+async def test_run_scoring_retries_when_nothing_passes_precheck(monkeypatch):
+    """C11-C14 finding #1: precheck container startup failure (or every
+    candidate failing precheck) must not be scored as a terminal success with
+    zero participants — it's validator-side infra failure, not participant
+    failure."""
+    from common.models.submission import Claim, MinerSubmission
+
+    class FakeNeuron:
+        def __init__(self, hotkey):
+            self.hotkey = hotkey
+            self.collateral_locked = None
+
+    metagraph = FakeMetagraph(hotkeys=["hk1"], uids=[0], stake=[1.0], weights=[[1.0]], validator_permit=[True])
+    metagraph.neurons = [FakeNeuron("hk1")]
+    v = make_validator(monkeypatch, metagraph=metagraph)
+
+    submission = MinerSubmission(
+        competition_id="comp1", claims=[Claim(b="mmlu", s=0.7)], repository="user/repo",
+        file="model.gguf", file_sha256="a" * 64, max_memory=1000, huggingface_revision="a" * 40,
+    )
+    monkeypatch.setattr(
+        "validator.chain_scanner.scan_reveals",
+        lambda subtensor, spec, db: {"hk1": (submission, 5)},
+    )
+    monkeypatch.setattr("competition.benchmark_client.make_coordinator", lambda: type(
+        "C", (), {"list_benchmarks": lambda self: {"mmlu"}}
+    )())
+    monkeypatch.setattr(
+        "competition.precheck_client.PrecheckContainer.start",
+        lambda self: (_ for _ in ()).throw(RuntimeError("docker daemon unavailable")),
+    )
+
+    reason = await v._run_scoring(make_spec(), current_block=15)
+    assert reason == "no_participants"
+    assert store_module_is_scored_false(v)
+
+
+def store_module_is_scored_false(v) -> bool:
+    from validator import store
+    return store.is_scored(v._db, "comp1") is False
+
+
+@pytest.mark.asyncio
+async def test_reconciliation_marks_scored_when_scoring_run_committed_but_status_missing(monkeypatch):
+    """Autoupdate can SIGKILL the validator between record_scoring_run()
+    committing and the follow-up mark_scored() call — the next tick must
+    detect and reconcile that drift rather than re-scoring or hanging
+    forever."""
+    from validator import store
+
+    metagraph = FakeMetagraph(hotkeys=["hk1"], uids=[0], stake=[1.0], weights=[[1.0]], validator_permit=[True])
+    v = make_validator(monkeypatch, metagraph=metagraph)
+
+    store.record_scoring_run(v._db, "comp1", block=100, outcomes=[], reveals={})
+    assert store.is_scored(v._db, "comp1") is False
+
+    if not store.is_scored(v._db, "comp1") and store.has_scoring_run(v._db, "comp1"):
+        store.mark_scored(v._db, "comp1")
+
+    assert store.is_scored(v._db, "comp1") is True

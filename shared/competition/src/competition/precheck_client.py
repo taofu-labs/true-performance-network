@@ -235,6 +235,37 @@ class PrecheckContainer:
         )
 
 
+def cleanup_stale_containers() -> None:
+    """
+    Remove any leftover tpn-precheck-* containers from a prior process.
+
+    Container names are random per PrecheckContainer.start() call and never
+    persisted, so a killed validator (the autoupdater SIGKILLs the process on
+    every detected update, mid-scoring or not) can leave an orphaned
+    container bound to the static PRECHECK_HOST_PORT — the next start() would
+    fail with "port is already allocated". Call once on validator startup,
+    before any PrecheckContainer is used.
+    """
+    try:
+        result = subprocess.run(
+            ["docker", "ps", "-aq", "--filter", "name=^tpn-precheck-"],
+            capture_output=True, text=True, timeout=15,
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError) as e:
+        logger.warning(f"Could not check for stale precheck containers: {e}")
+        return
+
+    container_ids = result.stdout.split()
+    if not container_ids:
+        return
+
+    logger.warning(f"Removing {len(container_ids)} stale precheck container(s) from a prior run: {container_ids}")
+    try:
+        subprocess.run(["docker", "rm", "-f", *container_ids], capture_output=True, timeout=30)
+    except Exception as e:
+        logger.warning(f"Failed to remove stale precheck containers: {e}")
+
+
 # ---------------------------------------------------------------------------
 # Response parsing
 # ---------------------------------------------------------------------------

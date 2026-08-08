@@ -3,13 +3,18 @@ import subprocess
 import pytest
 import requests
 
-from competition.precheck_client import PrecheckContainer, _parse_verdict
+from competition.precheck_client import PrecheckContainer, _parse_verdict, cleanup_stale_containers
 
 
 class _FakeCompletedProcess:
-    def __init__(self, returncode=0, stderr=""):
+    def __init__(self, returncode=0, stderr="", stdout=""):
         self.returncode = returncode
         self.stderr = stderr
+        self.stdout = stdout
+
+    def _with_stdout(self, stdout):
+        self.stdout = stdout
+        return self
 
 
 def make_container(**overrides):
@@ -100,3 +105,36 @@ def test_parse_verdict_missing_optional_sections():
     assert verdict.provenance is None
     assert verdict.ram is None
     assert verdict.sha256 is None
+
+
+def test_cleanup_stale_containers_removes_leftover_containers(monkeypatch):
+    """A killed validator (autoupdater SIGKILLs on every detected update)
+    can leave an orphaned tpn-precheck-* container bound to the static host
+    port — cleanup on startup must find and remove it so the next start()
+    doesn't fail with 'port already allocated'."""
+    calls = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        if cmd[:2] == ["docker", "ps"]:
+            return _FakeCompletedProcess(returncode=0)._with_stdout("abc123\ndef456\n")
+        return _FakeCompletedProcess(returncode=0)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    cleanup_stale_containers()
+
+    assert calls[0][:3] == ["docker", "ps", "-aq"]
+    assert calls[1] == ["docker", "rm", "-f", "abc123", "def456"]
+
+
+def test_cleanup_stale_containers_noop_when_none_found(monkeypatch):
+    def fake_run(cmd, **kwargs):
+        return _FakeCompletedProcess(returncode=0)._with_stdout("")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    cleanup_stale_containers()  # must not raise, must not attempt docker rm
+
+
+def test_cleanup_stale_containers_swallows_docker_missing(monkeypatch):
+    monkeypatch.setattr(subprocess, "run", lambda *a, **k: (_ for _ in ()).throw(FileNotFoundError()))
+    cleanup_stale_containers()  # must not raise

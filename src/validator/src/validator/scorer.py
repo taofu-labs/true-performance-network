@@ -180,21 +180,59 @@ async def benchmark_one(
     conn: sqlite3.Connection,
     poll_interval: float = 30.0,
     max_wait_seconds: float = None,
+    current_block: Optional[int] = None,
+    run_ids: Optional[Dict[str, str]] = None,
+    submit_semaphore: Optional[asyncio.Semaphore] = None,
 ) -> ScoringOutcome:
-    """Submit all benchmarks for one miner and poll until done."""
+    """
+    Submit all benchmarks for one miner and poll until done.
+
+    `run_ids`, if given, are coordinator run_ids already submitted and
+    persisted in a prior process (resumed after an autoupdater restart) —
+    submit is skipped for any benchmark name already present.
+
+    A validator restart mid-poll is common (autoupdater can SIGKILL every
+    ~15min while a scoring window stays open for hours-days), so run_ids are
+    persisted to `benchmark_runs` immediately after each submit, and a poll
+    timeout only becomes a hard skip once the competition's scoring window
+    (spec.scoring_end_block) has actually closed — otherwise the run is left
+    'pending-resume' for the next tick's reconciliation pass to pick back up.
+
+    `submit_semaphore`, if given, bounds concurrent *submits* only across all
+    benchmark_one() calls running in the same asyncio.gather — submit and
+    poll have different coordinator capacity profiles, so polling stays
+    unbounded/parallel once a run_id is accepted.
+    """
     hotkey, submission = p.hotkey, p.submission
     if max_wait_seconds is None:
         max_wait_seconds = getattr(common_settings, "BENCHMARK_POLL_TIMEOUT_SECONDS", 5400)
 
-    run_ids: Dict[str, str] = {}
+    run_ids = dict(run_ids or {})
     try:
         for task in spec.benchmarks:
-            run_ids[task.name] = await asyncio.to_thread(
-                coordinator.submit,
-                submission.repository,
-                submission.huggingface_revision,
-                task.name,
-                [p.gguf_file],
+            if task.name in run_ids:
+                continue
+            if submit_semaphore is not None:
+                async with submit_semaphore:
+                    run_id = await asyncio.to_thread(
+                        coordinator.submit,
+                        submission.repository,
+                        submission.huggingface_revision,
+                        task.name,
+                        [p.gguf_file],
+                    )
+            else:
+                run_id = await asyncio.to_thread(
+                    coordinator.submit,
+                    submission.repository,
+                    submission.huggingface_revision,
+                    task.name,
+                    [p.gguf_file],
+                )
+            run_ids[task.name] = run_id
+            store.upsert_benchmark_run(
+                conn, submission.competition_id, hotkey, task.name,
+                submission.repository, submission.huggingface_revision, run_id,
             )
     except Exception as e:
         return _skip(hotkey, submission, f"benchmark submit error: {e}")
@@ -205,7 +243,22 @@ async def benchmark_one(
     deadline = time.monotonic() + max_wait_seconds
     while pending:
         if time.monotonic() >= deadline:
-            logger.warning(f"{hotkey[:12]} benchmark poll timeout after {max_wait_seconds:.0f}s, still pending: {list(pending)}")
+            window_open = current_block is None or current_block < spec.scoring_end_block
+            if window_open:
+                logger.warning(
+                    f"{hotkey[:12]} benchmark poll timeout after {max_wait_seconds:.0f}s, "
+                    f"still pending: {list(pending)} — scoring window still open, resuming next tick"
+                )
+                for bname in pending:
+                    store.set_benchmark_run_status(
+                        conn, submission.competition_id, hotkey, bname, "pending-resume"
+                    )
+                return _skip(
+                    hotkey, submission,
+                    f"benchmark poll pending-resume, pending: {list(pending)}",
+                    actual_scores=actual_scores,
+                )
+            logger.warning(f"{hotkey[:12]} benchmark poll timeout after {max_wait_seconds:.0f}s, scoring window closed: {list(pending)}")
             return _skip(
                 hotkey, submission,
                 f"benchmark poll timeout after {max_wait_seconds:.0f}s, pending: {list(pending)}",
@@ -220,8 +273,10 @@ async def benchmark_one(
             if status.status == RunStatusCode.COMPLETED:
                 actual_scores[bname] = status.scores.get(bname, 0.0)
                 del pending[bname]
+                store.set_benchmark_run_status(conn, submission.competition_id, hotkey, bname, "completed")
                 logger.debug(f"{hotkey[:12]} {bname}={actual_scores[bname]:.4f}")
             elif status.status == RunStatusCode.FAILED:
+                store.set_benchmark_run_status(conn, submission.competition_id, hotkey, bname, "failed")
                 return _skip(hotkey, submission, f"benchmark {bname} failed: {status.failure_reason or 'unknown'}")
 
     # Score-mismatch check: miner claimed a benchmark score in its reveal

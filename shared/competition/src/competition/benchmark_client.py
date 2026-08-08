@@ -22,7 +22,59 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Protocol, runtime_checkable
 
 import requests
+import tenacity
 from loguru import logger
+
+# ---------------------------------------------------------------------------
+# Retry policy — coordinator backpressure (429) and transient 5xx/network
+# errors should be retried, not treated as participant failure. Terminal
+# client errors (auth, malformed request, unknown benchmark, invalid model
+# payload — any other 4xx) are NOT retried.
+# ---------------------------------------------------------------------------
+
+_RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
+
+SUBMIT_RETRY_COUNT = int(os.getenv("REQUEST_RETRY_COUNT", 3))
+SUBMIT_RETRY_BASE_DELAY = float(os.getenv("COORDINATOR_RETRY_BASE_DELAY", 2.0))
+SUBMIT_RETRY_MAX_DELAY = float(os.getenv("COORDINATOR_RETRY_MAX_DELAY", 60.0))
+
+
+def _is_retryable_error(exc: BaseException) -> bool:
+    if isinstance(exc, requests.HTTPError):
+        resp = exc.response
+        return resp is not None and resp.status_code in _RETRYABLE_STATUS_CODES
+    return isinstance(exc, (requests.Timeout, requests.ConnectionError))
+
+
+def _retry_after_wait(retry_state: "tenacity.RetryCallState") -> float:
+    """Honor a Retry-After header on 429s; otherwise exponential backoff."""
+    exc = retry_state.outcome.exception() if retry_state.outcome else None
+    if isinstance(exc, requests.HTTPError) and exc.response is not None:
+        retry_after = exc.response.headers.get("Retry-After")
+        if retry_after is not None:
+            try:
+                return min(float(retry_after), SUBMIT_RETRY_MAX_DELAY)
+            except ValueError:
+                pass
+    return min(
+        SUBMIT_RETRY_BASE_DELAY * (2 ** (retry_state.attempt_number - 1)),
+        SUBMIT_RETRY_MAX_DELAY,
+    )
+
+
+def _log_coordinator_retry(retry_state: "tenacity.RetryCallState") -> None:
+    exc = retry_state.outcome.exception() if retry_state.outcome else None
+    logger.warning(f"Coordinator request retry attempt {retry_state.attempt_number} after: {exc}")
+
+
+def coordinator_retry(func):
+    return tenacity.retry(
+        stop=tenacity.stop_after_attempt(SUBMIT_RETRY_COUNT),
+        wait=_retry_after_wait,
+        retry=tenacity.retry_if_exception(_is_retryable_error),
+        before_sleep=_log_coordinator_retry,
+        reraise=True,
+    )(func)
 
 
 # ---------------------------------------------------------------------------
@@ -167,6 +219,7 @@ class HttpCoordinator:
         self._benchmark_cache = {b["benchmark"] for b in data.get("benchmarks", [])}
         return self._benchmark_cache
 
+    @coordinator_retry
     def submit(
         self,
         repo: str,
@@ -201,6 +254,7 @@ class HttpCoordinator:
         logger.debug(f"[http] submitted {benchmark} for {repo}@{revision[:8]} -> {run_id}")
         return run_id
 
+    @coordinator_retry
     def poll(self, run_id: str) -> RunStatus:
         if run_id in self._completed_cache:
             return RunStatus(run_id=run_id, status=RunStatusCode.COMPLETED, scores=self._completed_cache[run_id])

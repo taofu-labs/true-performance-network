@@ -125,3 +125,53 @@ def test_list_competitions(tmp_path):
 
     ids = sorted(c["id"] for c in store.list_competitions(conn))
     assert ids == ["comp1", "comp2"]
+
+
+def test_upsert_benchmark_run_and_pending_benchmark_runs(tmp_path):
+    conn = make_conn(tmp_path)
+    assert store.pending_benchmark_runs(conn, "comp1") == []
+
+    store.upsert_benchmark_run(conn, "comp1", "hk1", "mmlu", "user/repo", "a" * 40, "run-1")
+    pending = store.pending_benchmark_runs(conn, "comp1")
+    assert len(pending) == 1
+    assert pending[0]["coordinator_run_id"] == "run-1"
+    assert pending[0]["status"] == "submitted"
+
+
+def test_upsert_benchmark_run_is_idempotent_on_conflict(tmp_path):
+    conn = make_conn(tmp_path)
+    store.upsert_benchmark_run(conn, "comp1", "hk1", "mmlu", "user/repo", "a" * 40, "run-1")
+    store.upsert_benchmark_run(conn, "comp1", "hk1", "mmlu", "user/repo", "a" * 40, "run-1-retry")
+
+    pending = store.pending_benchmark_runs(conn, "comp1")
+    assert len(pending) == 1
+    assert pending[0]["coordinator_run_id"] == "run-1-retry"
+
+
+def test_set_benchmark_run_status_excludes_from_pending(tmp_path):
+    conn = make_conn(tmp_path)
+    store.upsert_benchmark_run(conn, "comp1", "hk1", "mmlu", "user/repo", "a" * 40, "run-1")
+    store.set_benchmark_run_status(conn, "comp1", "hk1", "mmlu", "completed")
+    assert store.pending_benchmark_runs(conn, "comp1") == []
+
+
+def test_pending_benchmark_runs_includes_pending_resume(tmp_path):
+    conn = make_conn(tmp_path)
+    store.upsert_benchmark_run(conn, "comp1", "hk1", "mmlu", "user/repo", "a" * 40, "run-1", status="pending-resume")
+    pending = store.pending_benchmark_runs(conn, "comp1")
+    assert len(pending) == 1
+    assert pending[0]["status"] == "pending-resume"
+
+
+def test_has_scoring_run(tmp_path):
+    conn = make_conn(tmp_path)
+    assert store.has_scoring_run(conn, "comp1") is False
+
+    store.record_scoring_run(conn, "comp1", block=100, outcomes=[], reveals={})
+    assert store.has_scoring_run(conn, "comp1") is True
+
+
+def test_mark_scored_failed_no_participants_status(tmp_path):
+    conn = make_conn(tmp_path)
+    store.mark_scored(conn, "comp1", status="failed_no_participants")
+    assert store.scored_status(conn, "comp1") == "failed_no_participants"

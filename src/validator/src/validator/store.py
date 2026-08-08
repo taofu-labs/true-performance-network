@@ -100,6 +100,19 @@ CREATE TABLE IF NOT EXISTS scored_competitions (
     status TEXT NOT NULL DEFAULT 'scored'
 );
 
+CREATE TABLE IF NOT EXISTS benchmark_runs (
+    competition_id TEXT NOT NULL,
+    hotkey TEXT NOT NULL,
+    benchmark_name TEXT NOT NULL,
+    repository TEXT NOT NULL,
+    revision TEXT NOT NULL,
+    coordinator_run_id TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'submitted',
+    submitted_at REAL NOT NULL,
+    updated_at REAL NOT NULL,
+    PRIMARY KEY (competition_id, hotkey, benchmark_name)
+);
+
 CREATE TABLE IF NOT EXISTS banned_hotkeys (
     hotkey TEXT PRIMARY KEY,
     reason TEXT NOT NULL,
@@ -300,7 +313,9 @@ MAX_REVEAL_ATTEMPTS = 3  # 1 initial + 2 retries
 
 
 def mark_scored(conn: sqlite3.Connection, competition_id: str, status: str = "scored") -> None:
-    """status: 'scored' (normal completion) or 'failed_no_reveals' (gave up after retries)."""
+    """status: 'scored' (normal completion), 'failed_no_reveals' (gave up after
+    retries with no reveals), or 'failed_no_participants' (reveals existed but
+    nobody made it through precheck/dedup after retries)."""
     conn.execute(
         "INSERT INTO scored_competitions (competition_id, scored_at, status) "
         "VALUES (?, ?, ?) "
@@ -308,6 +323,16 @@ def mark_scored(conn: sqlite3.Connection, competition_id: str, status: str = "sc
         (competition_id, time.time(), status),
     )
     conn.commit()
+
+
+def has_scoring_run(conn: sqlite3.Connection, competition_id: str) -> bool:
+    """True if a scoring_runs row was committed for this competition — used to
+    detect the case where record_scoring_run() committed but the process was
+    killed (autoupdate restart) before the follow-up mark_scored() call ran."""
+    row = conn.execute(
+        "SELECT 1 FROM scoring_runs WHERE competition_id = ? LIMIT 1", (competition_id,)
+    ).fetchone()
+    return row is not None
 
 
 def is_scored(conn: sqlite3.Connection, competition_id: str) -> bool:
@@ -337,6 +362,76 @@ def bump_reveal_attempts(conn: sqlite3.Connection, competition_id: str) -> int:
         "SELECT reveal_attempts FROM scored_competitions WHERE competition_id = ?", (competition_id,)
     ).fetchone()
     return row["reveal_attempts"]
+
+
+# ---------------------------------------------------------------------------
+# Leader-only — benchmark run persistence (autoupdate/restart resume)
+# ---------------------------------------------------------------------------
+# The coordinator run_id for a submitted benchmark is otherwise only held in
+# an in-process dict for the life of one benchmark_one() call. The validator
+# autoupdater can SIGKILL the process at any point (checks every 15 min,
+# 10s grace) while a competition's scoring window is still open for hours to
+# days — so a submitted-but-not-yet-polled-to-completion run must survive a
+# restart. Persisted here at submit time; reconciled/resumed every
+# SCORING-phase leader-loop tick rather than only once at process boot,
+# since a restart can happen many times over one scoring window.
+
+def upsert_benchmark_run(
+    conn: sqlite3.Connection,
+    competition_id: str,
+    hotkey: str,
+    benchmark_name: str,
+    repository: str,
+    revision: str,
+    coordinator_run_id: str,
+    status: str = "submitted",
+) -> None:
+    """status: 'submitted' (in-flight), 'pending-resume' (poll timed out this
+    process but scoring window still open — pick up next tick), 'completed',
+    or 'failed'."""
+    now = time.time()
+    conn.execute(
+        """INSERT INTO benchmark_runs
+           (competition_id, hotkey, benchmark_name, repository, revision,
+            coordinator_run_id, status, submitted_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+           ON CONFLICT(competition_id, hotkey, benchmark_name) DO UPDATE SET
+             repository = excluded.repository,
+             revision = excluded.revision,
+             coordinator_run_id = excluded.coordinator_run_id,
+             status = excluded.status,
+             updated_at = excluded.updated_at""",
+        (competition_id, hotkey, benchmark_name, repository, revision,
+         coordinator_run_id, status, now, now),
+    )
+    conn.commit()
+
+
+def set_benchmark_run_status(
+    conn: sqlite3.Connection,
+    competition_id: str,
+    hotkey: str,
+    benchmark_name: str,
+    status: str,
+) -> None:
+    conn.execute(
+        """UPDATE benchmark_runs SET status = ?, updated_at = ?
+           WHERE competition_id = ? AND hotkey = ? AND benchmark_name = ?""",
+        (status, time.time(), competition_id, hotkey, benchmark_name),
+    )
+    conn.commit()
+
+
+def pending_benchmark_runs(conn: sqlite3.Connection, competition_id: str) -> List[dict]:
+    """Non-terminal runs (submitted or pending-resume) for a competition —
+    these have a coordinator run_id already accepted and should be resumed
+    by polling, not resubmitted."""
+    rows = conn.execute(
+        """SELECT * FROM benchmark_runs
+           WHERE competition_id = ? AND status IN ('submitted', 'pending-resume')""",
+        (competition_id,),
+    ).fetchall()
+    return [dict(r) for r in rows]
 
 
 # ---------------------------------------------------------------------------

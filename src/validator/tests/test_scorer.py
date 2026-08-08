@@ -1,3 +1,4 @@
+import asyncio
 import sqlite3
 
 import pytest
@@ -199,6 +200,144 @@ async def test_benchmark_one_bans_when_actual_lower_than_claimed():
     assert outcome.kind == scorer.OutcomeKind.SKIPPED
     assert "hotkey banned" in outcome.reason
     assert store.is_banned(conn, "hk1") is True
+
+
+@pytest.mark.asyncio
+async def test_benchmark_one_persists_run_id_after_submit():
+    """C11-C14 finding #2: coordinator run_id must be persisted immediately
+    after submit, not only held in-memory, so a killed/restarted validator
+    can resume polling instead of resubmitting."""
+    coordinator = MockCoordinator()
+    submission = make_submission_matching_mock()
+    p = scorer.PrecheckPass(hotkey="hk1", submission=submission, gguf_file="model.gguf", measured_memory_kb=999)
+    conn = make_db()
+    await scorer.benchmark_one(p, make_spec(), coordinator, conn=conn, poll_interval=0)
+
+    pending = store.pending_benchmark_runs(conn, "comp1")
+    # completed by the time benchmark_one returns, so no longer "pending" —
+    # but the row must exist with a terminal status, proving it was persisted.
+    row = conn.execute(
+        "SELECT * FROM benchmark_runs WHERE competition_id = ? AND hotkey = ?", ("comp1", "hk1")
+    ).fetchone()
+    assert row is not None
+    assert row["status"] == "completed"
+    assert row["coordinator_run_id"]
+
+
+@pytest.mark.asyncio
+async def test_benchmark_one_skips_submit_for_resumed_run_ids():
+    """A run_id passed in via `run_ids` (resumed from a prior process) must
+    not be resubmitted — only polled."""
+    coordinator = MockCoordinator()
+    submission = make_submission_matching_mock()
+    p = scorer.PrecheckPass(hotkey="hk1", submission=submission, gguf_file="model.gguf", measured_memory_kb=999)
+    conn = make_db()
+
+    # Pre-submit once to get a real run_id from the mock, simulating a prior process.
+    existing_run_id = coordinator.submit("user/repo", "a" * 40, "mmlu")
+    submit_calls = {"n": 0}
+    orig_submit = coordinator.submit
+
+    def counting_submit(*a, **k):
+        submit_calls["n"] += 1
+        return orig_submit(*a, **k)
+    coordinator.submit = counting_submit
+
+    outcome = await scorer.benchmark_one(
+        p, make_spec(), coordinator, conn=conn, poll_interval=0,
+        run_ids={"mmlu": existing_run_id},
+    )
+    assert submit_calls["n"] == 0  # resumed, not resubmitted
+    assert outcome.kind == scorer.OutcomeKind.SCORED
+
+
+@pytest.mark.asyncio
+async def test_benchmark_one_marks_pending_resume_when_window_still_open():
+    """C11-C14 finding #2: a poll timeout while the scoring window is still
+    open must not be a hard skip — it should be left resumable for the next
+    leader-loop tick, not converted to a score-0 participant failure."""
+    submission = make_submission_matching_mock()
+    p = scorer.PrecheckPass(hotkey="hk1", submission=submission, gguf_file="model.gguf", measured_memory_kb=999)
+    conn = make_db()
+
+    class NeverCompletingCoordinator:
+        def submit(self, *a, **k):
+            return "run-pending"
+
+        def poll(self, run_id):
+            from competition.benchmark_client import RunStatus, RunStatusCode
+            return RunStatus(run_id=run_id, status=RunStatusCode.RUNNING)
+
+    spec = make_spec()  # scoring_end_block=20
+    outcome = await scorer.benchmark_one(
+        p, spec, NeverCompletingCoordinator(), conn=conn, poll_interval=0,
+        max_wait_seconds=0, current_block=15,  # 15 < scoring_end_block=20 -> window open
+    )
+    assert outcome.kind == scorer.OutcomeKind.SKIPPED
+    assert "pending-resume" in outcome.reason
+
+    row = conn.execute(
+        "SELECT status FROM benchmark_runs WHERE competition_id = ? AND hotkey = ?", ("comp1", "hk1")
+    ).fetchone()
+    assert row["status"] == "pending-resume"
+
+
+@pytest.mark.asyncio
+async def test_benchmark_one_hard_skips_when_window_closed():
+    """Once the scoring window has actually closed, a still-pending poll
+    must finalize as a real timeout/skip — no more resuming."""
+    submission = make_submission_matching_mock()
+    p = scorer.PrecheckPass(hotkey="hk1", submission=submission, gguf_file="model.gguf", measured_memory_kb=999)
+    conn = make_db()
+
+    class NeverCompletingCoordinator:
+        def submit(self, *a, **k):
+            return "run-pending"
+
+        def poll(self, run_id):
+            from competition.benchmark_client import RunStatus, RunStatusCode
+            return RunStatus(run_id=run_id, status=RunStatusCode.RUNNING)
+
+    spec = make_spec()  # scoring_end_block=20
+    outcome = await scorer.benchmark_one(
+        p, spec, NeverCompletingCoordinator(), conn=conn, poll_interval=0,
+        max_wait_seconds=0, current_block=25,  # 25 >= scoring_end_block=20 -> window closed
+    )
+    assert outcome.kind == scorer.OutcomeKind.SKIPPED
+    assert "pending-resume" not in outcome.reason
+    assert "poll timeout" in outcome.reason
+
+
+@pytest.mark.asyncio
+async def test_benchmark_one_respects_submit_semaphore():
+    """C11-C14 finding #4: submit concurrency must be boundable independent
+    of poll concurrency."""
+    submission = make_submission_matching_mock()
+    p = scorer.PrecheckPass(hotkey="hk1", submission=submission, gguf_file="model.gguf", measured_memory_kb=999)
+    conn = make_db()
+
+    max_concurrent = {"seen": 0, "current": 0}
+
+    class TrackingCoordinator(MockCoordinator):
+        def submit(self, *a, **k):
+            max_concurrent["current"] += 1
+            max_concurrent["seen"] = max(max_concurrent["seen"], max_concurrent["current"])
+            try:
+                return super().submit(*a, **k)
+            finally:
+                max_concurrent["current"] -= 1
+
+    sem = asyncio.Semaphore(1)
+    coordinator = TrackingCoordinator()
+    outcomes = await asyncio.gather(*[
+        scorer.benchmark_one(
+            scorer.PrecheckPass(hotkey=f"hk{i}", submission=submission, gguf_file="model.gguf", measured_memory_kb=999),
+            make_spec(), coordinator, conn=conn, poll_interval=0, submit_semaphore=sem,
+        )
+        for i in range(3)
+    ])
+    assert max_concurrent["seen"] == 1
+    assert all(o.kind == scorer.OutcomeKind.SCORED for o in outcomes)
 
 
 @pytest.mark.asyncio

@@ -472,6 +472,7 @@ dependencies = [
     { name = "huggingface-hub" },
     { name = "loguru" },
     { name = "requests" },
+    { name = "tenacity" },
 ]
 
 [package.metadata]
@@ -480,6 +481,7 @@ requires-dist = [
     { name = "huggingface-hub", specifier = ">=0.23.0" },
     { name = "loguru", specifier = ">=0.7.3" },
     { name = "requests", specifier = ">=2.31.0" },
+    { name = "tenacity", specifier = ">=8.2.0" },
 ]
 
 [[package]]

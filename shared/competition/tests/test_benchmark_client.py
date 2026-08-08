@@ -1,3 +1,4 @@
+import requests
 import pytest
 
 from competition.benchmark_client import (
@@ -105,3 +106,76 @@ def test_http_coordinator_poll_in_progress_status_is_running():
     http._session.get = lambda *a, **k: _FakeResp({"status": "benchmarking"})
     status = http.poll("run1")
     assert status.status == RunStatusCode.RUNNING
+
+
+class _FakeErrorResp:
+    """Mimics a requests.Response for building an HTTPError with status_code/headers."""
+    def __init__(self, status_code, headers=None):
+        self.status_code = status_code
+        self.headers = headers or {}
+        self.text = ""
+
+    def json(self):
+        return {}
+
+
+def _http_error(status_code, headers=None):
+    return requests.HTTPError(response=_FakeErrorResp(status_code, headers))
+
+
+def test_http_coordinator_submit_retries_429_then_succeeds(monkeypatch):
+    """C11-C14 finding #3: a submit 429 (coordinator backpressure) must be
+    retried, not treated as an immediate participant failure."""
+    http = HttpCoordinator(base_url="http://example.invalid", api_key="k")
+    monkeypatch.setattr("competition.benchmark_client.SUBMIT_RETRY_BASE_DELAY", 0.0)
+    monkeypatch.setattr("time.sleep", lambda s: None)
+
+    calls = {"n": 0}
+
+    def fake_post(*a, **k):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise _http_error(429, headers={"Retry-After": "0"})
+        return _FakeResp({"run_id": "run-ok"})
+
+    monkeypatch.setattr(http._session, "post", fake_post)
+    run_id = http.submit("user/repo", "a" * 40, "mmlu")
+    assert run_id == "run-ok"
+    assert calls["n"] == 2
+
+
+def test_http_coordinator_submit_does_not_retry_terminal_4xx(monkeypatch):
+    """Auth failure / malformed request / etc must stay terminal — no retry,
+    exception propagates so the caller can skip the participant."""
+    http = HttpCoordinator(base_url="http://example.invalid", api_key="k")
+
+    calls = {"n": 0}
+
+    def fake_post(*a, **k):
+        calls["n"] += 1
+        raise _http_error(401)
+
+    monkeypatch.setattr(http._session, "post", fake_post)
+    with pytest.raises(requests.HTTPError):
+        http.submit("user/repo", "a" * 40, "mmlu")
+    assert calls["n"] == 1
+
+
+def test_http_coordinator_poll_retries_503_then_succeeds(monkeypatch):
+    http = HttpCoordinator(base_url="http://example.invalid", api_key="k")
+    http._run_benchmark["run1"] = "mmlu"
+    monkeypatch.setattr("competition.benchmark_client.SUBMIT_RETRY_BASE_DELAY", 0.0)
+    monkeypatch.setattr("time.sleep", lambda s: None)
+
+    calls = {"n": 0}
+
+    def fake_get(*a, **k):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise _http_error(503)
+        return _FakeResp({"status": "completed", "result": {"mmlu": 0.8}})
+
+    monkeypatch.setattr(http._session, "get", fake_get)
+    status = http.poll("run1")
+    assert status.status == RunStatusCode.COMPLETED
+    assert calls["n"] == 2

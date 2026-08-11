@@ -1,7 +1,7 @@
 import typer
 from rich.console import Console
 from rich.panel import Panel
-from cli.utils.context import get as get_ctx
+from cli.utils.context import get as get_ctx, current_block_safe
 from competition.leader_config_client import get_all_competitions, get_active_competitions
 
 console = Console()
@@ -13,13 +13,7 @@ def competitions(
 ):
     """Show competitions from the TPN config source."""
     ctx = get_ctx()
-
-    current_block = 0
-    try:
-        from common.chain import current_block as get_current_block, get_subtensor
-        current_block = get_current_block(get_subtensor(ctx.network))
-    except Exception:
-        pass
+    current_block = current_block_safe(ctx)
 
     if all_:
         specs = get_all_competitions(base_url=ctx.leader_url, force_refresh=refresh)
@@ -33,7 +27,7 @@ def competitions(
     for spec in specs:
         phase = spec.phase(current_block)
         remaining = spec.blocks_until_next_phase(current_block)
-        minutes = remaining * 12 // 60
+        minutes = remaining * ctx.block_time // 60
 
         lines = [
             f"[bold cyan]{spec.name}[/bold cyan]  [dim](ID: {spec.id})[/dim]",

@@ -3,7 +3,7 @@ import typer
 from rich.console import Console
 from rich.panel import Panel
 from cli.utils.config import load_competition_config, identity_dir
-from cli.utils.context import get as get_ctx
+from cli.utils.context import get as get_ctx, current_block_safe
 from competition.leader_config_client import get_active_competitions, is_competition
 
 console = Console()
@@ -21,12 +21,7 @@ def status(
         console.print(f"[red]Competition '{competition_id}' not found.[/red]")
         raise typer.Exit(1)
 
-    current_block = 0
-    try:
-        from common.chain import current_block as get_current_block, get_subtensor
-        current_block = get_current_block(get_subtensor(ctx.network))
-    except Exception:
-        pass
+    current_block = current_block_safe(ctx)
 
     active_specs = get_active_competitions(base_url=ctx.leader_url, current_block=current_block)
     lines = [

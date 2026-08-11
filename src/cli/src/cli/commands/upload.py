@@ -8,9 +8,8 @@ from pathlib import Path
 from rich.console import Console
 from rich.panel import Panel
 from cli.utils.config import load_competition_config, save_competition_config
-from cli.utils.context import get as get_ctx
+from cli.utils.context import get as get_ctx, resolve_competition_or_exit
 from cli.utils.hf_auth import ensure_hf_auth
-from competition.leader_config_client import is_competition
 
 console = Console()
 
@@ -24,9 +23,7 @@ def upload(
 ):
     """Upload your GGUF model to a private HuggingFace repo."""
     ctx = get_ctx()
-    if not is_competition(ctx.leader_url, competition_id):
-        console.print(f"[red]Competition '{competition_id}' not found.[/red]")
-        raise typer.Exit(1)
+    resolve_competition_or_exit(ctx, competition_id)
 
     if not gguf_path.exists():
         console.print(f"[red]File not found: {gguf_path}[/red]")

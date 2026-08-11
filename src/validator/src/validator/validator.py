@@ -37,8 +37,6 @@ class Validator(HealthServerMixin, LeaderApiMixin):
         self.hotkey = self.wallet.hotkey.ss58_address
         self.available: bool = True
 
-        # Task crash recovery state
-        self._tasks_failed: int = 0
         self._last_heartbeat: float = time.time()
 
         self._db = store.init_db()
@@ -338,7 +336,7 @@ class Validator(HealthServerMixin, LeaderApiMixin):
         # Phase 2: parallel benchmark — all passed miners run concurrently.
         # Resume any run_ids already submitted/persisted for these hotkeys in
         # a prior (killed) process instead of resubmitting from scratch.
-        poll_interval = getattr(validator_settings, "BENCHMARK_POLL_INTERVAL", 30.0)
+        poll_interval = validator_settings.BENCHMARK_POLL_INTERVAL
         pending_runs = store.pending_benchmark_runs(self._db, spec.id)
         resumable: dict[str, Dict[str, str]] = {}
         for row in pending_runs:
@@ -661,43 +659,30 @@ class Validator(HealthServerMixin, LeaderApiMixin):
             "uptime": time.time() - self._last_heartbeat if self._last_heartbeat > 0 else 0,
         }
 
-        if hasattr(self, "_weight_task") and self._weight_task:
-            status["weight_task_running"] = not self._weight_task.done()
-            status["weight_task_cancelled"] = self._weight_task.cancelled()
-        else:
-            status["weight_task_running"] = False
-
-        if hasattr(self, "_validator_task") and self._validator_task:
-            status["validator_task_running"] = not self._validator_task.done()
-            status["validator_task_cancelled"] = self._validator_task.cancelled()
-        else:
-            status["validator_task_running"] = False
+        for prefix, task in (("weight_task", self._weight_task if hasattr(self, "_weight_task") else None),
+                             ("validator_task", self._validator_task if hasattr(self, "_validator_task") else None)):
+            if task:
+                status[f"{prefix}_running"] = not task.done()
+                status[f"{prefix}_cancelled"] = task.cancelled()
+            else:
+                status[f"{prefix}_running"] = False
 
         return status
 
     def _log_task_status(self, weight_task: asyncio.Task, validator_task: asyncio.Task, task_restart_count: dict):
         """Log the current status of both tasks for debugging."""
-        weight_status = "None"
-        if weight_task:
-            if weight_task.done():
-                weight_status = "Done/Failed"
-            elif weight_task.cancelled():
-                weight_status = "Cancelled"
-            else:
-                weight_status = "Running"
-
-        validator_status = "None"
-        if validator_task:
-            if validator_task.done():
-                validator_status = "Done/Failed"
-            elif validator_task.cancelled():
-                validator_status = "Cancelled"
-            else:
-                validator_status = "Running"
+        def _state(task: Optional[asyncio.Task]) -> str:
+            if not task:
+                return "None"
+            if task.cancelled():
+                return "Cancelled"
+            if task.done():
+                return "Done/Failed"
+            return "Running"
 
         logger.info(
-            f"📊 Task Status - Weight: {weight_status} (restarts: {task_restart_count['weight_loop']}), "
-            f"Validator: {validator_status} (restarts: {task_restart_count['validator_loop']})"
+            f"📊 Task Status - Weight: {_state(weight_task)} (restarts: {task_restart_count['weight_loop']}), "
+            f"Validator: {_state(validator_task)} (restarts: {task_restart_count['validator_loop']})"
         )
 
 

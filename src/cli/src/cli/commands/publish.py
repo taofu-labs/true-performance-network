@@ -3,9 +3,8 @@ import typer
 from rich.console import Console
 from rich.panel import Panel
 from cli.utils.config import load_competition_config
-from cli.utils.context import get as get_ctx
+from cli.utils.context import get as get_ctx, resolve_competition_or_exit
 from cli.utils.hf_auth import ensure_hf_auth
-from competition.leader_config_client import is_competition
 
 console = Console()
 
@@ -17,16 +16,13 @@ def publish(
 ):
     """Make your HuggingFace repo public so validators can download your model."""
     ctx = get_ctx()
-    if not is_competition(ctx.leader_url, competition_id):
-        console.print(f"[red]Competition '{competition_id}' not found.[/red]")
-        raise typer.Exit(1)
+    resolve_competition_or_exit(ctx, competition_id)
 
-    
     cfg = load_competition_config(coldkey, hotkey_name, competition_id)
     repo_id = cfg.get("repository")
     if not repo_id:
         console.print(
-            f"[red]No repository found in config for {competition_id}."
+            f"[red]No repository found in config for {competition_id}.[/red]"
         )
         raise typer.Exit(1)
 

@@ -195,6 +195,14 @@ def check_local(req: CheckLocalRequest) -> JSONResponse:
 # ---------------------------------------------------------------------------
 
 def _run_checks(gguf_path: str, context_length: int, run_provenance: bool) -> dict:
+    try:
+        return _run_checks_inner(gguf_path, context_length, run_provenance)
+    except Exception as e:
+        print(f"Checks failed unexpectedly for {gguf_path}: {e}", file=sys.stderr, flush=True)
+        return {"provenance": None, "ram": None, "sha256": None, "error": f"precheck error: {e}"}
+
+
+def _run_checks_inner(gguf_path: str, context_length: int, run_provenance: bool) -> dict:
     provenance_result = None
     ram_result = None
     error = None
@@ -238,7 +246,7 @@ def _run_checks(gguf_path: str, context_length: int, run_provenance: bool) -> di
         if ram_reason and not error:
             error = f"ram check failed: {ram_reason}"
     except Exception as e:
-        ram_result = _FAILED_RAM
+        ram_result = _failed_ram()
         if not error:
             error = f"ram check error: {e}"
 
@@ -264,7 +272,8 @@ _RE_WEIGHTS = re.compile(r"load_tensors:.*CPU model buffer size\s*=\s*([\d.]+)\s
 _RE_KV      = re.compile(r"llama_kv_cache:.*CPU KV buffer size\s*=\s*([\d.]+)\s*MiB", re.IGNORECASE)
 
 
-_FAILED_RAM = {"passed": False, "ram_bytes": 0, "weights_bytes": 0, "kv_cache_bytes": 0}
+def _failed_ram() -> dict:
+    return {"passed": False, "ram_bytes": 0, "weights_bytes": 0, "kv_cache_bytes": 0}
 
 
 def _run_llama_cli(gguf_path: str, context_length: int) -> tuple[dict, str | None]:
@@ -300,7 +309,7 @@ def _run_llama_cli(gguf_path: str, context_length: int) -> tuple[dict, str | Non
     except subprocess.TimeoutExpired:
         reason = f"llama-cli timed out after {RAM_CHECK_TIMEOUT_SECONDS}s (context_length={context_length})"
         print(reason, file=sys.stderr)
-        return _FAILED_RAM, reason
+        return _failed_ram(), reason
 
     # llama-cli's generated output (--verbose logs the inference response) can
     # contain non-UTF-8 bytes from garbage token decodes; only the weight/KV
@@ -312,7 +321,7 @@ def _run_llama_cli(gguf_path: str, context_length: int) -> tuple[dict, str | Non
         sig_note = f" (killed by signal {-result.returncode})" if result.returncode < 0 else ""
         reason = f"llama-cli exit {result.returncode}{sig_note}: {combined[-500:]}"
         print(reason, file=sys.stderr)
-        return _FAILED_RAM, reason
+        return _failed_ram(), reason
 
     w_matches = _RE_WEIGHTS.findall(combined)
     kv_matches = _RE_KV.findall(combined)
@@ -321,7 +330,7 @@ def _run_llama_cli(gguf_path: str, context_length: int) -> tuple[dict, str | Non
         missing = "weights" if not w_matches else "kv-cache"
         reason = f"llama-cli log parse failed (missing {missing} buffer line)"
         print(f"{reason}. tail:\n{combined[-1000:]}", file=sys.stderr)
-        return _FAILED_RAM, reason
+        return _failed_ram(), reason
 
     weights_bytes = int(float(w_matches[-1]) * 1024 * 1024)
     kv_bytes      = int(float(kv_matches[-1]) * 1024 * 1024)

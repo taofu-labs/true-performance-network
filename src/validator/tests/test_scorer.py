@@ -3,6 +3,7 @@ import sqlite3
 
 import pytest
 
+from common import settings as common_settings
 from common.models.competition import BenchmarkTask, CompetitionSpec
 from common.models.submission import Claim, MinerSubmission
 from competition.benchmark_client import MockCoordinator
@@ -251,27 +252,31 @@ async def test_benchmark_one_skips_submit_for_resumed_run_ids():
     assert outcome.kind == scorer.OutcomeKind.SCORED
 
 
+class NeverCompletingCoordinator:
+    """Always RUNNING, phase/last_log_at frozen — simulates a truly stalled
+    coordinator run (no progress ever reported)."""
+    def submit(self, *a, **k):
+        return "run-pending"
+
+    def poll(self, run_id):
+        from competition.benchmark_client import RunStatus, RunStatusCode
+        return RunStatus(run_id=run_id, status=RunStatusCode.RUNNING, phase="benchmarking")
+
+
 @pytest.mark.asyncio
-async def test_benchmark_one_marks_pending_resume_when_window_still_open():
-    """C11-C14 finding #2: a poll timeout while the scoring window is still
-    open must not be a hard skip — it should be left resumable for the next
-    leader-loop tick, not converted to a score-0 participant failure."""
+async def test_benchmark_one_marks_pending_resume_when_window_still_open(monkeypatch):
+    """C11-C14 finding #2: a stale-progress timeout while the scoring window
+    is still open must not be a hard skip — it should be left resumable for
+    the next leader-loop tick, not converted to a score-0 participant failure."""
+    monkeypatch.setattr(common_settings, "BENCHMARK_EXECUTION_STALE_SECONDS", 0)
     submission = make_submission_matching_mock()
     p = scorer.PrecheckPass(hotkey="hk1", submission=submission, gguf_file="model.gguf", measured_memory_kb=999)
     conn = make_db()
 
-    class NeverCompletingCoordinator:
-        def submit(self, *a, **k):
-            return "run-pending"
-
-        def poll(self, run_id):
-            from competition.benchmark_client import RunStatus, RunStatusCode
-            return RunStatus(run_id=run_id, status=RunStatusCode.RUNNING)
-
     spec = make_spec()  # scoring_end_block=20
     outcome = await scorer.benchmark_one(
         p, spec, NeverCompletingCoordinator(), conn=conn, poll_interval=0,
-        max_wait_seconds=0, current_block=15,  # 15 < scoring_end_block=20 -> window open
+        current_block=15,  # 15 < scoring_end_block=20 -> window open
     )
     assert outcome.kind == scorer.OutcomeKind.SKIPPED
     assert "pending-resume" in outcome.reason
@@ -283,29 +288,118 @@ async def test_benchmark_one_marks_pending_resume_when_window_still_open():
 
 
 @pytest.mark.asyncio
-async def test_benchmark_one_hard_skips_when_window_closed():
-    """Once the scoring window has actually closed, a still-pending poll
+async def test_benchmark_one_hard_skips_when_window_closed(monkeypatch):
+    """Once the scoring window has actually closed, a still-stalled poll
     must finalize as a real timeout/skip — no more resuming."""
+    monkeypatch.setattr(common_settings, "BENCHMARK_EXECUTION_STALE_SECONDS", 0)
     submission = make_submission_matching_mock()
     p = scorer.PrecheckPass(hotkey="hk1", submission=submission, gguf_file="model.gguf", measured_memory_kb=999)
     conn = make_db()
 
-    class NeverCompletingCoordinator:
-        def submit(self, *a, **k):
-            return "run-pending"
-
-        def poll(self, run_id):
-            from competition.benchmark_client import RunStatus, RunStatusCode
-            return RunStatus(run_id=run_id, status=RunStatusCode.RUNNING)
-
     spec = make_spec()  # scoring_end_block=20
     outcome = await scorer.benchmark_one(
         p, spec, NeverCompletingCoordinator(), conn=conn, poll_interval=0,
-        max_wait_seconds=0, current_block=25,  # 25 >= scoring_end_block=20 -> window closed
+        current_block=25,  # 25 >= scoring_end_block=20 -> window closed
     )
     assert outcome.kind == scorer.OutcomeKind.SKIPPED
     assert "pending-resume" not in outcome.reason
-    assert "poll timeout" in outcome.reason
+    assert "timed out" in outcome.reason
+
+
+@pytest.mark.asyncio
+async def test_benchmark_one_survives_long_execution_phase_with_fresh_progress():
+    """A benchmark whose last_log_at keeps advancing must never be killed by
+    elapsed time alone, even past what the old fixed timeout would allow."""
+    submission = make_submission_matching_mock(claims=[Claim(b="mmlu", s=0.7)])
+    p = scorer.PrecheckPass(hotkey="hk1", submission=submission, gguf_file="model.gguf", measured_memory_kb=999)
+    conn = make_db()
+
+    class SlowButProgressingCoordinator:
+        def __init__(self):
+            self._n = 0
+
+        def submit(self, *a, **k):
+            return "run-slow"
+
+        def poll(self, run_id):
+            from competition.benchmark_client import RunStatus, RunStatusCode
+            self._n += 1
+            if self._n < 5:
+                return RunStatus(
+                    run_id=run_id, status=RunStatusCode.RUNNING,
+                    phase="benchmarking", last_log_at=f"tick-{self._n}",
+                )
+            return RunStatus(run_id=run_id, status=RunStatusCode.COMPLETED, scores={"mmlu": 0.7})
+
+    outcome = await scorer.benchmark_one(
+        p, make_spec(), SlowButProgressingCoordinator(), conn=conn, poll_interval=0,
+    )
+    assert outcome.kind == scorer.OutcomeKind.SCORED
+
+
+@pytest.mark.asyncio
+async def test_benchmark_one_estimated_seconds_remaining_extends_stale_window(monkeypatch):
+    """A run reporting a large estimated_seconds_remaining must survive
+    longer than the static per-bucket stale window before being called stale —
+    frozen last_log_at + a 0s static window would stall it on tick 1
+    otherwise, so surviving several ticks proves the estimate is in effect."""
+    monkeypatch.setattr(common_settings, "BENCHMARK_EXECUTION_STALE_SECONDS", 0)
+    submission = make_submission_matching_mock(claims=[Claim(b="mmlu", s=0.7)])
+    p = scorer.PrecheckPass(hotkey="hk1", submission=submission, gguf_file="model.gguf", measured_memory_kb=999)
+    conn = make_db()
+
+    class LongEstimateCoordinator:
+        def __init__(self):
+            self._n = 0
+
+        def submit(self, *a, **k):
+            return "run-estimate"
+
+        def poll(self, run_id):
+            from competition.benchmark_client import RunStatus, RunStatusCode
+            self._n += 1
+            if self._n < 5:
+                return RunStatus(
+                    run_id=run_id, status=RunStatusCode.RUNNING,
+                    phase="benchmarking", estimated_seconds_remaining=1_000_000,
+                )
+            return RunStatus(run_id=run_id, status=RunStatusCode.COMPLETED, scores={"mmlu": 0.7})
+
+    outcome = await scorer.benchmark_one(
+        p, make_spec(), LongEstimateCoordinator(), conn=conn, poll_interval=0, current_block=15,
+    )
+    assert outcome.kind == scorer.OutcomeKind.SCORED
+
+
+@pytest.mark.asyncio
+async def test_benchmark_one_execution_bucket_survives_zero_startup_window(monkeypatch):
+    """A run reporting phase="benchmarking" (execution bucket) must use
+    BENCHMARK_EXECUTION_STALE_SECONDS, not BENCHMARK_STARTUP_STALE_SECONDS —
+    with the startup window forced to 0s, a run stuck in startup would stall
+    immediately, but one reporting straight into "benchmarking" must not."""
+    monkeypatch.setattr(common_settings, "BENCHMARK_STARTUP_STALE_SECONDS", 0)
+    submission = make_submission_matching_mock(claims=[Claim(b="mmlu", s=0.7)])
+    p = scorer.PrecheckPass(hotkey="hk1", submission=submission, gguf_file="model.gguf", measured_memory_kb=999)
+    conn = make_db()
+
+    class ExecutionPhaseCoordinator:
+        def __init__(self):
+            self._n = 0
+
+        def submit(self, *a, **k):
+            return "run-execution"
+
+        def poll(self, run_id):
+            from competition.benchmark_client import RunStatus, RunStatusCode
+            self._n += 1
+            if self._n < 3:
+                return RunStatus(run_id=run_id, status=RunStatusCode.RUNNING, phase="benchmarking")
+            return RunStatus(run_id=run_id, status=RunStatusCode.COMPLETED, scores={"mmlu": 0.7})
+
+    outcome = await scorer.benchmark_one(
+        p, make_spec(), ExecutionPhaseCoordinator(), conn=conn, poll_interval=0, current_block=15,
+    )
+    assert outcome.kind == scorer.OutcomeKind.SCORED
 
 
 @pytest.mark.asyncio

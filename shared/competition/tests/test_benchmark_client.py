@@ -108,6 +108,43 @@ def test_http_coordinator_poll_in_progress_status_is_running():
     assert status.status == RunStatusCode.RUNNING
 
 
+def test_http_coordinator_poll_in_progress_carries_phase_and_progress():
+    http = HttpCoordinator(base_url="http://example.invalid", api_key="k")
+    http._session.get = lambda *a, **k: _FakeResp({
+        "status": "benchmarking",
+        "phase": "lm_eval_running",
+        "percent_complete": 62,
+        "progress": {
+            "message": "lm-eval progress: 40 of 100.",
+            "last_log_at": "2026-08-11T00:00:00Z",
+            "estimated_seconds_remaining": 1200,
+        },
+    })
+    status = http.poll("run1")
+    assert status.phase == "lm_eval_running"
+    assert status.percent_complete == 62
+    assert status.message == "lm-eval progress: 40 of 100."
+    assert status.last_log_at == "2026-08-11T00:00:00Z"
+    assert status.estimated_seconds_remaining == 1200
+
+
+def test_http_coordinator_poll_resumed_run_attributes_score_via_response_benchmark_field():
+    """A run resumed after a validator restart never called submit() in this
+    process, so self._run_benchmark is empty for it — the coordinator's own
+    `benchmark` field in the /status response must still let the score be
+    attributed correctly instead of being silently dropped."""
+    http = HttpCoordinator(base_url="http://example.invalid", api_key="k")
+    assert "run1" not in http._run_benchmark  # simulates a fresh process, no prior submit()
+    http._session.get = lambda *a, **k: _FakeResp({
+        "status": "completed",
+        "benchmark": "gsm8k",
+        "result_summary": {"score": 0.55, "prompt_tokens": 10, "samples": 5},
+    })
+    status = http.poll("run1")
+    assert status.status == RunStatusCode.COMPLETED
+    assert status.scores == {"gsm8k": 0.55}
+
+
 class _FakeErrorResp:
     """Mimics a requests.Response for building an HTTPError with status_code/headers."""
     def __init__(self, status_code, headers=None):

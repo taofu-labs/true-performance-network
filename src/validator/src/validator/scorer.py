@@ -28,6 +28,25 @@ from validator import store
 _HF_RESOLVE = "https://huggingface.co/{repo}/resolve/{revision}/{file}"
 _hf_api = HfApi()
 
+# Coordinator phases bucketed by expected stall tolerance — see
+# BENCHMARK_STARTUP_STALE_SECONDS / BENCHMARK_EXECUTION_STALE_SECONDS.
+_STARTUP_PHASES = {
+    "requested", "quoted", "queued", "provisioning",
+    "worker_booting", "downloading_model", "hashing_model", "preflight",
+}
+_EXECUTION_PHASES = {"benchmarking", "collecting_results"}
+
+# Buffer applied to the coordinator's own estimated_seconds_remaining before
+# using it to extend the stale window — a safety margin on a number the
+# coordinator already computed, not an independently tunable knob.
+_ESTIMATE_SAFETY_FACTOR = 1.5
+
+
+def _stale_window(phase: Optional[str]) -> float:
+    if phase in _EXECUTION_PHASES:
+        return common_settings.BENCHMARK_EXECUTION_STALE_SECONDS
+    return common_settings.BENCHMARK_STARTUP_STALE_SECONDS
+
 
 # ---------------------------------------------------------------------------
 # Outcome
@@ -148,7 +167,7 @@ def precheck_one(
 
     reported_bytes = submission.max_memory * 1024
     measured_bytes = verdict.ram.ram_bytes
-    tolerance = getattr(common_settings, "RAM_CHECK_LYING_TOLERANCE", 0.01)
+    tolerance = common_settings.RAM_CHECK_LYING_TOLERANCE
     if reported_bytes > 0 and abs(measured_bytes - reported_bytes) / reported_bytes > tolerance:
         diff = abs(measured_bytes - reported_bytes) / reported_bytes
         logger.warning(f"{hotkey[:12]} max_memory lie: reported={reported_bytes} measured={measured_bytes} diff={diff:.1%}")
@@ -179,7 +198,6 @@ async def benchmark_one(
     coordinator: Coordinator,
     conn: sqlite3.Connection,
     poll_interval: float = 30.0,
-    max_wait_seconds: float = None,
     current_block: Optional[int] = None,
     run_ids: Optional[Dict[str, str]] = None,
     submit_semaphore: Optional[asyncio.Semaphore] = None,
@@ -193,9 +211,13 @@ async def benchmark_one(
 
     A validator restart mid-poll is common (autoupdater can SIGKILL every
     ~15min while a scoring window stays open for hours-days), so run_ids are
-    persisted to `benchmark_runs` immediately after each submit, and a poll
-    timeout only becomes a hard skip once the competition's scoring window
-    (spec.scoring_end_block) has actually closed — otherwise the run is left
+    persisted to `benchmark_runs` immediately after each submit. A benchmark
+    is only given up on when its coordinator progress goes stale (no
+    progress.last_log_at movement for longer than its phase's stale window —
+    see _stale_window()) — long but healthy runs (multi-hour lm_eval tasks,
+    slow GGUF downloads) are never killed by elapsed time alone. Once stale,
+    the outcome is a hard skip only if the competition's scoring window
+    (spec.scoring_end_block) has closed; otherwise the run is left
     'pending-resume' for the next tick's reconciliation pass to pick back up.
 
     `submit_semaphore`, if given, bounds concurrent *submits* only across all
@@ -204,8 +226,6 @@ async def benchmark_one(
     unbounded/parallel once a run_id is accepted.
     """
     hotkey, submission = p.hotkey, p.submission
-    if max_wait_seconds is None:
-        max_wait_seconds = getattr(common_settings, "BENCHMARK_POLL_TIMEOUT_SECONDS", 5400)
 
     run_ids = dict(run_ids or {})
     try:
@@ -237,47 +257,79 @@ async def benchmark_one(
     except Exception as e:
         return _skip(hotkey, submission, f"benchmark submit error: {e}")
 
-    # Poll
+    # Poll — one stale-progress clock per benchmark, no fixed wall-clock deadline.
+    # A benchmark is stalled only when its coordinator progress.last_log_at
+    # stops advancing for longer than its phase's stale window (extended
+    # dynamically if the coordinator reports estimated_seconds_remaining).
     actual_scores: Dict[str, float] = {}
     pending = dict(run_ids)
-    deadline = time.monotonic() + max_wait_seconds
+    now = time.monotonic()
+    last_log_at: Dict[str, Optional[str]] = {bname: None for bname in pending}
+    last_progress_wall: Dict[str, float] = {bname: now for bname in pending}
+
     while pending:
-        if time.monotonic() >= deadline:
-            window_open = current_block is None or current_block < spec.scoring_end_block
-            if window_open:
-                logger.warning(
-                    f"{hotkey[:12]} benchmark poll timeout after {max_wait_seconds:.0f}s, "
-                    f"still pending: {list(pending)} — scoring window still open, resuming next tick"
-                )
-                for bname in pending:
-                    store.set_benchmark_run_status(
-                        conn, submission.competition_id, hotkey, bname, "pending-resume"
-                    )
-                return _skip(
-                    hotkey, submission,
-                    f"benchmark poll pending-resume, pending: {list(pending)}",
-                    actual_scores=actual_scores,
-                )
-            logger.warning(f"{hotkey[:12]} benchmark poll timeout after {max_wait_seconds:.0f}s, scoring window closed: {list(pending)}")
-            return _skip(
-                hotkey, submission,
-                f"benchmark poll timeout after {max_wait_seconds:.0f}s, pending: {list(pending)}",
-                actual_scores=actual_scores,
-            )
         await asyncio.sleep(poll_interval)
+        now = time.monotonic()
+        stalled: List[str] = []
         for bname in list(pending):
             try:
                 status = await asyncio.to_thread(coordinator.poll, pending[bname])
             except Exception as e:
                 return _skip(hotkey, submission, f"poll error: {e}")
+
             if status.status == RunStatusCode.COMPLETED:
                 actual_scores[bname] = status.scores.get(bname, 0.0)
                 del pending[bname]
                 store.set_benchmark_run_status(conn, submission.competition_id, hotkey, bname, "completed")
                 logger.debug(f"{hotkey[:12]} {bname}={actual_scores[bname]:.4f}")
-            elif status.status == RunStatusCode.FAILED:
+                continue
+            if status.status == RunStatusCode.FAILED:
                 store.set_benchmark_run_status(conn, submission.competition_id, hotkey, bname, "failed")
                 return _skip(hotkey, submission, f"benchmark {bname} failed: {status.failure_reason or 'unknown'}")
+
+            # Still running — refresh the activity clock if the coordinator
+            # reports new progress, else check it against the stale window.
+            if status.last_log_at != last_log_at[bname]:
+                last_log_at[bname] = status.last_log_at
+                last_progress_wall[bname] = now
+
+            store.update_benchmark_run_progress(
+                conn, submission.competition_id, hotkey, bname,
+                status.phase, status.percent_complete, status.message,
+            )
+
+            window = max(
+                _stale_window(status.phase),
+                (status.estimated_seconds_remaining or 0) * _ESTIMATE_SAFETY_FACTOR,
+            )
+            if now - last_progress_wall[bname] > window:
+                stalled.append(bname)
+
+        if not stalled:
+            continue
+
+        window_open = current_block is None or current_block < spec.scoring_end_block
+        if window_open:
+            logger.warning(
+                f"{hotkey[:12]} benchmark(s) stalled (no progress past stale window): "
+                f"{stalled} — scoring window still open, resuming next tick"
+            )
+            for bname in stalled:
+                store.set_benchmark_run_status(
+                    conn, submission.competition_id, hotkey, bname, "pending-resume"
+                )
+            return _skip(
+                hotkey, submission,
+                f"benchmark poll pending-resume, stalled: {stalled}",
+                actual_scores=actual_scores,
+            )
+
+        logger.warning(f"{hotkey[:12]} benchmark(s) stalled, scoring window closed: {stalled}")
+        return _skip(
+            hotkey, submission,
+            f"benchmark poll timed out (stale progress), pending: {stalled}",
+            actual_scores=actual_scores,
+        )
 
     # Score-mismatch check: miner claimed a benchmark score in its reveal
     # higher than what the coordinator actually measured. Only under-delivery

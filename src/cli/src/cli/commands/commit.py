@@ -9,10 +9,9 @@ from typing import Optional
 from rich.console import Console
 from rich.panel import Panel
 from cli.utils.config import load_competition_config, save_competition_config
-from cli.utils.context import get as get_ctx
+from cli.utils.context import get as get_ctx, resolve_competition_or_exit
 from common.chain import current_block as get_current_block, timelocked_commit, is_hotkey_registered, get_subtensor, get_wallet
 from common.models.submission import Claim, build_reveal_payload
-from competition.leader_config_client import get_competition_by_id
 
 console = Console()
 
@@ -44,10 +43,7 @@ def commit(
         raise typer.Exit(1)
 
     # ── Competition valid + OPEN ─────────────────────────────────────
-    spec = get_competition_by_id(base_url=ctx.leader_url, competition_id=competition_id)
-    if spec is None:
-        console.print(f"[red]Competition '{competition_id}' not found.[/red]")
-        raise typer.Exit(1)
+    spec = resolve_competition_or_exit(ctx, competition_id)
 
     from common.models.competition import CompetitionPhase
     phase = spec.phase(current_block)

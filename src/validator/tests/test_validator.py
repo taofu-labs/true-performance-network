@@ -1,7 +1,11 @@
+import tempfile
+from pathlib import Path
+
 import pytest
 
 from common import settings as common_settings
 from common.models.competition import BenchmarkTask, CompetitionSpec
+from validator import store
 from validator.validator import Validator
 
 
@@ -61,6 +65,11 @@ class FakeSubtensor:
 def make_validator(monkeypatch, metagraph=None, mode="leader"):
     monkeypatch.setattr(common_settings, "BITTENSOR", False)
     monkeypatch.setattr(common_settings, "VALIDATOR_MODE", mode, raising=False)
+    # Each test gets its own DB file — store.init_db() caches connections by
+    # path at module scope, so without this every test in this file would
+    # share (and pollute) the same on-disk validator.db.
+    db_path = Path(tempfile.mkstemp(suffix=".db")[1])
+    monkeypatch.setattr(store, "validator_db_path", lambda: db_path)
     return Validator(
         wallet=FakeWallet(),
         subtensor=FakeSubtensor(metagraph=metagraph),

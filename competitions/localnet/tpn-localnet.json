@@ -8,7 +8,6 @@
   "commit_end_block": 100,
   "scoring_end_block": 1200,
   "reveal_grace_blocks": 10,
-  "score_tolerance": 0.02,
 
   "competition_type": "benchmark_floor",
 

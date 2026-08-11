@@ -42,7 +42,6 @@ class CompetitionSpec(BaseModel):
     benchmarks: List[BenchmarkTask]
     model_requirements: ModelRequirements = ModelRequirements()
     reveal_grace_blocks: int = 150
-    score_tolerance: float = 0.02
     ram_check_context_length: int = 4096
 
     emission_weight: float = 1.0  # this competition's fixed share of total network weight (0,1]

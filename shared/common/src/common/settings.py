@@ -40,8 +40,14 @@ PRECHECK_HOST_PORT: int = int(os.getenv("PRECHECK_HOST_PORT", "8081"))
 RAM_CHECK_LYING_TOLERANCE: float = float(os.getenv("RAM_CHECK_LYING_TOLERANCE", "0.01"))
 SCORE_LYING_TOLERANCE: float = float(os.getenv("SCORE_LYING_TOLERANCE", "0.01"))
 
-# Max wall-clock seconds to poll a single benchmark run before giving up (skip, not fail-fast)
-BENCHMARK_POLL_TIMEOUT_SECONDS: int = int(os.getenv("BENCHMARK_POLL_TIMEOUT_SECONDS", "5400"))
+# Stale-progress windows: a benchmark run is considered stuck only when the
+# coordinator's progress.last_log_at stops advancing for longer than the
+# window for its current phase bucket — not by total elapsed wall-clock time.
+# Startup (provisioning/model download/preflight) gets a shorter window than
+# execution (benchmarking/collecting_results), where lm_eval heartbeats are
+# coarser and multi-hour runs (MMLU, HellaSwag) are expected and healthy.
+BENCHMARK_STARTUP_STALE_SECONDS: int = int(os.getenv("BENCHMARK_STARTUP_STALE_SECONDS", "900"))
+BENCHMARK_EXECUTION_STALE_SECONDS: int = int(os.getenv("BENCHMARK_EXECUTION_STALE_SECONDS", "1800"))
 
 
 def configure_logging() -> None:

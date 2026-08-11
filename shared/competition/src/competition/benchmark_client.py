@@ -101,6 +101,11 @@ class RunStatus:
     status: str           # RunStatusCode constant
     scores: Dict[str, float] = field(default_factory=dict)
     failure_reason: Optional[str] = None
+    phase: Optional[str] = None
+    percent_complete: Optional[float] = None
+    last_log_at: Optional[str] = None
+    message: Optional[str] = None
+    estimated_seconds_remaining: Optional[float] = None
 
 
 # ---------------------------------------------------------------------------
@@ -263,25 +268,38 @@ class HttpCoordinator:
         data = resp.json()
 
         raw_status = data.get("status", "")
-        benchmark = self._run_benchmark.get(run_id)
+        # Coordinator's status response is the source of truth for which
+        # benchmark a run_id belongs to — falls back to the in-memory cache
+        # (populated by submit() in this process) for older coordinators that
+        # don't echo `benchmark` back, or as a fast path.
+        benchmark = data.get("benchmark") or self._run_benchmark.get(run_id)
+        progress = data.get("progress") or {}
+        progress_fields = dict(
+            phase=data.get("phase"),
+            percent_complete=data.get("percent_complete"),
+            last_log_at=progress.get("last_log_at"),
+            message=progress.get("message"),
+            estimated_seconds_remaining=progress.get("estimated_seconds_remaining"),
+        )
 
         if raw_status in ("completed", "cache_hit"):
             scores = _extract_scores(data.get("result"), benchmark) or _extract_scores(data.get("result_summary"), benchmark)
-            return RunStatus(run_id=run_id, status=RunStatusCode.COMPLETED, scores=scores)
+            return RunStatus(run_id=run_id, status=RunStatusCode.COMPLETED, scores=scores, **progress_fields)
 
         if raw_status in ("failed", "cancelled", "cleanup_failed"):
             return RunStatus(
                 run_id=run_id,
                 status=RunStatusCode.FAILED,
                 failure_reason=data.get("failure_reason") or f"run ended in terminal status {raw_status!r}",
+                **progress_fields,
             )
 
         if raw_status in _IN_PROGRESS:
-            return RunStatus(run_id=run_id, status=RunStatusCode.RUNNING)
+            return RunStatus(run_id=run_id, status=RunStatusCode.RUNNING, **progress_fields)
 
         # Unknown status — treat as still running
         logger.warning(f"[http] unknown status {raw_status!r} for {run_id}")
-        return RunStatus(run_id=run_id, status=RunStatusCode.RUNNING)
+        return RunStatus(run_id=run_id, status=RunStatusCode.RUNNING, **progress_fields)
 
 
 def _extract_scores(result: Optional[dict], benchmark: Optional[str]) -> Dict[str, float]:

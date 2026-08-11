@@ -52,7 +52,8 @@ Key env vars:
 | `COORDINATOR_API_KEY` | (none) | Auth for the benchmark coordinator, `http` backend only |
 | `PRECHECK_IMAGE` | `ghcr.io/taofu-labs/tpn-precheck` | Docker image used for provenance/RAM precheck |
 | `PRECHECK_HOST_PORT` | `8081` | Host port the precheck container binds to (loopback-only) |
-| `BENCHMARK_POLL_TIMEOUT_SECONDS` | `5400` | Max wall-clock time to poll one benchmark run before giving up |
+| `BENCHMARK_STARTUP_STALE_SECONDS` | `900` | Give up on a benchmark run if no coordinator progress (provisioning/model download/preflight) for this long |
+| `BENCHMARK_EXECUTION_STALE_SECONDS` | `1800` | Give up on a benchmark run if no coordinator progress (benchmarking/collecting_results) for this long — extended dynamically if the coordinator reports `estimated_seconds_remaining` |
 
 **Loop timing:**
 

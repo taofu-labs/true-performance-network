@@ -195,6 +195,14 @@ def check_local(req: CheckLocalRequest) -> JSONResponse:
 # ---------------------------------------------------------------------------
 
 def _run_checks(gguf_path: str, context_length: int, run_provenance: bool) -> dict:
+    try:
+        return _run_checks_inner(gguf_path, context_length, run_provenance)
+    except Exception as e:
+        print(f"Checks failed unexpectedly for {gguf_path}: {e}", file=sys.stderr, flush=True)
+        return {"provenance": None, "ram": None, "sha256": None, "error": f"precheck error: {e}"}
+
+
+def _run_checks_inner(gguf_path: str, context_length: int, run_provenance: bool) -> dict:
     provenance_result = None
     ram_result = None
     error = None
@@ -233,10 +241,12 @@ def _run_checks(gguf_path: str, context_length: int, run_provenance: bool) -> di
     # RAM check (always, even if provenance errored — independent gate)
     _debug(f"Starting RAM check (context_length={context_length})")
     try:
-        ram_result = _run_llama_cli(gguf_path, context_length)
+        ram_result, ram_reason = _run_llama_cli(gguf_path, context_length)
         _debug(f"RAM check result: {ram_result}")
+        if ram_reason and not error:
+            error = f"ram check failed: {ram_reason}"
     except Exception as e:
-        ram_result = {"passed": False, "ram_bytes": 0, "weights_bytes": 0, "kv_cache_bytes": 0}
+        ram_result = _failed_ram()
         if not error:
             error = f"ram check error: {e}"
 
@@ -262,7 +272,12 @@ _RE_WEIGHTS = re.compile(r"load_tensors:.*CPU model buffer size\s*=\s*([\d.]+)\s
 _RE_KV      = re.compile(r"llama_kv_cache:.*CPU KV buffer size\s*=\s*([\d.]+)\s*MiB", re.IGNORECASE)
 
 
-def _run_llama_cli(gguf_path: str, context_length: int) -> dict:
+def _failed_ram() -> dict:
+    return {"passed": False, "ram_bytes": 0, "weights_bytes": 0, "kv_cache_bytes": 0}
+
+
+def _run_llama_cli(gguf_path: str, context_length: int) -> tuple[dict, str | None]:
+    """Returns (ram_result, reason). reason is None on success, else why it failed."""
     # --single-turn: exit after one response (b10020 stays as server otherwise)
     # --no-warmup: skip warmup pass to avoid SIGABRT on encoder-only models
     # findall[-1]: model loads twice internally; last match has real values (not 0.00 MiB)
@@ -292,8 +307,9 @@ def _run_llama_cli(gguf_path: str, context_length: int) -> dict:
             timeout=RAM_CHECK_TIMEOUT_SECONDS,
         )
     except subprocess.TimeoutExpired:
-        print(f"llama-cli timed out after {RAM_CHECK_TIMEOUT_SECONDS}s", file=sys.stderr)
-        return {"passed": False, "ram_bytes": 0, "weights_bytes": 0, "kv_cache_bytes": 0}
+        reason = f"llama-cli timed out after {RAM_CHECK_TIMEOUT_SECONDS}s (context_length={context_length})"
+        print(reason, file=sys.stderr)
+        return _failed_ram(), reason
 
     # llama-cli's generated output (--verbose logs the inference response) can
     # contain non-UTF-8 bytes from garbage token decodes; only the weight/KV
@@ -301,15 +317,20 @@ def _run_llama_cli(gguf_path: str, context_length: int) -> dict:
     combined = (result.stdout + result.stderr).decode("utf-8", errors="replace")
 
     if result.returncode != 0:
-        print(f"llama-cli exit {result.returncode}: {combined[-500:]}", file=sys.stderr)
-        return {"passed": False, "ram_bytes": 0, "weights_bytes": 0, "kv_cache_bytes": 0}
+        # negative returncode == killed by signal (e.g. -9 SIGKILL from OOM killer)
+        sig_note = f" (killed by signal {-result.returncode})" if result.returncode < 0 else ""
+        reason = f"llama-cli exit {result.returncode}{sig_note}: {combined[-500:]}"
+        print(reason, file=sys.stderr)
+        return _failed_ram(), reason
 
     w_matches = _RE_WEIGHTS.findall(combined)
     kv_matches = _RE_KV.findall(combined)
 
     if not w_matches or not kv_matches:
-        print(f"llama-cli log parse failed. tail:\n{combined[-1000:]}", file=sys.stderr)
-        return {"passed": False, "ram_bytes": 0, "weights_bytes": 0, "kv_cache_bytes": 0}
+        missing = "weights" if not w_matches else "kv-cache"
+        reason = f"llama-cli log parse failed (missing {missing} buffer line)"
+        print(f"{reason}. tail:\n{combined[-1000:]}", file=sys.stderr)
+        return _failed_ram(), reason
 
     weights_bytes = int(float(w_matches[-1]) * 1024 * 1024)
     kv_bytes      = int(float(kv_matches[-1]) * 1024 * 1024)
@@ -319,7 +340,7 @@ def _run_llama_cli(gguf_path: str, context_length: int) -> dict:
         "ram_bytes": weights_bytes + kv_bytes,
         "weights_bytes": weights_bytes,
         "kv_cache_bytes": kv_bytes,
-    }
+    }, None
 
 
 # ---------------------------------------------------------------------------

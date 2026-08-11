@@ -110,6 +110,9 @@ CREATE TABLE IF NOT EXISTS benchmark_runs (
     status TEXT NOT NULL DEFAULT 'submitted',
     submitted_at REAL NOT NULL,
     updated_at REAL NOT NULL,
+    phase TEXT,
+    percent_complete REAL,
+    last_message TEXT,
     PRIMARY KEY (competition_id, hotkey, benchmark_name)
 );
 
@@ -154,8 +157,22 @@ def init_db(path: Optional[Path] = None) -> sqlite3.Connection:
     conn.execute("PRAGMA journal_mode=WAL")
     conn.executescript(_SCHEMA)
     conn.commit()
+    _migrate_benchmark_runs_progress_columns(conn)
     _connections[key] = conn
     return conn
+
+
+def _migrate_benchmark_runs_progress_columns(conn: sqlite3.Connection) -> None:
+    """Add phase/percent_complete/last_message to benchmark_runs if missing.
+
+    CREATE TABLE IF NOT EXISTS only covers brand-new DBs — existing deployed
+    DBs need these added via ALTER TABLE. No-op once already applied.
+    """
+    existing = {row["name"] for row in conn.execute("PRAGMA table_info(benchmark_runs)")}
+    for column, ddl_type in (("phase", "TEXT"), ("percent_complete", "REAL"), ("last_message", "TEXT")):
+        if column not in existing:
+            conn.execute(f"ALTER TABLE benchmark_runs ADD COLUMN {column} {ddl_type}")
+    conn.commit()
 
 
 # ---------------------------------------------------------------------------
@@ -418,6 +435,27 @@ def set_benchmark_run_status(
         """UPDATE benchmark_runs SET status = ?, updated_at = ?
            WHERE competition_id = ? AND hotkey = ? AND benchmark_name = ?""",
         (status, time.time(), competition_id, hotkey, benchmark_name),
+    )
+    conn.commit()
+
+
+def update_benchmark_run_progress(
+    conn: sqlite3.Connection,
+    competition_id: str,
+    hotkey: str,
+    benchmark_name: str,
+    phase: Optional[str],
+    percent_complete: Optional[float],
+    last_message: Optional[str],
+) -> None:
+    """Records the coordinator's latest reported phase/progress for a
+    still-in-flight run — diagnostics only, so a restart can show last-known
+    state immediately without waiting for the first post-resume poll. Does
+    not touch `status`, unlike set_benchmark_run_status()."""
+    conn.execute(
+        """UPDATE benchmark_runs SET phase = ?, percent_complete = ?, last_message = ?, updated_at = ?
+           WHERE competition_id = ? AND hotkey = ? AND benchmark_name = ?""",
+        (phase, percent_complete, last_message, time.time(), competition_id, hotkey, benchmark_name),
     )
     conn.commit()
 

@@ -131,6 +131,8 @@ class Validator(HealthServerMixin, LeaderApiMixin):
                             retry_reason = await self._run_scoring(spec, current_block)
                             if retry_reason is None:
                                 store.mark_scored(self._db, spec.id)
+                            elif retry_reason == "pending_resume":
+                                logger.info(f"{spec.id}: benchmark(s) pending-resume, retrying next tick")
                             else:
                                 attempts = store.bump_reveal_attempts(self._db, spec.id)
                                 if attempts >= store.MAX_REVEAL_ATTEMPTS:
@@ -212,7 +214,7 @@ class Validator(HealthServerMixin, LeaderApiMixin):
         'no_participants' (reveals existed but nothing survived dedup,
         precheck, or coordinator/infra failures)."""
         from validator.chain_scanner import scan_reveals
-        from validator.scorer import precheck_one, benchmark_one, dedup_winner, _skip, PrecheckPass, ScoringOutcome
+        from validator.scorer import precheck_one, benchmark_one, dedup_winner, _skip, PrecheckPass, ScoringOutcome, OutcomeKind
         from competition.benchmark_client import make_coordinator
         from competition.precheck_client import PrecheckContainer
         from competition.scoring import sort_by_self_reported, compute_emission_weights
@@ -353,6 +355,10 @@ class Validator(HealthServerMixin, LeaderApiMixin):
         ])
         all_outcomes.extend(benchmark_outcomes)
         logger.debug(f"Benchmark done: {len(benchmark_outcomes)} outcome(s)")
+
+        if any(o.kind == OutcomeKind.PENDING_RESUME for o in benchmark_outcomes):
+            logger.info(f"{spec.id}: benchmark run(s) pending-resume, scoring window still open — retrying next tick")
+            return "pending_resume"
 
         all_results = [o.result for o in all_outcomes]
         ranked = sorted(all_results, key=lambda r: r.final_score, reverse=True)

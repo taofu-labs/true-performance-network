@@ -54,8 +54,9 @@ def _stale_window(phase: Optional[str]) -> float:
 
 class OutcomeKind(Enum):
     SCORED = auto()
-    SKIPPED = auto()       # any non-lie failure → backfill
-    DISQUALIFIED = auto()  # max_memory lie → also backfill, but flagged
+    SKIPPED = auto()         # any non-lie failure → backfill
+    DISQUALIFIED = auto()    # max_memory lie → also backfill, but flagged
+    PENDING_RESUME = auto()  # stalled, window still open — not final, retry next tick
 
 
 @dataclass
@@ -318,10 +319,9 @@ async def benchmark_one(
                 store.set_benchmark_run_status(
                     conn, submission.competition_id, hotkey, bname, "pending-resume"
                 )
-            return _skip(
+            return _pending_resume(
                 hotkey, submission,
                 f"benchmark poll pending-resume, stalled: {stalled}",
-                actual_scores=actual_scores,
             )
 
         logger.warning(f"{hotkey[:12]} benchmark(s) stalled, scoring window closed: {stalled}")
@@ -401,6 +401,25 @@ def _skip(
             disqualified=False,
             disqualification_reason=reason,
             actual_scores=actual_scores or {},
+            final_score=0.0,
+            max_memory_kb=submission.max_memory,
+            lying_detected=False,
+            eval_backend="coordinator",
+        ),
+    )
+
+
+def _pending_resume(hotkey: str, submission: MinerSubmission, reason: str) -> ScoringOutcome:
+    return ScoringOutcome(
+        kind=OutcomeKind.PENDING_RESUME,
+        reason=reason,
+        result=ScoringResult(
+            hotkey=hotkey,
+            competition_id=submission.competition_id,
+            passed_floors=False,
+            disqualified=False,
+            disqualification_reason=reason,
+            actual_scores={},
             final_score=0.0,
             max_memory_kb=submission.max_memory,
             lying_detected=False,

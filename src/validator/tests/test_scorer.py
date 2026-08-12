@@ -278,7 +278,7 @@ async def test_benchmark_one_marks_pending_resume_when_window_still_open(monkeyp
         p, spec, NeverCompletingCoordinator(), conn=conn, poll_interval=0,
         current_block=15,  # 15 < scoring_end_block=20 -> window open
     )
-    assert outcome.kind == scorer.OutcomeKind.SKIPPED
+    assert outcome.kind == scorer.OutcomeKind.PENDING_RESUME
     assert "pending-resume" in outcome.reason
 
     row = conn.execute(

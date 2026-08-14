@@ -69,19 +69,10 @@ def compute_emission_weights(
     """
     Map hotkeys to emission weights based on rank.
     ranked_results must be sorted by final_score descending.
-    Non-qualifying or disqualified miners receive weight 0.
     """
     weights: Dict[str, float] = {}
-    qualifier_idx = 0
-    for result in ranked_results:
-        if not result.passed_floors or result.disqualified:
-            weights[result.hotkey] = 0.0
-            continue
-        if qualifier_idx < len(distribution):
-            weights[result.hotkey] = distribution[qualifier_idx]
-            qualifier_idx += 1
-        else:
-            weights[result.hotkey] = 0.0
+    for idx, result in enumerate(ranked_results):
+        weights[result.hotkey] = distribution[idx] if idx < len(distribution) else 0.0
     return weights
 
 

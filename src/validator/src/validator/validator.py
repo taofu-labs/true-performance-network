@@ -1,6 +1,6 @@
 import asyncio
 import time
-from typing import Dict, Optional
+from typing import Optional
 
 import bittensor as bt
 import numpy as np
@@ -40,10 +40,15 @@ class Validator(HealthServerMixin, LeaderApiMixin):
         self._last_heartbeat: float = time.time()
 
         self._db = store.init_db()
+        self._coordinator = None
 
         if self.mode == "leader":
             from competition.precheck_client import cleanup_stale_containers
-            cleanup_stale_containers()
+            in_flight = [
+                spec["id"] for spec in store.list_competitions(self._db)
+                if store.get_stage(self._db, spec["id"]) == "stage2_scoring"
+            ]
+            cleanup_stale_containers(keep_competition_ids=in_flight)
 
         if self.mode == "follower":
             from validator.leader_client import LeaderClient
@@ -67,6 +72,12 @@ class Validator(HealthServerMixin, LeaderApiMixin):
                     f"Hotkey {self.wallet.hotkey.ss58_address} not registered on subnet {common_settings.NETUID} "
                     f"(network: {common_settings.NETWORK})"
                 )
+
+    def _get_coordinator(self):
+        if self._coordinator is None:
+            from competition.benchmark_client import make_coordinator
+            self._coordinator = make_coordinator()
+        return self._coordinator
 
     def _get_active_competitions(self, current_block: int):
         """Active competitions from this validator's own source of truth.
@@ -118,38 +129,13 @@ class Validator(HealthServerMixin, LeaderApiMixin):
                         logger.debug(f"REVEALING phase — waiting for reveal grace to end at {spec.scoring_starts_at()}")
 
                     elif phase == CompetitionPhase.SCORING:
-                        # Reconcile drift left by a process kill (autoupdater
-                        # SIGKILLs roughly every 15 min, mid-scoring-window)
-                        # between a committed scoring_runs row and a
-                        # never-applied mark_scored — catch up without
-                        # re-scoring rather than leaving it stuck forever.
-                        if not store.is_scored(self._db, spec.id) and store.has_scoring_run(self._db, spec.id):
-                            logger.warning(f"{spec.id}: found committed scoring_runs row with no scored_competitions status — reconciling")
-                            store.mark_scored(self._db, spec.id)
-
-                        if not store.is_scored(self._db, spec.id):
-                            retry_reason = await self._run_scoring(spec, current_block)
-                            if retry_reason is None:
-                                store.mark_scored(self._db, spec.id)
-                            elif retry_reason == "pending_resume":
-                                logger.info(f"{spec.id}: benchmark(s) pending-resume, retrying next tick")
-                            else:
-                                attempts = store.bump_reveal_attempts(self._db, spec.id)
-                                if attempts >= store.MAX_REVEAL_ATTEMPTS:
-                                    terminal_status = (
-                                        "failed_no_reveals" if retry_reason == "no_reveals"
-                                        else "failed_no_participants"
-                                    )
-                                    logger.warning(
-                                        f"{spec.id}: giving up after {attempts} attempts ({retry_reason}) — "
-                                        f"marking scored with no result"
-                                    )
-                                    store.mark_scored(self._db, spec.id, status=terminal_status)
-                                else:
-                                    logger.info(
-                                        f"{spec.id}: retryable scoring failure ({retry_reason}), "
-                                        f"attempt {attempts}/{store.MAX_REVEAL_ATTEMPTS}"
-                                    )
+                        if store.is_scored(self._db, spec.id):
+                            continue
+                        stage = store.get_stage(self._db, spec.id)
+                        if stage == "stage1_ranking":
+                            await self.run_stage_1(spec)
+                        elif stage == "stage2_scoring":
+                            await self.run_stage_2(spec, current_block)
 
             except Exception as e:
                 logger.exception(f"Leader loop error: {e}")
@@ -178,24 +164,23 @@ class Validator(HealthServerMixin, LeaderApiMixin):
                     if phase not in (CompetitionPhase.SCORING, CompetitionPhase.DISTRIBUTING, CompetitionPhase.COMPLETE):
                         continue
 
-                    runs, scored_status = self._leader_client.get_scoring_results(spec.id)
-                    if not runs:
-                        if scored_status in ("failed_no_reveals", "failed_no_participants"):
+                    results, scored_status = self._leader_client.get_scoring_results(spec.id)
+                    if not results:
+                        if scored_status in ("failed_no_reveals", "failed_no_participants", "failed_stage1_infra"):
                             logger.warning(f"{spec.id}: leader gave up ({scored_status}) — marking scored, no weights")
                             store.mark_scored(self._db, spec.id, status=scored_status)
                         else:
                             logger.debug(f"{spec.id}: no scoring results from leader yet")
                         continue
 
-                    latest = runs[-1]
                     ranked = sorted(
-                        [ScoringResult(**r) for r in latest["results"]],
+                        [ScoringResult(**r) for r in results],
                         key=lambda r: r.final_score,
                         reverse=True,
                     )
                     hotkey_weights = compute_emission_weights(ranked, spec.emission_distribution)
 
-                    logger.info(f"{spec.id}: following leader run {latest['run_id']} — weights: "
+                    logger.info(f"{spec.id}: following leader — weights: "
                                 f"{[(k[:8], v) for k, v in hotkey_weights.items() if v > 0]}")
                     store.record_weights(self._db, spec.id, hotkey_weights)
                     store.mark_scored(self._db, spec.id)
@@ -205,43 +190,35 @@ class Validator(HealthServerMixin, LeaderApiMixin):
             finally:
                 await asyncio.sleep(validator_settings.FOLLOWER_POLL_INTERVAL)
 
-    async def _run_scoring(self, spec, current_block: int) -> Optional[str]:
-        """Returns None if scoring reached a terminal state (success) and the
-        competition should be marked scored. Returns a retry-reason string
-        for a retryable failure so the caller can retry on a later tick and,
-        after MAX_REVEAL_ATTEMPTS, pick the right terminal failure status:
-        'no_reveals' (nobody ever revealed / registered / had collateral) or
-        'no_participants' (reveals existed but nothing survived dedup,
-        precheck, or coordinator/infra failures)."""
+    async def run_stage_1(self, spec) -> None:
         from validator.chain_scanner import scan_reveals
-        from validator.scorer import precheck_one, benchmark_one, dedup_winner, _skip, PrecheckPass, ScoringOutcome, OutcomeKind
-        from competition.benchmark_client import make_coordinator
-        from competition.precheck_client import PrecheckContainer
-        from competition.scoring import sort_by_self_reported, compute_emission_weights
-        from validator import settings as validator_settings
+        from validator.scorer import dedup_winner
+        from competition.scoring import sort_by_self_reported
 
-        logger.info(f"🏆 Scoring competition {spec.id}")
+        logger.info(f"🏆 Stage 1 (reveal/rank) for {spec.id}")
 
-        all_outcomes: list[ScoringOutcome] = []
+        try:
+            reveals = scan_reveals(self.subtensor, spec, self._db)
+        except Exception as e:
+            self._bump_stage1_or_fail(spec.id, f"scan_reveals failed: {e}")
+            return
 
-        reveals = scan_reveals(self.subtensor, spec, self._db)
         logger.debug(f"scan_reveals returned {len(reveals)} reveal(s): {list(reveals.keys())}")
         if not reveals:
-            logger.warning("No valid reveals. Skipping weight update.")
-            return "no_reveals"
+            logger.warning(f"{spec.id}: no valid reveals — terminal, no reveals will ever arrive after commit window close")
+            store.mark_scored(self._db, spec.id, status="failed_no_reveals")
+            return
 
         registered = set(self.metagraph.hotkeys)
         reveals = {hk: sub for hk, sub in reveals.items() if hk in registered}
-        logger.debug(f"{len(reveals)} reveal(s) from registered hotkeys: {list(reveals.keys())}")
         if not reveals:
-            logger.warning("No reveals from registered hotkeys. Skipping weight update.")
-            return "no_reveals"
+            logger.warning(f"{spec.id}: no reveals from registered hotkeys — terminal")
+            store.mark_scored(self._db, spec.id, status="failed_no_reveals")
+            return
 
-        # Collateral skip: a hotkey below COLLATERAL_MIN_THRESHOLD is excluded
-        # from this scoring run only — not a ban, no persistent state change.
-        # `None` (runtime doesn't report collateral yet) never skips.
         collateral_by_hotkey = {n.hotkey: n.collateral_locked for n in self.metagraph.neurons}
         min_collateral = validator_settings.COLLATERAL_MIN_THRESHOLD
+        collateral_failed: dict[str, str] = {}
         if min_collateral > 0:
             def _has_collateral(hotkey: str) -> bool:
                 collateral = collateral_by_hotkey.get(hotkey)
@@ -249,21 +226,11 @@ class Validator(HealthServerMixin, LeaderApiMixin):
                     return True
                 return collateral.amount >= min_collateral
 
-            skipped = {hk for hk in reveals if not _has_collateral(hk)}
-            for hk in skipped:
-                logger.info(f"{hk[:12]} skipped — collateral below threshold ({collateral_by_hotkey[hk]} < {min_collateral})")
-            reveals = {hk: sub for hk, sub in reveals.items() if hk not in skipped}
-            if not reveals:
-                logger.warning("No reveals left after collateral skip. Skipping weight update.")
-                return "no_participants"
+            for hk in list(reveals):
+                if not _has_collateral(hk):
+                    collateral_failed[hk] = f"collateral below threshold ({collateral_by_hotkey[hk]} < {min_collateral})"
+                    logger.info(f"{hk[:12]} failed stage 1 — {collateral_failed[hk]}")
 
-        # sha256 dedup: when two reveals share the same self-reported file_sha256,
-        # only the earlier reveal_block (chain-native, unforgeable) is eligible.
-        # Filtered out here, before precheck, so a losing duplicate never costs a
-        # Docker container run. Safe to key on self-reported hash: a hotkey that
-        # falsely claims another's hash gets banned by precheck's existing
-        # sha256-mismatch check if it wins the slot, or is simply skipped if it
-        # loses — no incentive either way.
         seen_hashes: dict[str, tuple[str, int]] = {}
         dedup_losers: dict[str, tuple[str, int]] = {}
         for hotkey, (submission, block) in sorted(reveals.items(), key=lambda kv: kv[1][1]):
@@ -271,109 +238,156 @@ class Validator(HealthServerMixin, LeaderApiMixin):
             if loser is not None:
                 dedup_losers[hotkey] = loser
             else:
+                displaced = seen_hashes.get(submission.file_sha256)
+                if displaced is not None:
+                    dedup_losers[displaced[0]] = (hotkey, block)
                 seen_hashes[submission.file_sha256] = (hotkey, block)
 
-        if dedup_losers:
-            for hotkey, (winner_hotkey, winner_block) in dedup_losers.items():
-                submission, block = reveals[hotkey]
-                reason = (
-                    f"duplicate file_sha256={submission.file_sha256[:12]} — earlier reveal by "
-                    f"{winner_hotkey[:12]} at block {winner_block} (this reveal at block {block})"
-                )
-                all_outcomes.append(_skip(hotkey, submission, reason))
-                logger.info(f"SKIPPED {hotkey[:12]}: {reason} — dedup loss")
-            reveals = {hk: v for hk, v in reveals.items() if hk not in dedup_losers}
-            if not reveals:
-                logger.warning("No reveals left after dedup filtering. Retrying next tick.")
-                return "no_participants"
+        dedup_failed: dict[str, str] = {}
+        for hotkey, (winner_hotkey, winner_block) in dedup_losers.items():
+            submission, block = reveals[hotkey]
+            dedup_failed[hotkey] = (
+                f"duplicate file_sha256={submission.file_sha256[:12]} — earlier reveal by "
+                f"{winner_hotkey[:12]} at block {winner_block} (this reveal at block {block})"
+            )
+            logger.info(f"{hotkey[:12]} failed stage 1 — dedup loss")
 
-        ranked_candidates = sort_by_self_reported(
-            {hk: sub for hk, (sub, _block) in reveals.items()}, spec
-        )
-        logger.debug(f"Ranked candidates by self-reported score: {[hk[:12] for hk, _ in ranked_candidates]}")
-        coordinator = make_coordinator()
+        eligible = {
+            hk: v for hk, v in reveals.items()
+            if hk not in collateral_failed and hk not in dedup_failed
+        }
+        if not eligible:
+            logger.warning(f"{spec.id}: no reveals left after collateral/dedup filtering — terminal")
+            store.mark_scored(self._db, spec.id, status="failed_no_participants")
+            return
 
         try:
+            coordinator = self._get_coordinator()
             available = await asyncio.to_thread(coordinator.list_benchmarks)
-            logger.debug(f"Coordinator available benchmarks: {available}")
             missing = {t.name for t in spec.benchmarks} - available
             if missing:
-                logger.error(f"Coordinator missing benchmarks {missing} — aborting scoring")
-                return "no_participants"
+                self._bump_stage1_or_fail(spec.id, f"coordinator missing benchmarks {missing}")
+                return
         except Exception as e:
-            logger.error(f"Cannot reach coordinator: {e} — aborting scoring")
-            return "no_participants"
+            self._bump_stage1_or_fail(spec.id, f"cannot reach coordinator: {e}")
+            return
 
-        precheck_ctr: PrecheckContainer | None = PrecheckContainer(base_repo=spec.model_repo)
+        ranked_candidates = sort_by_self_reported({hk: sub for hk, (sub, _block) in eligible.items()}, spec)
+        logger.debug(f"Ranked candidates by self-reported score: {[hk[:12] for hk, _ in ranked_candidates]}")
+
         try:
-            await asyncio.to_thread(precheck_ctr.start)
+            for rank, (hotkey, submission) in enumerate(ranked_candidates):
+                store.insert_revealed_candidate(
+                    self._db, spec.id, hotkey, rank, submission.model_dump_json(),
+                    reveals[hotkey][1], status="standby",
+                )
+            for hotkey, reason in {**collateral_failed, **dedup_failed}.items():
+                store.insert_revealed_candidate(
+                    self._db, spec.id, hotkey, -1, reveals[hotkey][0].model_dump_json(),
+                    reveals[hotkey][1], status="failed", failure_reason=reason,
+                )
+            self._db.commit()
         except Exception as e:
-            logger.error(f"Precheck container failed to start: {e} — skipping precheck")
-            precheck_ctr = None
+            self._bump_stage1_or_fail(spec.id, f"failed to persist revealed_candidates: {e}")
+            return
 
-        # Phase 1: sequential precheck — backfill on skip OR disqualify until top_n pass
-        passed: list[PrecheckPass] = []
-        try:
-            for hotkey, submission in ranked_candidates:
-                result = await asyncio.to_thread(precheck_one, hotkey, submission, spec, precheck_ctr, self._db)
-                if isinstance(result, PrecheckPass):
-                    passed.append(result)
-                    if len(passed) == spec.top_n:
-                        break
-                else:
-                    all_outcomes.append(result)
-                    logger.info(f"{result.kind.name} {hotkey[:12]}: {result.reason} — backfilling")
-        finally:
-            if precheck_ctr:
-                try:
-                    await asyncio.to_thread(precheck_ctr.stop)
-                except Exception as e:
-                    logger.warning(f"Precheck container stop error: {e}")
+        store.set_stage(self._db, spec.id, "stage2_scoring")
+        logger.info(f"{spec.id}: stage 1 done — {len(ranked_candidates)} ranked, "
+                    f"{len(collateral_failed) + len(dedup_failed)} failed stage-1 filters")
 
-        logger.debug(f"Precheck done: {len(passed)} passed, {len(all_outcomes)} skipped/disqualified so far")
-        if not passed:
-            logger.warning("No submissions passed precheck. Retrying next tick (may be transient infra failure).")
-            return "no_participants"
+    def _bump_stage1_or_fail(self, competition_id: str, reason: str) -> None:
+        attempts = store.bump_stage1_attempts(self._db, competition_id)
+        if attempts >= store.STAGE1_MAX_ATTEMPTS:
+            logger.error(f"{competition_id}: stage 1 giving up after {attempts} attempts — {reason}")
+            store.mark_scored(self._db, competition_id, status="failed_stage1_infra")
+        else:
+            logger.warning(f"{competition_id}: stage 1 infra failure, attempt {attempts}/{store.STAGE1_MAX_ATTEMPTS} — {reason}")
 
-        # Phase 2: parallel benchmark — all passed miners run concurrently.
-        # Resume any run_ids already submitted/persisted for these hotkeys in
-        # a prior (killed) process instead of resubmitting from scratch.
-        poll_interval = validator_settings.BENCHMARK_POLL_INTERVAL
-        pending_runs = store.pending_benchmark_runs(self._db, spec.id)
-        resumable: dict[str, Dict[str, str]] = {}
-        for row in pending_runs:
-            resumable.setdefault(row["hotkey"], {})[row["benchmark_name"]] = row["coordinator_run_id"]
+    async def run_stage_2(self, spec, current_block: int) -> None:
+        from validator.scorer import precheck_one, submit_benchmarks_for_candidate, poll_open_benchmarks
+        from competition.precheck_client import PrecheckContainer, is_container_up, stop_container
+        from common.models.submission import MinerSubmission
 
-        submit_semaphore = asyncio.Semaphore(max(1, validator_settings.BENCHMARK_SUBMIT_CONCURRENCY))
-        benchmark_outcomes = await asyncio.gather(*[
-            benchmark_one(
-                p, spec, coordinator, self._db, poll_interval,
-                current_block=current_block, run_ids=resumable.get(p.hotkey),
-                submit_semaphore=submit_semaphore,
-            )
-            for p in passed
-        ])
-        all_outcomes.extend(benchmark_outcomes)
-        logger.debug(f"Benchmark done: {len(benchmark_outcomes)} outcome(s)")
-
-        if any(o.kind == OutcomeKind.PENDING_RESUME for o in benchmark_outcomes):
-            logger.info(f"{spec.id}: benchmark run(s) pending-resume, scoring window still open — retrying next tick")
-            return "pending_resume"
-
-        all_results = [o.result for o in all_outcomes]
-        ranked = sorted(all_results, key=lambda r: r.final_score, reverse=True)
-        hotkey_weights = compute_emission_weights(ranked, spec.emission_distribution)
-        logger.debug(f"Final ranking: {[(r.hotkey[:12], r.final_score) for r in ranked]}")
-        logger.debug(f"Emission weights: {hotkey_weights}")
-
-        store.record_scoring_run(
-            self._db, spec.id, current_block, all_outcomes,
-            {hk: sub for hk, (sub, _block) in reveals.items()},
+        db = self._db
+        cid = spec.id
+        done_count = store.count_candidates_by_status(db, cid, ("done",))
+        still_active = store.count_candidates_by_status(
+            db, cid, ("standby", "prechecking", "queued", "benchmarking")
         )
-        store.record_weights(self._db, spec.id, hotkey_weights)
 
-        logger.info(f"Weights computed: {[(k[:8], v) for k, v in hotkey_weights.items() if v > 0]}")
-        return None
+        if current_block >= spec.scoring_end_block or done_count >= spec.top_n or still_active == 0:
+            stop_container(cid)
+            self._finalize_stage_3(spec)
+            return
+
+        coordinator = self._get_coordinator()
+
+        try:
+            await asyncio.to_thread(poll_open_benchmarks, db, cid, spec, coordinator, current_block)
+        except Exception as e:
+            logger.warning(f"{cid}: poll_open_benchmarks error (will retry next tick): {e}")
+
+        concurrency_cap = max(1, validator_settings.SCORING_QUEUE_CONCURRENCY)
+        in_flight_benchmarking = store.count_candidates_by_status(db, cid, ("benchmarking",))
+        benchmark_slots = concurrency_cap - in_flight_benchmarking
+        if benchmark_slots > 0:
+            queued = store.candidates_by_status(db, cid, ("queued",))[:benchmark_slots]
+            for row in queued:
+                submission = MinerSubmission.model_validate_json(row["submission_json"])
+                store.set_candidate_status(db, cid, row["hotkey"], "benchmarking")
+                err = await asyncio.to_thread(
+                    submit_benchmarks_for_candidate, db, cid, row["hotkey"], submission,
+                    row["gguf_file"], spec, coordinator,
+                )
+                if err:
+                    logger.warning(f"{row['hotkey'][:12]} {err} — backfilling")
+                    store.set_candidate_status(db, cid, row["hotkey"], "failed", err)
+
+        precheck_ctr = PrecheckContainer(competition_id=cid, base_repo=spec.model_repo)
+        try:
+            await asyncio.to_thread(precheck_ctr.launch)
+        except Exception as e:
+            logger.warning(f"{cid}: precheck container launch failed (will retry next tick): {e}")
+            return
+
+        if not await asyncio.to_thread(is_container_up, cid):
+            logger.debug(f"{cid}: precheck container not ready yet, skipping precheck this tick")
+            return
+
+        in_queue = store.count_candidates_by_status(db, cid, ("benchmarking", "queued"))
+        queue_slots = (spec.top_n + concurrency_cap) - in_queue
+        if queue_slots > 0:
+            standbys = store.candidates_by_status(db, cid, ("standby",))[:queue_slots]
+            for row in standbys:
+                submission = MinerSubmission.model_validate_json(row["submission_json"])
+                store.set_candidate_status(db, cid, row["hotkey"], "prechecking")
+                result = await asyncio.to_thread(precheck_one, row["hotkey"], submission, spec, precheck_ctr, db)
+                if result.passed:
+                    store.mark_precheck_passed(db, cid, row["hotkey"], result.gguf_file, result.measured_memory_kb)
+                else:
+                    logger.info(f"{row['hotkey'][:12]} failed precheck: {result.reason} — backfilling")
+                    store.set_candidate_status(db, cid, row["hotkey"], "failed", result.reason)
+
+    def _finalize_stage_3(self, spec) -> None:
+        from competition.scoring import compute_emission_weights
+        from common.models.submission import ScoringResult
+
+        cid = spec.id
+        results = store.scoring_results_for_competition(self._db, cid)
+        ranked = sorted(
+            (ScoringResult(hotkey=r["hotkey"], competition_id=cid,
+                           final_score=r["final_score"], max_memory_kb=r["max_memory_kb"])
+             for r in results),
+            key=lambda r: r.final_score, reverse=True,
+        )
+
+        hotkey_weights = compute_emission_weights(ranked, spec.emission_distribution)
+        logger.debug(f"{cid}: final ranking: {[(r.hotkey[:12], r.final_score) for r in ranked]}")
+        logger.debug(f"{cid}: emission weights: {hotkey_weights}")
+
+        store.record_weights(self._db, cid, hotkey_weights)
+        store.mark_scored(self._db, cid, status="scored")
+        logger.info(f"{cid}: weights computed: {[(k[:8], v) for k, v in hotkey_weights.items() if v > 0]}")
 
     async def _compute_and_set_aggregate_weights(self, current_block: int) -> bool:
         """

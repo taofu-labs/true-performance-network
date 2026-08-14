@@ -77,10 +77,13 @@ class LeaderApiMixin:
         competition_id = request.query.get("competition_id")
         if not competition_id:
             return web.json_response({"error": "competition_id is required"}, status=400)
-        since_run_id = int(request.query.get("since_run_id", 0))
-        runs = store.scoring_results_since(self._db, competition_id, since_run_id)
+        results = (
+            store.scoring_results_for_competition(self._db, competition_id)
+            if store.get_stage(self._db, competition_id) == "finalized"
+            else []
+        )
         return web.json_response({
-            "runs": runs,
+            "results": results,
             "scored_status": store.scored_status(self._db, competition_id),
         })
 

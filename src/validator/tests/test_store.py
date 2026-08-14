@@ -35,6 +35,37 @@ def test_is_scored_and_mark_scored(tmp_path):
     assert store.is_scored(conn, "comp1") is True
 
 
+def test_mark_scored_sets_matching_terminal_stage(tmp_path):
+    conn = make_conn(tmp_path)
+    store.mark_scored(conn, "comp1", status="failed_no_reveals")
+    assert store.scored_status(conn, "comp1") == "failed_no_reveals"
+    assert store.get_stage(conn, "comp1") == "failed_no_reveals"
+
+    store.mark_scored(conn, "comp2", status="scored")
+    assert store.get_stage(conn, "comp2") == "finalized"
+
+
+def test_get_stage_defaults_to_stage1_for_unseen_competition(tmp_path):
+    conn = make_conn(tmp_path)
+    assert store.get_stage(conn, "never-seen") == "stage1_ranking"
+
+
+def test_set_stage(tmp_path):
+    conn = make_conn(tmp_path)
+    store.set_stage(conn, "comp1", "stage2_scoring")
+    assert store.get_stage(conn, "comp1") == "stage2_scoring"
+    store.set_stage(conn, "comp1", "finalized")
+    assert store.get_stage(conn, "comp1") == "finalized"
+
+
+def test_bump_stage1_attempts_increments_and_caps(tmp_path):
+    conn = make_conn(tmp_path)
+    assert store.bump_stage1_attempts(conn, "comp1") == 1
+    assert store.bump_stage1_attempts(conn, "comp1") == 2
+    assert store.bump_stage1_attempts(conn, "comp1") == 3
+    assert store.STAGE1_MAX_ATTEMPTS == 3
+
+
 def test_ban_and_is_banned(tmp_path):
     conn = make_conn(tmp_path)
     assert store.is_banned(conn, "hk1") is False
@@ -61,40 +92,6 @@ def test_record_and_get_latest_weights(tmp_path):
 
     history = store.weights_history_for_competition(conn, "comp1")
     assert len(history) == 2
-
-
-def test_record_scoring_run_and_scoring_results_since(tmp_path):
-    from validator.scorer import OutcomeKind, ScoringOutcome
-    from common.models.submission import MinerSubmission, ScoringResult, Claim
-
-    conn = make_conn(tmp_path)
-    submission = MinerSubmission(
-        competition_id="comp1",
-        claims=[Claim(b="mmlu", s=0.7)],
-        repository="user/repo",
-        file="model.gguf",
-        file_sha256="a" * 64,
-        max_memory=1000,
-        huggingface_revision="a" * 40,
-    )
-    outcome = ScoringOutcome(
-        kind=OutcomeKind.SCORED,
-        result=ScoringResult(
-            hotkey="hk1", competition_id="comp1", passed_floors=True, disqualified=False,
-            actual_scores={"mmlu": 0.7}, final_score=0.7, max_memory_kb=1000,
-            lying_detected=False, eval_backend="coordinator",
-        ),
-    )
-
-    run_id = store.record_scoring_run(conn, "comp1", block=100, outcomes=[outcome], reveals={"hk1": submission})
-    assert run_id == 1
-
-    runs = store.scoring_results_since(conn, "comp1")
-    assert len(runs) == 1
-    assert runs[0]["results"][0]["hotkey"] == "hk1"
-    assert runs[0]["results"][0]["final_score"] == 0.7
-
-    assert store.scoring_results_since(conn, "comp1", after_run_id=run_id) == []
 
 
 def test_upsert_and_get_competition(tmp_path):
@@ -127,51 +124,177 @@ def test_list_competitions(tmp_path):
     assert ids == ["comp1", "comp2"]
 
 
-def test_upsert_benchmark_run_and_pending_benchmark_runs(tmp_path):
+# ---------------------------------------------------------------------------
+# revealed_candidates (stage 1 output / stage 2 queue)
+# ---------------------------------------------------------------------------
+
+def test_insert_and_get_candidate(tmp_path):
     conn = make_conn(tmp_path)
-    assert store.pending_benchmark_runs(conn, "comp1") == []
+    store.insert_revealed_candidate(conn, "comp1", "hk1", rank=0, submission_json="{}", reveal_block=10, status="standby")
+    conn.commit()
 
-    store.upsert_benchmark_run(conn, "comp1", "hk1", "mmlu", "user/repo", "a" * 40, "run-1")
-    pending = store.pending_benchmark_runs(conn, "comp1")
-    assert len(pending) == 1
-    assert pending[0]["coordinator_run_id"] == "run-1"
-    assert pending[0]["status"] == "submitted"
+    candidate = store.get_candidate(conn, "comp1", "hk1")
+    assert candidate["status"] == "standby"
+    assert candidate["rank"] == 0
+    assert candidate["gguf_file"] is None
+    assert candidate["measured_memory_kb"] is None
 
 
-def test_upsert_benchmark_run_is_idempotent_on_conflict(tmp_path):
+def test_set_candidate_status(tmp_path):
     conn = make_conn(tmp_path)
-    store.upsert_benchmark_run(conn, "comp1", "hk1", "mmlu", "user/repo", "a" * 40, "run-1")
-    store.upsert_benchmark_run(conn, "comp1", "hk1", "mmlu", "user/repo", "a" * 40, "run-1-retry")
+    store.insert_revealed_candidate(conn, "comp1", "hk1", rank=0, submission_json="{}", reveal_block=10, status="standby")
+    conn.commit()
 
-    pending = store.pending_benchmark_runs(conn, "comp1")
-    assert len(pending) == 1
-    assert pending[0]["coordinator_run_id"] == "run-1-retry"
+    store.set_candidate_status(conn, "comp1", "hk1", "failed", "provenance fail")
+    candidate = store.get_candidate(conn, "comp1", "hk1")
+    assert candidate["status"] == "failed"
+    assert candidate["failure_reason"] == "provenance fail"
 
 
-def test_set_benchmark_run_status_excludes_from_pending(tmp_path):
+def test_mark_precheck_passed_sets_queued_and_precheck_fields(tmp_path):
     conn = make_conn(tmp_path)
-    store.upsert_benchmark_run(conn, "comp1", "hk1", "mmlu", "user/repo", "a" * 40, "run-1")
-    store.set_benchmark_run_status(conn, "comp1", "hk1", "mmlu", "completed")
-    assert store.pending_benchmark_runs(conn, "comp1") == []
+    store.insert_revealed_candidate(conn, "comp1", "hk1", rank=0, submission_json="{}", reveal_block=10, status="standby")
+    conn.commit()
+
+    store.mark_precheck_passed(conn, "comp1", "hk1", gguf_file="model.gguf", measured_memory_kb=1234)
+    candidate = store.get_candidate(conn, "comp1", "hk1")
+    assert candidate["status"] == "queued"
+    assert candidate["gguf_file"] == "model.gguf"
+    assert candidate["measured_memory_kb"] == 1234
 
 
-def test_pending_benchmark_runs_includes_pending_resume(tmp_path):
+def test_candidates_by_status_filters_and_orders_by_rank(tmp_path):
     conn = make_conn(tmp_path)
-    store.upsert_benchmark_run(conn, "comp1", "hk1", "mmlu", "user/repo", "a" * 40, "run-1", status="pending-resume")
-    pending = store.pending_benchmark_runs(conn, "comp1")
-    assert len(pending) == 1
-    assert pending[0]["status"] == "pending-resume"
+    store.insert_revealed_candidate(conn, "comp1", "hk2", rank=1, submission_json="{}", reveal_block=10, status="standby")
+    store.insert_revealed_candidate(conn, "comp1", "hk1", rank=0, submission_json="{}", reveal_block=10, status="standby")
+    store.insert_revealed_candidate(conn, "comp1", "hk3", rank=2, submission_json="{}", reveal_block=10, status="failed", failure_reason="x")
+    conn.commit()
+
+    standby = store.candidates_by_status(conn, "comp1", ("standby",))
+    assert [c["hotkey"] for c in standby] == ["hk1", "hk2"]
 
 
-def test_has_scoring_run(tmp_path):
+def test_count_candidates_by_status(tmp_path):
     conn = make_conn(tmp_path)
-    assert store.has_scoring_run(conn, "comp1") is False
+    store.insert_revealed_candidate(conn, "comp1", "hk1", rank=0, submission_json="{}", reveal_block=10, status="standby")
+    store.insert_revealed_candidate(conn, "comp1", "hk2", rank=1, submission_json="{}", reveal_block=10, status="standby")
+    conn.commit()
 
-    store.record_scoring_run(conn, "comp1", block=100, outcomes=[], reveals={})
-    assert store.has_scoring_run(conn, "comp1") is True
+    assert store.count_candidates_by_status(conn, "comp1", ("standby",)) == 2
+    assert store.count_candidates_by_status(conn, "comp1", ("done",)) == 0
 
 
-def test_mark_scored_failed_no_participants_status(tmp_path):
+def test_all_candidates_for_competition_ordered_by_rank(tmp_path):
     conn = make_conn(tmp_path)
-    store.mark_scored(conn, "comp1", status="failed_no_participants")
-    assert store.scored_status(conn, "comp1") == "failed_no_participants"
+    store.insert_revealed_candidate(conn, "comp1", "hk2", rank=1, submission_json="{}", reveal_block=10, status="standby")
+    store.insert_revealed_candidate(conn, "comp1", "hk1", rank=0, submission_json="{}", reveal_block=10, status="standby")
+    conn.commit()
+
+    all_candidates = store.all_candidates_for_competition(conn, "comp1")
+    assert [c["hotkey"] for c in all_candidates] == ["hk1", "hk2"]
+
+
+# ---------------------------------------------------------------------------
+# benchmark_results (stage 2 benchmark persistence)
+# ---------------------------------------------------------------------------
+
+def test_insert_and_open_benchmark_results(tmp_path):
+    conn = make_conn(tmp_path)
+    assert store.open_benchmark_results(conn, "comp1") == []
+
+    store.insert_benchmark_result(conn, "comp1", "hk1", "mmlu", "user/repo", "a" * 40, "run-1")
+    conn.commit()
+
+    open_rows = store.open_benchmark_results(conn, "comp1")
+    assert len(open_rows) == 1
+    assert open_rows[0]["coordinator_run_id"] == "run-1"
+    assert open_rows[0]["status"] == "submitted"
+    assert open_rows[0]["score"] is None
+
+
+def test_insert_benchmark_result_is_idempotent_on_conflict(tmp_path):
+    conn = make_conn(tmp_path)
+    store.insert_benchmark_result(conn, "comp1", "hk1", "mmlu", "user/repo", "a" * 40, "run-1")
+    store.insert_benchmark_result(conn, "comp1", "hk1", "mmlu", "user/repo", "a" * 40, "run-1-retry")
+    conn.commit()
+
+    open_rows = store.open_benchmark_results(conn, "comp1")
+    assert len(open_rows) == 1
+    assert open_rows[0]["coordinator_run_id"] == "run-1-retry"
+
+
+def test_update_benchmark_result_persists_score_on_completion(tmp_path):
+    """The C19 fix: a completed benchmark's score is persisted, not just its status."""
+    conn = make_conn(tmp_path)
+    store.insert_benchmark_result(conn, "comp1", "hk1", "mmlu", "user/repo", "a" * 40, "run-1")
+    conn.commit()
+
+    store.update_benchmark_result(conn, "comp1", "hk1", "mmlu", "completed", score=0.85)
+    conn.commit()
+
+    rows = store.benchmark_results_for_hotkey(conn, "comp1", "hk1")
+    assert rows[0]["status"] == "completed"
+    assert rows[0]["score"] == 0.85
+    assert store.open_benchmark_results(conn, "comp1") == []  # no longer open
+
+
+def test_update_benchmark_result_without_score_preserves_existing_score(tmp_path):
+    conn = make_conn(tmp_path)
+    store.insert_benchmark_result(conn, "comp1", "hk1", "mmlu", "user/repo", "a" * 40, "run-1")
+    conn.commit()
+    store.update_benchmark_result(conn, "comp1", "hk1", "mmlu", "completed", score=0.5)
+    conn.commit()
+
+    # a later progress-only update (no score passed) must not clobber it
+    store.update_benchmark_result(conn, "comp1", "hk1", "mmlu", "completed", phase="done")
+    conn.commit()
+
+    rows = store.benchmark_results_for_hotkey(conn, "comp1", "hk1")
+    assert rows[0]["score"] == 0.5
+
+
+def test_open_benchmark_results_includes_pending_resume(tmp_path):
+    conn = make_conn(tmp_path)
+    store.insert_benchmark_result(conn, "comp1", "hk1", "mmlu", "user/repo", "a" * 40, "run-1", status="pending-resume")
+    conn.commit()
+
+    open_rows = store.open_benchmark_results(conn, "comp1")
+    assert len(open_rows) == 1
+    assert open_rows[0]["status"] == "pending-resume"
+
+
+def test_open_benchmark_results_excludes_completed_and_failed(tmp_path):
+    conn = make_conn(tmp_path)
+    store.insert_benchmark_result(conn, "comp1", "hk1", "mmlu", "user/repo", "a" * 40, "run-1")
+    store.insert_benchmark_result(conn, "comp1", "hk2", "mmlu", "user/repo", "a" * 40, "run-2")
+    conn.commit()
+    store.update_benchmark_result(conn, "comp1", "hk1", "mmlu", "completed", score=0.5)
+    store.update_benchmark_result(conn, "comp1", "hk2", "mmlu", "failed")
+    conn.commit()
+
+    assert store.open_benchmark_results(conn, "comp1") == []
+
+
+# ---------------------------------------------------------------------------
+# scoring_results (stage 3 finalized happy-path results)
+# ---------------------------------------------------------------------------
+
+def test_record_and_read_scoring_results(tmp_path):
+    conn = make_conn(tmp_path)
+    store.record_scoring_result(conn, "comp1", "hk1", final_score=0.9, max_memory_kb=1000)
+    store.record_scoring_result(conn, "comp1", "hk2", final_score=0.5, max_memory_kb=2000)
+    conn.commit()
+
+    results = store.scoring_results_for_competition(conn, "comp1")
+    assert [r["hotkey"] for r in results] == ["hk1", "hk2"]  # ordered by final_score DESC
+
+
+def test_record_scoring_result_is_idempotent_on_conflict(tmp_path):
+    conn = make_conn(tmp_path)
+    store.record_scoring_result(conn, "comp1", "hk1", final_score=0.5, max_memory_kb=1000)
+    store.record_scoring_result(conn, "comp1", "hk1", final_score=0.9, max_memory_kb=1000)
+    conn.commit()
+
+    results = store.scoring_results_for_competition(conn, "comp1")
+    assert len(results) == 1
+    assert results[0]["final_score"] == 0.9

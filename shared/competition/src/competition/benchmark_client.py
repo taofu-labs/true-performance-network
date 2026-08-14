@@ -211,18 +211,12 @@ class HttpCoordinator:
             "Content-Type": "application/json",
         })
         self._timeout = timeout
-        self._benchmark_cache: Optional[set] = None
-        self._completed_cache: Dict[str, Dict[str, float]] = {}
-        self._run_benchmark: Dict[str, str] = {}
 
     def list_benchmarks(self) -> set:
-        if self._benchmark_cache is not None:
-            return self._benchmark_cache
         resp = self._session.get(f"{self._base}/benchmarks", timeout=self._timeout)
         resp.raise_for_status()
         data = resp.json()
-        self._benchmark_cache = {b["benchmark"] for b in data.get("benchmarks", [])}
-        return self._benchmark_cache
+        return {b["benchmark"] for b in data.get("benchmarks", [])}
 
     @coordinator_retry
     def submit(
@@ -249,30 +243,18 @@ class HttpCoordinator:
         data = resp.json()
 
         run_id = data["run_id"]
-        self._run_benchmark[run_id] = benchmark
-
-        # Coordinator may return a cached/completed result immediately
-        if data.get("cached") and data.get("result"):
-            logger.info(f"[http] cached result for {repo}@{revision[:8]} benchmark={benchmark}")
-            self._completed_cache[run_id] = _extract_scores(data["result"], benchmark)
 
         logger.debug(f"[http] submitted {benchmark} for {repo}@{revision[:8]} -> {run_id}")
         return run_id
 
     @coordinator_retry
     def poll(self, run_id: str) -> RunStatus:
-        if run_id in self._completed_cache:
-            return RunStatus(run_id=run_id, status=RunStatusCode.COMPLETED, scores=self._completed_cache[run_id])
         resp = self._session.get(f"{self._base}/status/{run_id}", timeout=self._timeout)
         resp.raise_for_status()
         data = resp.json()
 
         raw_status = data.get("status", "")
-        # Coordinator's status response is the source of truth for which
-        # benchmark a run_id belongs to — falls back to the in-memory cache
-        # (populated by submit() in this process) for older coordinators that
-        # don't echo `benchmark` back, or as a fast path.
-        benchmark = data.get("benchmark") or self._run_benchmark.get(run_id)
+        benchmark = data.get("benchmark")
         progress = data.get("progress") or {}
         progress_fields = dict(
             phase=data.get("phase"),
@@ -419,7 +401,6 @@ if __name__ == "__main__":
             return self._payload
 
     http = HttpCoordinator(base_url="http://example.invalid", api_key="k")
-    http._run_benchmark["run-cache-hit"] = "gsm8k"
     http._session.get = lambda *a, **k: _FakeResp({"status": "cache_hit", "result": {"gsm8k": 0.9}})
     cache_hit_status = http.poll("run-cache-hit")
     assert cache_hit_status.status == RunStatusCode.COMPLETED, f"cache_hit not treated as completed: {cache_hit_status}"

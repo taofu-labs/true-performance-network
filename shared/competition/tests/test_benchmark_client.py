@@ -87,7 +87,6 @@ class _FakeResp:
 
 def test_http_coordinator_poll_cache_hit_is_completed():
     http = HttpCoordinator(base_url="http://example.invalid", api_key="k")
-    http._run_benchmark["run1"] = "gsm8k"
     http._session.get = lambda *a, **k: _FakeResp({"status": "cache_hit", "result": {"gsm8k": 0.9}})
     status = http.poll("run1")
     assert status.status == RunStatusCode.COMPLETED
@@ -128,13 +127,8 @@ def test_http_coordinator_poll_in_progress_carries_phase_and_progress():
     assert status.estimated_seconds_remaining == 1200
 
 
-def test_http_coordinator_poll_resumed_run_attributes_score_via_response_benchmark_field():
-    """A run resumed after a validator restart never called submit() in this
-    process, so self._run_benchmark is empty for it — the coordinator's own
-    `benchmark` field in the /status response must still let the score be
-    attributed correctly instead of being silently dropped."""
+def test_http_coordinator_poll_attributes_score_via_response_benchmark_field():
     http = HttpCoordinator(base_url="http://example.invalid", api_key="k")
-    assert "run1" not in http._run_benchmark  # simulates a fresh process, no prior submit()
     http._session.get = lambda *a, **k: _FakeResp({
         "status": "completed",
         "benchmark": "gsm8k",
@@ -200,7 +194,6 @@ def test_http_coordinator_submit_does_not_retry_terminal_4xx(monkeypatch):
 
 def test_http_coordinator_poll_retries_503_then_succeeds(monkeypatch):
     http = HttpCoordinator(base_url="http://example.invalid", api_key="k")
-    http._run_benchmark["run1"] = "mmlu"
     monkeypatch.setattr("competition.benchmark_client.SUBMIT_RETRY_BASE_DELAY", 0.0)
     monkeypatch.setattr("time.sleep", lambda s: None)
 

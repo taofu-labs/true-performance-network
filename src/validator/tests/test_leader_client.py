@@ -9,14 +9,14 @@ def test_requires_base_url():
         LeaderClient("")
 
 
-def test_get_scoring_results_returns_runs_and_status(monkeypatch):
+def test_get_scoring_results_returns_results_and_status(monkeypatch):
     client = LeaderClient("http://leader.local:9200")
 
     class _Resp:
         def raise_for_status(self):
             pass
         def json(self):
-            return {"runs": [{"run_id": 1, "competition_id": "comp1", "results": []}], "scored_status": "scored"}
+            return {"results": [{"hotkey": "hk1", "competition_id": "comp1", "final_score": 0.7, "max_memory_kb": 1000}], "scored_status": "scored"}
 
     captured = {}
     def fake_get(url, params, timeout):
@@ -25,14 +25,14 @@ def test_get_scoring_results_returns_runs_and_status(monkeypatch):
         return _Resp()
     monkeypatch.setattr(requests, "get", fake_get)
 
-    runs, scored_status = client.get_scoring_results("comp1", since_run_id=5)
-    assert runs == [{"run_id": 1, "competition_id": "comp1", "results": []}]
+    results, scored_status = client.get_scoring_results("comp1")
+    assert results == [{"hotkey": "hk1", "competition_id": "comp1", "final_score": 0.7, "max_memory_kb": 1000}]
     assert scored_status == "scored"
     assert captured["url"] == "http://leader.local:9200/v1/follower/scoring-results"
-    assert captured["params"] == {"competition_id": "comp1", "since_run_id": 5}
+    assert captured["params"] == {"competition_id": "comp1"}
 
 
-def test_get_scoring_results_empty_when_no_runs_key(monkeypatch):
+def test_get_scoring_results_empty_when_no_results_key(monkeypatch):
     client = LeaderClient("http://leader.local:9200")
 
     class _Resp:

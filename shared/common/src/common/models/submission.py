@@ -60,14 +60,8 @@ class MinerSubmission(BaseModel):
 class ScoringResult(BaseModel):
     hotkey: str
     competition_id: str
-    passed_floors: bool
-    disqualified: bool
-    disqualification_reason: Optional[str] = None
-    actual_scores: Dict[str, float]
     final_score: float
     max_memory_kb: int
-    lying_detected: bool
-    eval_backend: str = "stub"
 
 
 # ── Commit/reveal helpers ─────────────────────────────────────────────────────

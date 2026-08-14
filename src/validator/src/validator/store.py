@@ -3,13 +3,6 @@ SQLite-backed persistent storage for validator state.
 
 All data stored in ~/.tpn/validator-storage/validator.db (POSIX) or
 %APPDATA%/tpn/validator-storage/validator.db (Windows).
-
-Leader-only tables (scoring_runs, scoring_results, reveals, precheck_outcomes)
-record the full history of every scoring run — permanent, append-only.
-Both leader and follower use scored_competitions/banned_hotkeys/weights_history.
-
-WAL mode lets the read API (leader.api) and the scoring loop read/write the
-same file concurrently from one process without lock contention.
 """
 from __future__ import annotations
 
@@ -18,12 +11,7 @@ import os
 import sqlite3
 import time
 from pathlib import Path
-from typing import TYPE_CHECKING, Dict, List, Optional
-
-if TYPE_CHECKING:
-    from common.models.submission import MinerSubmission
-    from common.models.competition import CompetitionSpec
-    from validator.scorer import ScoringOutcome
+from typing import Dict, List, Optional
 
 
 def tpn_home() -> Path:
@@ -52,38 +40,52 @@ def clear_validator_db() -> None:
 
 
 _SCHEMA = """
-CREATE TABLE IF NOT EXISTS scoring_runs (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
+CREATE TABLE IF NOT EXISTS scored_competitions (
+    competition_id TEXT PRIMARY KEY,
+    stage TEXT NOT NULL DEFAULT 'stage1_ranking',
+    stage1_attempts INTEGER NOT NULL DEFAULT 0,
+    scored_at REAL,
+    status TEXT NOT NULL DEFAULT 'scoring'
+);
+
+CREATE TABLE IF NOT EXISTS revealed_candidates (
     competition_id TEXT NOT NULL,
-    scored_at REAL NOT NULL,
-    block INTEGER NOT NULL
+    hotkey TEXT NOT NULL,
+    rank INTEGER NOT NULL,
+    submission_json TEXT NOT NULL,
+    reveal_block INTEGER NOT NULL,
+    status TEXT NOT NULL,
+    failure_reason TEXT,
+    gguf_file TEXT,
+    measured_memory_kb INTEGER,
+    updated_at REAL NOT NULL,
+    PRIMARY KEY (competition_id, hotkey)
+);
+
+CREATE TABLE IF NOT EXISTS benchmark_results (
+    competition_id TEXT NOT NULL,
+    hotkey TEXT NOT NULL,
+    benchmark_name TEXT NOT NULL,
+    score REAL,
+    coordinator_run_id TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'submitted',
+    repository TEXT NOT NULL,
+    revision TEXT NOT NULL,
+    submitted_at REAL NOT NULL,
+    updated_at REAL NOT NULL,
+    phase TEXT,
+    percent_complete REAL,
+    last_message TEXT,
+    PRIMARY KEY (competition_id, hotkey, benchmark_name)
 );
 
 CREATE TABLE IF NOT EXISTS scoring_results (
-    run_id INTEGER NOT NULL REFERENCES scoring_runs(id),
     competition_id TEXT NOT NULL,
     hotkey TEXT NOT NULL,
-    passed_floors INTEGER NOT NULL,
-    disqualified INTEGER NOT NULL,
-    disqualification_reason TEXT,
-    actual_scores TEXT NOT NULL,
     final_score REAL NOT NULL,
     max_memory_kb INTEGER NOT NULL,
-    lying_detected INTEGER NOT NULL,
-    eval_backend TEXT NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS reveals (
-    run_id INTEGER NOT NULL REFERENCES scoring_runs(id),
-    hotkey TEXT NOT NULL,
-    submission_json TEXT NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS precheck_outcomes (
-    run_id INTEGER NOT NULL REFERENCES scoring_runs(id),
-    hotkey TEXT NOT NULL,
-    kind TEXT NOT NULL,
-    reason TEXT NOT NULL
+    finalized_at REAL NOT NULL,
+    PRIMARY KEY (competition_id, hotkey)
 );
 
 CREATE TABLE IF NOT EXISTS weights_history (
@@ -91,13 +93,6 @@ CREATE TABLE IF NOT EXISTS weights_history (
     competition_id TEXT NOT NULL,
     set_at REAL NOT NULL,
     weights_json TEXT NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS scored_competitions (
-    competition_id TEXT PRIMARY KEY,
-    scored_at REAL NOT NULL,
-    reveal_attempts INTEGER NOT NULL DEFAULT 0,
-    status TEXT NOT NULL DEFAULT 'scored'
 );
 
 CREATE TABLE IF NOT EXISTS benchmark_runs (
@@ -129,10 +124,11 @@ CREATE TABLE IF NOT EXISTS competitions (
     updated_at REAL NOT NULL
 );
 
-CREATE INDEX IF NOT EXISTS idx_scoring_runs_competition ON scoring_runs(competition_id);
-CREATE INDEX IF NOT EXISTS idx_scoring_results_run ON scoring_results(run_id);
-CREATE INDEX IF NOT EXISTS idx_reveals_run ON reveals(run_id);
-CREATE INDEX IF NOT EXISTS idx_precheck_outcomes_run ON precheck_outcomes(run_id);
+CREATE INDEX IF NOT EXISTS idx_revealed_candidates_competition ON revealed_candidates(competition_id);
+CREATE INDEX IF NOT EXISTS idx_revealed_candidates_status ON revealed_candidates(competition_id, status);
+CREATE INDEX IF NOT EXISTS idx_benchmark_results_competition ON benchmark_results(competition_id);
+CREATE INDEX IF NOT EXISTS idx_benchmark_results_status ON benchmark_results(competition_id, status);
+CREATE INDEX IF NOT EXISTS idx_scoring_results_competition ON scoring_results(competition_id);
 """
 
 
@@ -157,69 +153,254 @@ def init_db(path: Optional[Path] = None) -> sqlite3.Connection:
     conn.execute("PRAGMA journal_mode=WAL")
     conn.executescript(_SCHEMA)
     conn.commit()
-    _migrate_benchmark_runs_progress_columns(conn)
+    _migrate_scored_competitions_stage_columns(conn)
     _connections[key] = conn
     return conn
 
 
-def _migrate_benchmark_runs_progress_columns(conn: sqlite3.Connection) -> None:
-    """Add phase/percent_complete/last_message to benchmark_runs if missing.
-
-    CREATE TABLE IF NOT EXISTS only covers brand-new DBs — existing deployed
-    DBs need these added via ALTER TABLE. No-op once already applied.
-    """
-    existing = {row["name"] for row in conn.execute("PRAGMA table_info(benchmark_runs)")}
-    for column, ddl_type in (("phase", "TEXT"), ("percent_complete", "REAL"), ("last_message", "TEXT")):
-        if column not in existing:
-            conn.execute(f"ALTER TABLE benchmark_runs ADD COLUMN {column} {ddl_type}")
+def _migrate_scored_competitions_stage_columns(conn: sqlite3.Connection) -> None:
+    existing = {row["name"] for row in conn.execute("PRAGMA table_info(scored_competitions)")}
+    if "stage" not in existing:
+        conn.execute("ALTER TABLE scored_competitions ADD COLUMN stage TEXT NOT NULL DEFAULT 'finalized'")
+    if "stage1_attempts" not in existing:
+        conn.execute("ALTER TABLE scored_competitions ADD COLUMN stage1_attempts INTEGER NOT NULL DEFAULT 0")
     conn.commit()
 
 
-# ---------------------------------------------------------------------------
-# Leader-only writes
-# ---------------------------------------------------------------------------
+STAGE1_MAX_ATTEMPTS = 3
 
-def record_scoring_run(
+
+def get_stage(conn: sqlite3.Connection, competition_id: str) -> str:
+    row = conn.execute(
+        "SELECT stage FROM scored_competitions WHERE competition_id = ?", (competition_id,)
+    ).fetchone()
+    return row["stage"] if row else "stage1_ranking"
+
+
+def bump_stage1_attempts(conn: sqlite3.Connection, competition_id: str) -> int:
+    conn.execute(
+        "INSERT INTO scored_competitions (competition_id, stage, stage1_attempts) "
+        "VALUES (?, 'stage1_ranking', 1) "
+        "ON CONFLICT(competition_id) DO UPDATE SET stage1_attempts = stage1_attempts + 1",
+        (competition_id,),
+    )
+    conn.commit()
+    row = conn.execute(
+        "SELECT stage1_attempts FROM scored_competitions WHERE competition_id = ?", (competition_id,)
+    ).fetchone()
+    return row["stage1_attempts"]
+
+
+def set_stage(conn: sqlite3.Connection, competition_id: str, stage: str) -> None:
+    conn.execute(
+        "INSERT INTO scored_competitions (competition_id, stage) VALUES (?, ?) "
+        "ON CONFLICT(competition_id) DO UPDATE SET stage = excluded.stage",
+        (competition_id, stage),
+    )
+    conn.commit()
+
+
+def mark_scored(conn: sqlite3.Connection, competition_id: str, status: str = "scored") -> None:
+    stage = "finalized" if status == "scored" else status
+    conn.execute(
+        "INSERT INTO scored_competitions (competition_id, scored_at, status, stage) "
+        "VALUES (?, ?, ?, ?) "
+        "ON CONFLICT(competition_id) DO UPDATE SET scored_at = excluded.scored_at, "
+        "status = excluded.status, stage = excluded.stage",
+        (competition_id, time.time(), status, stage),
+    )
+    conn.commit()
+
+
+def is_scored(conn: sqlite3.Connection, competition_id: str) -> bool:
+    row = conn.execute(
+        "SELECT scored_at FROM scored_competitions WHERE competition_id = ?", (competition_id,)
+    ).fetchone()
+    return row is not None and row["scored_at"] is not None and row["scored_at"] > 0
+
+
+def scored_status(conn: sqlite3.Connection, competition_id: str) -> Optional[str]:
+    row = conn.execute(
+        "SELECT status FROM scored_competitions WHERE competition_id = ?", (competition_id,)
+    ).fetchone()
+    return row["status"] if row else None
+
+
+
+def insert_revealed_candidate(
     conn: sqlite3.Connection,
     competition_id: str,
-    block: int,
-    outcomes: List["ScoringOutcome"],
-    reveals: Dict[str, "MinerSubmission"],
-) -> int:
-    """Persist one full scoring run: results, precheck outcomes, raw reveals. Returns run_id."""
-    now = time.time()
-    cur = conn.execute(
-        "INSERT INTO scoring_runs (competition_id, scored_at, block) VALUES (?, ?, ?)",
-        (competition_id, now, block),
+    hotkey: str,
+    rank: int,
+    submission_json: str,
+    reveal_block: int,
+    status: str,
+    failure_reason: Optional[str] = None,
+) -> None:
+    conn.execute(
+        """INSERT INTO revealed_candidates
+           (competition_id, hotkey, rank, submission_json, reveal_block, status, failure_reason, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+        (competition_id, hotkey, rank, submission_json, reveal_block, status, failure_reason, time.time()),
     )
-    run_id = cur.lastrowid
 
-    for outcome in outcomes:
-        r = outcome.result
-        conn.execute(
-            """INSERT INTO scoring_results
-               (run_id, competition_id, hotkey, passed_floors, disqualified, disqualification_reason,
-                actual_scores, final_score, max_memory_kb, lying_detected, eval_backend)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (
-                run_id, competition_id, r.hotkey, int(r.passed_floors), int(r.disqualified),
-                r.disqualification_reason, json.dumps(r.actual_scores), r.final_score,
-                r.max_memory_kb, int(r.lying_detected), r.eval_backend,
-            ),
-        )
-        conn.execute(
-            "INSERT INTO precheck_outcomes (run_id, hotkey, kind, reason) VALUES (?, ?, ?, ?)",
-            (run_id, r.hotkey, outcome.kind.name, outcome.reason),
-        )
 
-    for hotkey, submission in reveals.items():
-        conn.execute(
-            "INSERT INTO reveals (run_id, hotkey, submission_json) VALUES (?, ?, ?)",
-            (run_id, hotkey, submission.model_dump_json()),
-        )
-
+def set_candidate_status(
+    conn: sqlite3.Connection,
+    competition_id: str,
+    hotkey: str,
+    status: str,
+    failure_reason: Optional[str] = None,
+) -> None:
+    conn.execute(
+        """UPDATE revealed_candidates SET status = ?, failure_reason = ?, updated_at = ?
+           WHERE competition_id = ? AND hotkey = ?""",
+        (status, failure_reason, time.time(), competition_id, hotkey),
+    )
     conn.commit()
-    return run_id
+
+
+def mark_precheck_passed(
+    conn: sqlite3.Connection,
+    competition_id: str,
+    hotkey: str,
+    gguf_file: str,
+    measured_memory_kb: int,
+) -> None:
+    conn.execute(
+        """UPDATE revealed_candidates
+           SET status = 'queued', gguf_file = ?, measured_memory_kb = ?, updated_at = ?
+           WHERE competition_id = ? AND hotkey = ?""",
+        (gguf_file, measured_memory_kb, time.time(), competition_id, hotkey),
+    )
+    conn.commit()
+
+
+def get_candidate(conn: sqlite3.Connection, competition_id: str, hotkey: str) -> Optional[dict]:
+    row = conn.execute(
+        "SELECT * FROM revealed_candidates WHERE competition_id = ? AND hotkey = ?",
+        (competition_id, hotkey),
+    ).fetchone()
+    return dict(row) if row else None
+
+
+def candidates_by_status(
+    conn: sqlite3.Connection, competition_id: str, statuses: tuple, order_by_rank: bool = True
+) -> List[dict]:
+    placeholders = ",".join("?" for _ in statuses)
+    order = " ORDER BY rank ASC" if order_by_rank else ""
+    rows = conn.execute(
+        f"SELECT * FROM revealed_candidates WHERE competition_id = ? AND status IN ({placeholders}){order}",
+        (competition_id, *statuses),
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def count_candidates_by_status(conn: sqlite3.Connection, competition_id: str, statuses: tuple) -> int:
+    placeholders = ",".join("?" for _ in statuses)
+    row = conn.execute(
+        f"SELECT COUNT(*) AS n FROM revealed_candidates WHERE competition_id = ? AND status IN ({placeholders})",
+        (competition_id, *statuses),
+    ).fetchone()
+    return row["n"]
+
+
+def all_candidates_for_competition(conn: sqlite3.Connection, competition_id: str) -> List[dict]:
+    rows = conn.execute(
+        "SELECT * FROM revealed_candidates WHERE competition_id = ? ORDER BY rank ASC",
+        (competition_id,),
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def insert_benchmark_result(
+    conn: sqlite3.Connection,
+    competition_id: str,
+    hotkey: str,
+    benchmark_name: str,
+    repository: str,
+    revision: str,
+    coordinator_run_id: str,
+    status: str = "submitted",
+) -> None:
+    now = time.time()
+    conn.execute(
+        """INSERT INTO benchmark_results
+           (competition_id, hotkey, benchmark_name, repository, revision,
+            coordinator_run_id, status, submitted_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+           ON CONFLICT(competition_id, hotkey, benchmark_name) DO UPDATE SET
+             repository = excluded.repository,
+             revision = excluded.revision,
+             coordinator_run_id = excluded.coordinator_run_id,
+             status = excluded.status,
+             updated_at = excluded.updated_at""",
+        (competition_id, hotkey, benchmark_name, repository, revision, coordinator_run_id, status, now, now),
+    )
+
+
+def update_benchmark_result(
+    conn: sqlite3.Connection,
+    competition_id: str,
+    hotkey: str,
+    benchmark_name: str,
+    status: str,
+    score: Optional[float] = None,
+    phase: Optional[str] = None,
+    percent_complete: Optional[float] = None,
+    last_message: Optional[str] = None,
+) -> None:
+    conn.execute(
+        """UPDATE benchmark_results
+           SET status = ?, score = COALESCE(?, score), phase = ?, percent_complete = ?,
+               last_message = ?, updated_at = ?
+           WHERE competition_id = ? AND hotkey = ? AND benchmark_name = ?""",
+        (status, score, phase, percent_complete, last_message, time.time(),
+         competition_id, hotkey, benchmark_name),
+    )
+
+
+def open_benchmark_results(conn: sqlite3.Connection, competition_id: str) -> List[dict]:
+    rows = conn.execute(
+        """SELECT * FROM benchmark_results
+           WHERE competition_id = ? AND status IN ('submitted', 'pending-resume')""",
+        (competition_id,),
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def benchmark_results_for_hotkey(conn: sqlite3.Connection, competition_id: str, hotkey: str) -> List[dict]:
+    rows = conn.execute(
+        "SELECT * FROM benchmark_results WHERE competition_id = ? AND hotkey = ?",
+        (competition_id, hotkey),
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def record_scoring_result(
+    conn: sqlite3.Connection,
+    competition_id: str,
+    hotkey: str,
+    final_score: float,
+    max_memory_kb: int,
+) -> None:
+    now = time.time()
+    conn.execute(
+        """INSERT INTO scoring_results (competition_id, hotkey, final_score, max_memory_kb, finalized_at)
+           VALUES (?, ?, ?, ?, ?)
+           ON CONFLICT(competition_id, hotkey) DO UPDATE SET
+             final_score = excluded.final_score, max_memory_kb = excluded.max_memory_kb,
+             finalized_at = excluded.finalized_at""",
+        (competition_id, hotkey, final_score, max_memory_kb, now),
+    )
+
+
+def scoring_results_for_competition(conn: sqlite3.Connection, competition_id: str) -> List[dict]:
+    rows = conn.execute(
+        "SELECT * FROM scoring_results WHERE competition_id = ? ORDER BY final_score DESC",
+        (competition_id,),
+    ).fetchall()
+    return [dict(r) for r in rows]
 
 
 def record_weights(conn: sqlite3.Connection, competition_id: str, hotkey_weights: Dict[str, float]) -> None:
@@ -228,32 +409,6 @@ def record_weights(conn: sqlite3.Connection, competition_id: str, hotkey_weights
         (competition_id, time.time(), json.dumps(hotkey_weights)),
     )
     conn.commit()
-
-
-# ---------------------------------------------------------------------------
-# Leader-only reads (serve the API)
-# ---------------------------------------------------------------------------
-
-def scoring_results_since(conn: sqlite3.Connection, competition_id: str, after_run_id: int = 0) -> List[dict]:
-    """Runs for a competition with id > after_run_id, each with its results embedded. For follower polling."""
-    runs = conn.execute(
-        "SELECT * FROM scoring_runs WHERE competition_id = ? AND id > ? ORDER BY id ASC",
-        (competition_id, after_run_id),
-    ).fetchall()
-
-    out = []
-    for run in runs:
-        results = conn.execute(
-            "SELECT * FROM scoring_results WHERE run_id = ?", (run["id"],)
-        ).fetchall()
-        out.append({
-            "run_id": run["id"],
-            "competition_id": run["competition_id"],
-            "block": run["block"],
-            "scored_at": run["scored_at"],
-            "results": [_result_row_to_dict(r) for r in results],
-        })
-    return out
 
 
 def weights_history_for_competition(conn: sqlite3.Connection, competition_id: str) -> List[dict]:
@@ -274,207 +429,22 @@ def latest_weights_for_competition(conn: sqlite3.Connection, competition_id: str
 
 
 def full_state_for_competition(conn: sqlite3.Connection, competition_id: str) -> dict:
-    """Reveals + precheck outcomes + scoring results + weights history for one competition. Dashboard use."""
-    runs = conn.execute(
-        "SELECT * FROM scoring_runs WHERE competition_id = ? ORDER BY id ASC",
-        (competition_id,),
+    candidates = all_candidates_for_competition(conn, competition_id)
+    benchmark_rows = conn.execute(
+        "SELECT * FROM benchmark_results WHERE competition_id = ?", (competition_id,)
     ).fetchall()
-
-    run_details = []
-    for run in runs:
-        run_id = run["id"]
-        results = conn.execute("SELECT * FROM scoring_results WHERE run_id = ?", (run_id,)).fetchall()
-        precheck = conn.execute("SELECT * FROM precheck_outcomes WHERE run_id = ?", (run_id,)).fetchall()
-        reveals = conn.execute("SELECT * FROM reveals WHERE run_id = ?", (run_id,)).fetchall()
-        run_details.append({
-            "run_id": run_id,
-            "block": run["block"],
-            "scored_at": run["scored_at"],
-            "results": [_result_row_to_dict(r) for r in results],
-            "precheck_outcomes": [
-                {"hotkey": p["hotkey"], "kind": p["kind"], "reason": p["reason"]} for p in precheck
-            ],
-            "reveals": {
-                r["hotkey"]: json.loads(r["submission_json"]) for r in reveals
-            },
-        })
+    results = scoring_results_for_competition(conn, competition_id)
 
     return {
         "competition_id": competition_id,
-        "runs": run_details,
+        "stage": get_stage(conn, competition_id),
+        "candidates": candidates,
+        "benchmark_results": [dict(r) for r in benchmark_rows],
+        "results": results,
         "weights_history": weights_history_for_competition(conn, competition_id),
         "scored_status": scored_status(conn, competition_id),
     }
 
-
-def _result_row_to_dict(r: sqlite3.Row) -> dict:
-    return {
-        "hotkey": r["hotkey"],
-        "competition_id": r["competition_id"],
-        "passed_floors": bool(r["passed_floors"]),
-        "disqualified": bool(r["disqualified"]),
-        "disqualification_reason": r["disqualification_reason"],
-        "actual_scores": json.loads(r["actual_scores"]),
-        "final_score": r["final_score"],
-        "max_memory_kb": r["max_memory_kb"],
-        "lying_detected": bool(r["lying_detected"]),
-        "eval_backend": r["eval_backend"],
-    }
-
-
-# ---------------------------------------------------------------------------
-# Both modes — "already scored this competition" bookkeeping
-# ---------------------------------------------------------------------------
-
-MAX_REVEAL_ATTEMPTS = 3  # 1 initial + 2 retries
-
-
-def mark_scored(conn: sqlite3.Connection, competition_id: str, status: str = "scored") -> None:
-    """status: 'scored' (normal completion), 'failed_no_reveals' (gave up after
-    retries with no reveals), or 'failed_no_participants' (reveals existed but
-    nobody made it through precheck/dedup after retries)."""
-    conn.execute(
-        "INSERT INTO scored_competitions (competition_id, scored_at, status) "
-        "VALUES (?, ?, ?) "
-        "ON CONFLICT(competition_id) DO UPDATE SET scored_at = excluded.scored_at, status = excluded.status",
-        (competition_id, time.time(), status),
-    )
-    conn.commit()
-
-
-def has_scoring_run(conn: sqlite3.Connection, competition_id: str) -> bool:
-    """True if a scoring_runs row was committed for this competition — used to
-    detect the case where record_scoring_run() committed but the process was
-    killed (autoupdate restart) before the follow-up mark_scored() call ran."""
-    row = conn.execute(
-        "SELECT 1 FROM scoring_runs WHERE competition_id = ? LIMIT 1", (competition_id,)
-    ).fetchone()
-    return row is not None
-
-
-def is_scored(conn: sqlite3.Connection, competition_id: str) -> bool:
-    row = conn.execute(
-        "SELECT scored_at FROM scored_competitions WHERE competition_id = ?", (competition_id,)
-    ).fetchone()
-    return row is not None and row["scored_at"] > 0
-
-
-def scored_status(conn: sqlite3.Connection, competition_id: str) -> Optional[str]:
-    row = conn.execute(
-        "SELECT status FROM scored_competitions WHERE competition_id = ?", (competition_id,)
-    ).fetchone()
-    return row["status"] if row else None
-
-
-def bump_reveal_attempts(conn: sqlite3.Connection, competition_id: str) -> int:
-    """Increment and return the retry-attempt count for competition_id (row created if absent)."""
-    conn.execute(
-        "INSERT INTO scored_competitions (competition_id, scored_at, reveal_attempts) "
-        "VALUES (?, 0, 1) "
-        "ON CONFLICT(competition_id) DO UPDATE SET reveal_attempts = reveal_attempts + 1",
-        (competition_id,),
-    )
-    conn.commit()
-    row = conn.execute(
-        "SELECT reveal_attempts FROM scored_competitions WHERE competition_id = ?", (competition_id,)
-    ).fetchone()
-    return row["reveal_attempts"]
-
-
-# ---------------------------------------------------------------------------
-# Leader-only — benchmark run persistence (autoupdate/restart resume)
-# ---------------------------------------------------------------------------
-# The coordinator run_id for a submitted benchmark is otherwise only held in
-# an in-process dict for the life of one benchmark_one() call. The validator
-# autoupdater can SIGKILL the process at any point (checks every 15 min,
-# 10s grace) while a competition's scoring window is still open for hours to
-# days — so a submitted-but-not-yet-polled-to-completion run must survive a
-# restart. Persisted here at submit time; reconciled/resumed every
-# SCORING-phase leader-loop tick rather than only once at process boot,
-# since a restart can happen many times over one scoring window.
-
-def upsert_benchmark_run(
-    conn: sqlite3.Connection,
-    competition_id: str,
-    hotkey: str,
-    benchmark_name: str,
-    repository: str,
-    revision: str,
-    coordinator_run_id: str,
-    status: str = "submitted",
-) -> None:
-    """status: 'submitted' (in-flight), 'pending-resume' (poll timed out this
-    process but scoring window still open — pick up next tick), 'completed',
-    or 'failed'."""
-    now = time.time()
-    conn.execute(
-        """INSERT INTO benchmark_runs
-           (competition_id, hotkey, benchmark_name, repository, revision,
-            coordinator_run_id, status, submitted_at, updated_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-           ON CONFLICT(competition_id, hotkey, benchmark_name) DO UPDATE SET
-             repository = excluded.repository,
-             revision = excluded.revision,
-             coordinator_run_id = excluded.coordinator_run_id,
-             status = excluded.status,
-             updated_at = excluded.updated_at""",
-        (competition_id, hotkey, benchmark_name, repository, revision,
-         coordinator_run_id, status, now, now),
-    )
-    conn.commit()
-
-
-def set_benchmark_run_status(
-    conn: sqlite3.Connection,
-    competition_id: str,
-    hotkey: str,
-    benchmark_name: str,
-    status: str,
-) -> None:
-    conn.execute(
-        """UPDATE benchmark_runs SET status = ?, updated_at = ?
-           WHERE competition_id = ? AND hotkey = ? AND benchmark_name = ?""",
-        (status, time.time(), competition_id, hotkey, benchmark_name),
-    )
-    conn.commit()
-
-
-def update_benchmark_run_progress(
-    conn: sqlite3.Connection,
-    competition_id: str,
-    hotkey: str,
-    benchmark_name: str,
-    phase: Optional[str],
-    percent_complete: Optional[float],
-    last_message: Optional[str],
-) -> None:
-    """Records the coordinator's latest reported phase/progress for a
-    still-in-flight run — diagnostics only, so a restart can show last-known
-    state immediately without waiting for the first post-resume poll. Does
-    not touch `status`, unlike set_benchmark_run_status()."""
-    conn.execute(
-        """UPDATE benchmark_runs SET phase = ?, percent_complete = ?, last_message = ?, updated_at = ?
-           WHERE competition_id = ? AND hotkey = ? AND benchmark_name = ?""",
-        (phase, percent_complete, last_message, time.time(), competition_id, hotkey, benchmark_name),
-    )
-    conn.commit()
-
-
-def pending_benchmark_runs(conn: sqlite3.Connection, competition_id: str) -> List[dict]:
-    """Non-terminal runs (submitted or pending-resume) for a competition —
-    these have a coordinator run_id already accepted and should be resumed
-    by polling, not resubmitted."""
-    rows = conn.execute(
-        """SELECT * FROM benchmark_runs
-           WHERE competition_id = ? AND status IN ('submitted', 'pending-resume')""",
-        (competition_id,),
-    ).fetchall()
-    return [dict(r) for r in rows]
-
-
-# ---------------------------------------------------------------------------
-# Leader-only — competition specs (source of truth for /v1/competitions)
-# ---------------------------------------------------------------------------
 
 def upsert_competition(conn: sqlite3.Connection, spec: "CompetitionSpec") -> None:
     """Insert or replace a competition spec, keeping the original created_at on update."""
@@ -500,10 +470,6 @@ def list_competitions(conn: sqlite3.Connection) -> List[dict]:
     rows = conn.execute("SELECT spec_json FROM competitions ORDER BY id ASC").fetchall()
     return [json.loads(r["spec_json"]) for r in rows]
 
-
-# ---------------------------------------------------------------------------
-# Both modes — bans
-# ---------------------------------------------------------------------------
 
 def ban(conn: sqlite3.Connection, hotkey: str, reason: str) -> None:
     conn.execute(

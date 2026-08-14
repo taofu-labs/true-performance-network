@@ -20,13 +20,13 @@ WALLET_PATH = os.getenv("WALLET_PATH", None)  # None = use bittensor default (~/
 REQUEST_RETRY_COUNT = int(os.getenv("REQUEST_RETRY_COUNT", 3))
 CLIENT_REQUEST_TIMEOUT = int(os.getenv("CLIENT_REQUEST_TIMEOUT", 30))
 
-BENCHMARK_POLL_INTERVAL: float = float(os.getenv("BENCHMARK_POLL_INTERVAL", 30.0))
-
 # Benchmark submit and poll have different coordinator capacity profiles —
 # submitting many jobs at once can hit rate/queue limits even though polling
 # them in parallel afterward is fine. Caps concurrent *submits* only; polling
 # stays unbounded/parallel once a run_id is accepted.
 BENCHMARK_SUBMIT_CONCURRENCY: int = int(os.getenv("BENCHMARK_SUBMIT_CONCURRENCY", 1))
+
+SCORING_QUEUE_CONCURRENCY: int = int(os.getenv("SCORING_QUEUE_CONCURRENCY", 5))
 
 # Minimum alpha a hotkey must have locked as miner collateral to be scored
 # this run. Not a ban — a miner below threshold is simply skipped for the

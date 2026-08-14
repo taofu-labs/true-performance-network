@@ -1,24 +1,17 @@
 """
 Scorer for TPN — no full model download in the validator process.
-
-Flow per scoring run:
-  1. precheck_one()   — HF metadata + container (provenance + RAM). Sync, sequential.
-  2. benchmark_one()  — submit all benchmarks, poll until done. Async, runs in parallel
-                        across miners (coordinator manages its own queue).
 """
-import asyncio
 import sqlite3
 import time
 from dataclasses import dataclass
-from enum import Enum, auto
-from typing import Dict, List, Optional, Union
+from typing import Dict, Optional
 
 from huggingface_hub import HfApi
 from loguru import logger
 
 from common import settings as common_settings
 from common.models.competition import CompetitionSpec
-from common.models.submission import MinerSubmission, ScoringResult
+from common.models.submission import MinerSubmission
 from competition.benchmark_client import Coordinator, RunStatusCode
 from competition.model_store import check_repo_public
 from competition.precheck_client import PrecheckContainer
@@ -48,24 +41,6 @@ def _stale_window(phase: Optional[str]) -> float:
     return common_settings.BENCHMARK_STARTUP_STALE_SECONDS
 
 
-# ---------------------------------------------------------------------------
-# Outcome
-# ---------------------------------------------------------------------------
-
-class OutcomeKind(Enum):
-    SCORED = auto()
-    SKIPPED = auto()         # any non-lie failure → backfill
-    DISQUALIFIED = auto()    # max_memory lie → also backfill, but flagged
-    PENDING_RESUME = auto()  # stalled, window still open — not final, retry next tick
-
-
-@dataclass
-class ScoringOutcome:
-    kind: OutcomeKind
-    result: ScoringResult
-    reason: str = ""
-
-
 def dedup_winner(
     seen: Dict[str, "tuple[str, int]"],
     hotkey: str,
@@ -93,35 +68,22 @@ def dedup_winner(
 
 
 @dataclass
-class PrecheckPass:
-    """Carries everything benchmark_one needs — produced by precheck_one on success."""
-    hotkey: str
-    submission: MinerSubmission
-    gguf_file: str
-    measured_memory_kb: int
+class PrecheckResult:
+    passed: bool
+    reason: str = ""
+    gguf_file: str = ""
+    measured_memory_kb: int = 0
 
-
-# ---------------------------------------------------------------------------
-# Phase 1: precheck (sync — runs sequentially, one at a time)
-# ---------------------------------------------------------------------------
 
 def precheck_one(
     hotkey: str,
     submission: MinerSubmission,
     spec: CompetitionSpec,
-    precheck_ctr: Optional[PrecheckContainer],
+    precheck_ctr: PrecheckContainer,
     conn: sqlite3.Connection,
-) -> Union[PrecheckPass, ScoringOutcome]:
-    """
-    Run HF metadata check + container precheck.
-    Returns PrecheckPass on success, ScoringOutcome on skip/disqualify.
-    Blocking — call via asyncio.to_thread.
-    """
-    if precheck_ctr is None:
-        return _skip(hotkey, submission, "precheck container unavailable")
-
+) -> PrecheckResult:
     if not check_repo_public(submission.repository):
-        return _skip(hotkey, submission, "repo not publicly accessible")
+        return PrecheckResult(False, "repo not publicly accessible")
 
     try:
         files = list(_hf_api.list_repo_files(
@@ -129,11 +91,11 @@ def precheck_one(
             revision=submission.huggingface_revision,
         ))
     except Exception as e:
-        return _skip(hotkey, submission, f"HF API list_repo_files failed: {e}")
+        return PrecheckResult(False, f"HF API list_repo_files failed: {e}")
 
     gguf_file = next((f for f in files if f.endswith(".gguf")), None)
     if not gguf_file:
-        return _skip(hotkey, submission, "no .gguf file found at revision")
+        return PrecheckResult(False, "no .gguf file found at revision")
 
     download_url = _HF_RESOLVE.format(
         repo=submission.repository,
@@ -147,35 +109,33 @@ def precheck_one(
 
     if verdict.error:
         logger.warning(f"{hotkey[:12]} precheck error: {verdict.error}")
-        return _skip(hotkey, submission, f"precheck error: {verdict.error}")
+        return PrecheckResult(False, f"precheck error: {verdict.error}")
 
     if verdict.provenance and not verdict.provenance.is_derivative:
         notes = "; ".join(verdict.provenance.notes) or "CKA below threshold"
         logger.warning(f"{hotkey[:12]} provenance fail: {notes}")
-        return _skip(hotkey, submission, f"provenance fail: {notes}")
+        return PrecheckResult(False, f"provenance fail: {notes}")
 
     if verdict.sha256 and verdict.sha256.lower() != submission.file_sha256:
         reason = f"sha256 mismatch: revealed={submission.file_sha256[:12]} actual={verdict.sha256[:12]}"
         store.ban(conn, hotkey, reason)
         logger.warning(f"{hotkey[:12]} BANNED — {reason}")
-        return _skip(hotkey, submission, f"{reason} (hotkey banned)")
+        return PrecheckResult(False, f"{reason} (hotkey banned)")
 
     if not verdict.ram:
-        return _skip(hotkey, submission, "no RAM measurement returned by precheck")
+        return PrecheckResult(False, "no RAM measurement returned by precheck")
 
     if not verdict.ram.passed:
-        return _skip(hotkey, submission, "llama-cli load failed")
+        return PrecheckResult(False, "llama-cli load failed")
 
     reported_bytes = submission.max_memory * 1024
     measured_bytes = verdict.ram.ram_bytes
     tolerance = common_settings.RAM_CHECK_LYING_TOLERANCE
     if reported_bytes > 0 and abs(measured_bytes - reported_bytes) / reported_bytes > tolerance:
         diff = abs(measured_bytes - reported_bytes) / reported_bytes
-        logger.warning(f"{hotkey[:12]} max_memory lie: reported={reported_bytes} measured={measured_bytes} diff={diff:.1%}")
-        return _disqualify(
-            hotkey, submission,
-            f"max_memory lie: reported {reported_bytes}B measured {measured_bytes}B ({diff:.1%})",
-        )
+        reason = f"max_memory lie: reported {reported_bytes}B measured {measured_bytes}B ({diff:.1%})"
+        logger.warning(f"{hotkey[:12]} {reason}")
+        return PrecheckResult(False, reason)
 
     logger.info(
         f"{hotkey[:12]} precheck OK"
@@ -183,158 +143,130 @@ def precheck_one(
         + (f" CKA={verdict.provenance.cka:.3f}" if verdict.provenance else "")
     )
 
-    return PrecheckPass(
-        hotkey=hotkey, submission=submission, gguf_file=gguf_file,
-        measured_memory_kb=measured_bytes // 1024,
-    )
+    return PrecheckResult(True, gguf_file=gguf_file, measured_memory_kb=measured_bytes // 1024)
 
 
-# ---------------------------------------------------------------------------
-# Phase 2: benchmark (async — all miners run in parallel)
-# ---------------------------------------------------------------------------
-
-async def benchmark_one(
-    p: PrecheckPass,
+def submit_benchmarks_for_candidate(
+    conn: sqlite3.Connection,
+    competition_id: str,
+    hotkey: str,
+    submission: MinerSubmission,
+    gguf_file: str,
     spec: CompetitionSpec,
     coordinator: Coordinator,
-    conn: sqlite3.Connection,
-    poll_interval: float = 30.0,
-    current_block: Optional[int] = None,
-    run_ids: Optional[Dict[str, str]] = None,
-    submit_semaphore: Optional[asyncio.Semaphore] = None,
-) -> ScoringOutcome:
-    """
-    Submit all benchmarks for one miner and poll until done.
-
-    `run_ids`, if given, are coordinator run_ids already submitted and
-    persisted in a prior process (resumed after an autoupdater restart) —
-    submit is skipped for any benchmark name already present.
-
-    A validator restart mid-poll is common (autoupdater can SIGKILL every
-    ~15min while a scoring window stays open for hours-days), so run_ids are
-    persisted to `benchmark_runs` immediately after each submit. A benchmark
-    is only given up on when its coordinator progress goes stale (no
-    progress.last_log_at movement for longer than its phase's stale window —
-    see _stale_window()) — long but healthy runs (multi-hour lm_eval tasks,
-    slow GGUF downloads) are never killed by elapsed time alone. Once stale,
-    the outcome is a hard skip only if the competition's scoring window
-    (spec.scoring_end_block) has closed; otherwise the run is left
-    'pending-resume' for the next tick's reconciliation pass to pick back up.
-
-    `submit_semaphore`, if given, bounds concurrent *submits* only across all
-    benchmark_one() calls running in the same asyncio.gather — submit and
-    poll have different coordinator capacity profiles, so polling stays
-    unbounded/parallel once a run_id is accepted.
-    """
-    hotkey, submission = p.hotkey, p.submission
-
-    run_ids = dict(run_ids or {})
+) -> Optional[str]:
     try:
         for task in spec.benchmarks:
-            if task.name in run_ids:
-                continue
-            if submit_semaphore is not None:
-                async with submit_semaphore:
-                    run_id = await asyncio.to_thread(
-                        coordinator.submit,
-                        submission.repository,
-                        submission.huggingface_revision,
-                        task.name,
-                        [p.gguf_file],
-                    )
-            else:
-                run_id = await asyncio.to_thread(
-                    coordinator.submit,
-                    submission.repository,
-                    submission.huggingface_revision,
-                    task.name,
-                    [p.gguf_file],
-                )
-            run_ids[task.name] = run_id
-            store.upsert_benchmark_run(
-                conn, submission.competition_id, hotkey, task.name,
+            run_id = coordinator.submit(
+                submission.repository, submission.huggingface_revision, task.name, [gguf_file],
+            )
+            store.insert_benchmark_result(
+                conn, competition_id, hotkey, task.name,
                 submission.repository, submission.huggingface_revision, run_id,
             )
     except Exception as e:
-        return _skip(hotkey, submission, f"benchmark submit error: {e}")
+        return f"benchmark submit error: {e}"
+    conn.commit()
+    return None
 
-    # Poll — one stale-progress clock per benchmark, no fixed wall-clock deadline.
-    # A benchmark is stalled only when its coordinator progress.last_log_at
-    # stops advancing for longer than its phase's stale window (extended
-    # dynamically if the coordinator reports estimated_seconds_remaining).
-    actual_scores: Dict[str, float] = {}
-    pending = dict(run_ids)
+
+_last_log_at: Dict[tuple, Optional[str]] = {}
+_last_progress_wall: Dict[tuple, float] = {}
+
+
+def poll_open_benchmarks(
+    conn: sqlite3.Connection,
+    competition_id: str,
+    spec: CompetitionSpec,
+    coordinator: Coordinator,
+    current_block: Optional[int] = None,
+) -> None:
+    rows = store.open_benchmark_results(conn, competition_id)
     now = time.monotonic()
-    last_log_at: Dict[str, Optional[str]] = {bname: None for bname in pending}
-    last_progress_wall: Dict[str, float] = {bname: now for bname in pending}
+    touched_hotkeys = set()
 
-    while pending:
-        await asyncio.sleep(poll_interval)
-        now = time.monotonic()
-        stalled: List[str] = []
-        for bname in list(pending):
-            try:
-                status = await asyncio.to_thread(coordinator.poll, pending[bname])
-            except Exception as e:
-                return _skip(hotkey, submission, f"poll error: {e}")
+    for row in rows:
+        hotkey, bname = row["hotkey"], row["benchmark_name"]
+        key = (competition_id, hotkey, bname)
+        touched_hotkeys.add(hotkey)
 
-            if status.status == RunStatusCode.COMPLETED:
-                actual_scores[bname] = status.scores.get(bname, 0.0)
-                del pending[bname]
-                store.set_benchmark_run_status(conn, submission.competition_id, hotkey, bname, "completed")
-                logger.debug(f"{hotkey[:12]} {bname}={actual_scores[bname]:.4f}")
-                continue
-            if status.status == RunStatusCode.FAILED:
-                store.set_benchmark_run_status(conn, submission.competition_id, hotkey, bname, "failed")
-                return _skip(hotkey, submission, f"benchmark {bname} failed: {status.failure_reason or 'unknown'}")
+        try:
+            status = coordinator.poll(row["coordinator_run_id"])
+        except Exception as e:
+            store.update_benchmark_result(conn, competition_id, hotkey, bname, "failed")
+            _fail_candidate(conn, competition_id, hotkey, f"poll error: {e}")
+            continue
 
-            # Still running — refresh the activity clock if the coordinator
-            # reports new progress, else check it against the stale window.
-            if status.last_log_at != last_log_at[bname]:
-                last_log_at[bname] = status.last_log_at
-                last_progress_wall[bname] = now
+        if status.status == RunStatusCode.COMPLETED:
+            score = status.scores.get(bname, 0.0)
+            store.update_benchmark_result(conn, competition_id, hotkey, bname, "completed", score=score)
+            logger.debug(f"{hotkey[:12]} {bname}={score:.4f}")
+            _last_log_at.pop(key, None)
+            _last_progress_wall.pop(key, None)
+            continue
 
-            store.update_benchmark_run_progress(
-                conn, submission.competition_id, hotkey, bname,
-                status.phase, status.percent_complete, status.message,
-            )
+        if status.status == RunStatusCode.FAILED:
+            store.update_benchmark_result(conn, competition_id, hotkey, bname, "failed")
+            reason = f"benchmark {bname} failed: {status.failure_reason or 'unknown'}"
+            logger.warning(f"{hotkey[:12]} {reason}")
+            _fail_candidate(conn, competition_id, hotkey, reason)
+            continue
 
-            window = max(
-                _stale_window(status.phase),
-                (status.estimated_seconds_remaining or 0) * _ESTIMATE_SAFETY_FACTOR,
-            )
-            if now - last_progress_wall[bname] > window:
-                stalled.append(bname)
+        if status.last_log_at != _last_log_at.get(key):
+            _last_log_at[key] = status.last_log_at
+            _last_progress_wall[key] = now
+        _last_progress_wall.setdefault(key, now)
 
-        if not stalled:
+        store.update_benchmark_result(
+            conn, competition_id, hotkey, bname, row["status"],
+            phase=status.phase, percent_complete=status.percent_complete, last_message=status.message,
+        )
+
+        window = max(
+            _stale_window(status.phase),
+            (status.estimated_seconds_remaining or 0) * _ESTIMATE_SAFETY_FACTOR,
+        )
+        if now - _last_progress_wall[key] <= window:
             continue
 
         window_open = current_block is None or current_block < spec.scoring_end_block
         if window_open:
             logger.warning(
-                f"{hotkey[:12]} benchmark(s) stalled (no progress past stale window): "
-                f"{stalled} — scoring window still open, resuming next tick"
+                f"{hotkey[:12]} {bname} stalled (no progress past stale window) — "
+                f"scoring window still open, resuming next tick"
             )
-            for bname in stalled:
-                store.set_benchmark_run_status(
-                    conn, submission.competition_id, hotkey, bname, "pending-resume"
-                )
-            return _pending_resume(
-                hotkey, submission,
-                f"benchmark poll pending-resume, stalled: {stalled}",
-            )
+            store.update_benchmark_result(conn, competition_id, hotkey, bname, "pending-resume")
+        else:
+            logger.warning(f"{hotkey[:12]} {bname} stalled, scoring window closed")
+            store.update_benchmark_result(conn, competition_id, hotkey, bname, "failed")
+            _fail_candidate(conn, competition_id, hotkey, f"benchmark poll timed out (stale progress): {bname}")
 
-        logger.warning(f"{hotkey[:12]} benchmark(s) stalled, scoring window closed: {stalled}")
-        return _skip(
-            hotkey, submission,
-            f"benchmark poll timed out (stale progress), pending: {stalled}",
-            actual_scores=actual_scores,
-        )
+    conn.commit()
 
-    # Score-mismatch check: miner claimed a benchmark score in its reveal
-    # higher than what the coordinator actually measured. Only under-delivery
-    # is a lie worth banning — actual scoring higher than claimed is not
-    # penalized (e.g. non-determinism, claim rounded down).
+    for hotkey in touched_hotkeys:
+        _resolve_candidate_if_terminal(conn, competition_id, hotkey, spec)
+
+
+def _fail_candidate(conn: sqlite3.Connection, competition_id: str, hotkey: str, reason: str) -> None:
+    store.set_candidate_status(conn, competition_id, hotkey, "failed", reason)
+
+
+def _resolve_candidate_if_terminal(
+    conn: sqlite3.Connection, competition_id: str, hotkey: str, spec: CompetitionSpec,
+) -> None:
+    candidate = store.get_candidate(conn, competition_id, hotkey)
+    if candidate is None or candidate["status"] != "benchmarking":
+        return
+
+    rows = store.benchmark_results_for_hotkey(conn, competition_id, hotkey)
+    if any(r["status"] not in ("completed", "failed") for r in rows):
+        return
+    if any(r["status"] == "failed" for r in rows):
+        return
+
+    actual_scores = {r["benchmark_name"]: r["score"] for r in rows if r["score"] is not None}
+    submission = MinerSubmission.model_validate_json(candidate["submission_json"])
+
     claimed_scores = submission.self_reported_scores
     tolerance = common_settings.SCORE_LYING_TOLERANCE
     for bname, actual in actual_scores.items():
@@ -346,104 +278,24 @@ async def benchmark_one(
             reason = f"score mismatch on {bname}: claimed={claim:.4f} actual={actual:.4f} ({shortfall:.1%} lower)"
             store.ban(conn, hotkey, reason)
             logger.warning(f"{hotkey[:12]} BANNED — {reason}")
-            return _skip(hotkey, submission, f"{reason} (hotkey banned)", actual_scores=actual_scores)
+            _fail_candidate(conn, competition_id, hotkey, f"{reason} (hotkey banned)")
+            return
 
-    # Floor check
     passed, failures = passes_floors(actual_scores, spec.benchmarks)
     if not passed:
         logger.info(f"{hotkey[:12]} floor fail: {failures}")
-        return _skip(hotkey, submission, f"failed floors: {failures}", actual_scores=actual_scores)
+        _fail_candidate(conn, competition_id, hotkey, f"failed floors: {failures}")
+        return
 
-    # Memory cap check (ram_ceiling competitions only)
-    if not passes_memory_cap(submission.max_memory, spec):
-        logger.info(f"{hotkey[:12]} memory cap fail: {submission.max_memory}KB > {spec.max_memory_kb}KB")
-        return _skip(
-            hotkey, submission,
-            f"exceeded memory cap: {submission.max_memory}KB > {spec.max_memory_kb}KB",
-            actual_scores=actual_scores,
-        )
+    measured_memory_kb = candidate["measured_memory_kb"] or 0
+    if not passes_memory_cap(measured_memory_kb, spec):
+        reason = f"exceeded memory cap: {measured_memory_kb}KB > {spec.max_memory_kb}KB"
+        logger.info(f"{hotkey[:12]} memory cap fail: {reason}")
+        _fail_candidate(conn, competition_id, hotkey, reason)
+        return
 
-    final = final_score(actual_scores, p.measured_memory_kb, spec)
-    logger.info(f"{hotkey[:12]} SCORED final={final:.6f} scores={actual_scores}")
-    return ScoringOutcome(
-        kind=OutcomeKind.SCORED,
-        result=ScoringResult(
-            hotkey=hotkey,
-            competition_id=submission.competition_id,
-            passed_floors=True,
-            disqualified=False,
-            actual_scores=actual_scores,
-            final_score=final,
-            max_memory_kb=p.measured_memory_kb,
-            lying_detected=False,
-            eval_backend="coordinator",
-        ),
-    )
-
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-def _skip(
-    hotkey: str,
-    submission: MinerSubmission,
-    reason: str,
-    actual_scores: Optional[Dict[str, float]] = None,
-) -> ScoringOutcome:
-    return ScoringOutcome(
-        kind=OutcomeKind.SKIPPED,
-        reason=reason,
-        result=ScoringResult(
-            hotkey=hotkey,
-            competition_id=submission.competition_id,
-            passed_floors=False,
-            disqualified=False,
-            disqualification_reason=reason,
-            actual_scores=actual_scores or {},
-            final_score=0.0,
-            max_memory_kb=submission.max_memory,
-            lying_detected=False,
-            eval_backend="coordinator",
-        ),
-    )
-
-
-def _pending_resume(hotkey: str, submission: MinerSubmission, reason: str) -> ScoringOutcome:
-    return ScoringOutcome(
-        kind=OutcomeKind.PENDING_RESUME,
-        reason=reason,
-        result=ScoringResult(
-            hotkey=hotkey,
-            competition_id=submission.competition_id,
-            passed_floors=False,
-            disqualified=False,
-            disqualification_reason=reason,
-            actual_scores={},
-            final_score=0.0,
-            max_memory_kb=submission.max_memory,
-            lying_detected=False,
-            eval_backend="coordinator",
-        ),
-    )
-
-
-def _disqualify(hotkey: str, submission: MinerSubmission, reason: str) -> ScoringOutcome:
-    logger.warning(f"DISQUALIFIED {hotkey[:12]}: {reason}")
-    return ScoringOutcome(
-        kind=OutcomeKind.DISQUALIFIED,
-        reason=reason,
-        result=ScoringResult(
-            hotkey=hotkey,
-            competition_id=submission.competition_id,
-            passed_floors=False,
-            disqualified=True,
-            disqualification_reason=reason,
-            actual_scores={},
-            final_score=0.0,
-            max_memory_kb=submission.max_memory,
-            lying_detected=True,
-            eval_backend="coordinator",
-        ),
-    )
-
+    score = final_score(actual_scores, measured_memory_kb, spec)
+    logger.info(f"{hotkey[:12]} SCORED final={score:.6f} scores={actual_scores}")
+    store.record_scoring_result(conn, competition_id, hotkey, score, measured_memory_kb)
+    store.set_candidate_status(conn, competition_id, hotkey, "done")
+    conn.commit()

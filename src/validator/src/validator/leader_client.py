@@ -13,13 +13,13 @@ class LeaderClient:
         self._base = base_url.rstrip("/")
         self._timeout = timeout
 
-    def get_scoring_results(self, competition_id: str, since_run_id: int = 0) -> tuple[List[dict], Optional[str]]:
-        """Returns (runs, scored_status). scored_status is 'scored', 'failed_no_reveals', or None if not yet scored."""
+    def get_scoring_results(self, competition_id: str) -> tuple[List[dict], Optional[str]]:
+        """Returns (results, scored_status). scored_status is 'scored', 'failed_no_reveals', or None if not yet scored."""
         resp = requests.get(
             f"{self._base}/v1/follower/scoring-results",
-            params={"competition_id": competition_id, "since_run_id": since_run_id},
+            params={"competition_id": competition_id},
             timeout=self._timeout,
         )
         resp.raise_for_status()
         body = resp.json()
-        return body.get("runs", []), body.get("scored_status")
+        return body.get("results", []), body.get("scored_status")

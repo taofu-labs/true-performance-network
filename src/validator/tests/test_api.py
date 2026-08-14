@@ -67,7 +67,28 @@ async def test_follower_scoring_results_empty_for_unknown_competition(conn):
         resp = await client.get("/v1/follower/scoring-results", params={"competition_id": "comp1"})
         assert resp.status == 200
         body = await resp.json()
-        assert body == {"runs": [], "scored_status": None}
+        assert body == {"results": [], "scored_status": None}
+
+
+@pytest.mark.asyncio
+async def test_follower_scoring_results_hidden_until_finalized(conn):
+    """A competition mid-stage2_scoring must not leak partial results to
+    followers — only stage == 'finalized' exposes anything here."""
+    store.record_scoring_result(conn, "comp1", "hk1", final_score=0.7, max_memory_kb=1000)
+    conn.commit()
+    store.set_stage(conn, "comp1", "stage2_scoring")
+
+    async with TestClient(TestServer(make_app(conn))) as client:
+        resp = await client.get("/v1/follower/scoring-results", params={"competition_id": "comp1"})
+        body = await resp.json()
+        assert body["results"] == []
+
+    store.set_stage(conn, "comp1", "finalized")
+    async with TestClient(TestServer(make_app(conn))) as client:
+        resp = await client.get("/v1/follower/scoring-results", params={"competition_id": "comp1"})
+        body = await resp.json()
+        assert body["results"] == [{"competition_id": "comp1", "hotkey": "hk1", "final_score": 0.7,
+                                     "max_memory_kb": 1000, "finalized_at": body["results"][0]["finalized_at"]}]
 
 
 @pytest.mark.asyncio
@@ -101,7 +122,9 @@ async def test_state_competition_returns_full_state_shape(conn):
         resp = await client.get("/v1/state/competitions/comp1")
         body = await resp.json()
         assert body["competition_id"] == "comp1"
-        assert body["runs"] == []
+        assert body["candidates"] == []
+        assert body["benchmark_results"] == []
+        assert body["results"] == []
 
 
 @pytest.mark.asyncio

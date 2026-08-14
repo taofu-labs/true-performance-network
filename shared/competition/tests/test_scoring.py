@@ -204,28 +204,19 @@ def test_sort_by_self_reported_ram_ceiling_highest_composite_first():
     assert [hk for hk, _ in ranked] == ["hk_high", "hk_low"]
 
 
-def make_result(hotkey: str, final: float, passed=True, disqualified=False) -> ScoringResult:
+def make_result(hotkey: str, final: float) -> ScoringResult:
     return ScoringResult(
         hotkey=hotkey,
         competition_id="rf",
-        passed_floors=passed,
-        disqualified=disqualified,
-        actual_scores={},
         final_score=final,
         max_memory_kb=1000,
-        lying_detected=False,
     )
 
 
-def test_compute_emission_weights_ranks_and_zeroes_non_qualifiers():
-    ranked = [
-        make_result("hk1", 3.0),
-        make_result("hk2", 2.0),
-        make_result("hk3", 1.0, passed=False),
-        make_result("hk4", 0.5, disqualified=True),
-    ]
+def test_compute_emission_weights_ranks_qualifiers():
+    ranked = [make_result("hk1", 3.0), make_result("hk2", 2.0)]
     weights = compute_emission_weights(ranked, [0.7, 0.3])
-    assert weights == {"hk1": 0.7, "hk2": 0.3, "hk3": 0.0, "hk4": 0.0}
+    assert weights == {"hk1": 0.7, "hk2": 0.3}
 
 
 def test_compute_emission_weights_more_qualifiers_than_distribution_slots():

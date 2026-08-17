@@ -54,6 +54,7 @@ Key env vars:
 | `PRECHECK_HOST_PORT` | `8081` | Host port the precheck container binds to (loopback-only) |
 | `BENCHMARK_STARTUP_STALE_SECONDS` | `900` | Give up on a benchmark run if no coordinator progress (provisioning/model download/preflight) for this long |
 | `BENCHMARK_EXECUTION_STALE_SECONDS` | `1800` | Give up on a benchmark run if no coordinator progress (benchmarking/collecting_results) for this long — extended dynamically if the coordinator reports `estimated_seconds_remaining` |
+| `BENCHMARK_QUEUED_STALE_SECONDS` | `86400` | Give up on a benchmark run stuck in `queued` (or `retry_waiting`, the phase used while a transiently-failed run is auto-requeued) for this long — last_log_at never advances while merely queued, so this window is long enough to cover legitimate multi-hour queue waits |
 
 **Loop timing:**
 

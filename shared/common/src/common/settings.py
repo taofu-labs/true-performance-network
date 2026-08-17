@@ -48,6 +48,7 @@ SCORE_LYING_TOLERANCE: float = float(os.getenv("SCORE_LYING_TOLERANCE", "0.01"))
 # coarser and multi-hour runs (MMLU, HellaSwag) are expected and healthy.
 BENCHMARK_STARTUP_STALE_SECONDS: int = int(os.getenv("BENCHMARK_STARTUP_STALE_SECONDS", "900"))
 BENCHMARK_EXECUTION_STALE_SECONDS: int = int(os.getenv("BENCHMARK_EXECUTION_STALE_SECONDS", "1800"))
+BENCHMARK_QUEUED_STALE_SECONDS: int = int(os.getenv("BENCHMARK_QUEUED_STALE_SECONDS", "86400"))
 
 
 def configure_logging() -> None:

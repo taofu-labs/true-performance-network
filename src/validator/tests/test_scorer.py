@@ -452,3 +452,129 @@ def test_poll_open_benchmarks_execution_bucket_survives_zero_startup_window(monk
 
     candidate = store.get_candidate(conn, "comp1", "hk1")
     assert candidate["status"] == "done"
+
+
+def test_poll_open_benchmarks_queued_bucket_survives_zero_startup_window(monkeypatch):
+    """phase="queued" must use BENCHMARK_QUEUED_STALE_SECONDS, not
+    BENCHMARK_STARTUP_STALE_SECONDS — a run merely waiting for a worker slot
+    must not be flagged stale just because the (unrelated) startup window is
+    tight."""
+    monkeypatch.setattr(common_settings, "BENCHMARK_STARTUP_STALE_SECONDS", 0)
+    conn = make_db()
+    submission = make_submission(claims=[Claim(b="mmlu", s=0.7)])
+    insert_candidate(conn, "hk1", submission, status="benchmarking", measured_memory_kb=999)
+    store.insert_benchmark_result(conn, "comp1", "hk1", "mmlu", "user/repo", "a" * 40, "run-queued")
+    conn.commit()
+
+    class QueuedPhaseCoordinator:
+        def __init__(self):
+            self._n = 0
+
+        def poll(self, run_id):
+            from competition.benchmark_client import RunStatus, RunStatusCode
+            self._n += 1
+            if self._n < 3:
+                return RunStatus(run_id=run_id, status=RunStatusCode.RUNNING, phase="queued")
+            return RunStatus(run_id=run_id, status=RunStatusCode.COMPLETED, scores={"mmlu": 0.7})
+
+    coordinator = QueuedPhaseCoordinator()
+    spec = make_spec()
+    for _ in range(4):
+        scorer.poll_open_benchmarks(conn, "comp1", spec, coordinator, current_block=15)
+
+    candidate = store.get_candidate(conn, "comp1", "hk1")
+    assert candidate["status"] == "done"
+
+
+def test_poll_open_benchmarks_retry_waiting_bucket_survives_zero_startup_window(monkeypatch):
+    """phase="retry_waiting" (status stays "queued" but phase is relabeled
+    when a transiently-failed run is auto-requeued, see
+    schedule_run_retry in the coordinator) must use
+    BENCHMARK_QUEUED_STALE_SECONDS, not BENCHMARK_STARTUP_STALE_SECONDS —
+    same frozen-last_log_at situation as plain "queued"."""
+    monkeypatch.setattr(common_settings, "BENCHMARK_STARTUP_STALE_SECONDS", 0)
+    conn = make_db()
+    submission = make_submission(claims=[Claim(b="mmlu", s=0.7)])
+    insert_candidate(conn, "hk1", submission, status="benchmarking", measured_memory_kb=999)
+    store.insert_benchmark_result(conn, "comp1", "hk1", "mmlu", "user/repo", "a" * 40, "run-retry-waiting")
+    conn.commit()
+
+    class RetryWaitingPhaseCoordinator:
+        def __init__(self):
+            self._n = 0
+
+        def poll(self, run_id):
+            from competition.benchmark_client import RunStatus, RunStatusCode
+            self._n += 1
+            if self._n < 3:
+                return RunStatus(run_id=run_id, status=RunStatusCode.RUNNING, phase="retry_waiting")
+            return RunStatus(run_id=run_id, status=RunStatusCode.COMPLETED, scores={"mmlu": 0.7})
+
+    coordinator = RetryWaitingPhaseCoordinator()
+    spec = make_spec()
+    for _ in range(4):
+        scorer.poll_open_benchmarks(conn, "comp1", spec, coordinator, current_block=15)
+
+    candidate = store.get_candidate(conn, "comp1", "hk1")
+    assert candidate["status"] == "done"
+
+
+def test_poll_open_benchmarks_queued_goes_stale_after_queued_window(monkeypatch):
+    """A run whose phase stays "queued" forever (last_log_at frozen, as the
+    coordinator never re-logs a merely-waiting run) must still eventually be
+    caught once BENCHMARK_QUEUED_STALE_SECONDS itself elapses."""
+    monkeypatch.setattr(common_settings, "BENCHMARK_QUEUED_STALE_SECONDS", 0)
+    conn = make_db()
+    submission = make_submission()
+    insert_candidate(conn, "hk1", submission, status="benchmarking")
+    store.insert_benchmark_result(conn, "comp1", "hk1", "mmlu", "user/repo", "a" * 40, "run-queued-stale")
+    conn.commit()
+
+    class NeverLeavingQueueCoordinator:
+        def poll(self, run_id):
+            from competition.benchmark_client import RunStatus, RunStatusCode
+            return RunStatus(run_id=run_id, status=RunStatusCode.RUNNING, phase="queued")
+
+    spec = make_spec()  # scoring_end_block=20
+    coordinator = NeverLeavingQueueCoordinator()
+    # First pass establishes the staleness clock (setdefault); with a 0s
+    # window, any elapsed time on the second pass trips staleness.
+    scorer.poll_open_benchmarks(conn, "comp1", spec, coordinator, current_block=15)
+    scorer.poll_open_benchmarks(conn, "comp1", spec, coordinator, current_block=15)
+
+    rows = store.benchmark_results_for_hotkey(conn, "comp1", "hk1")
+    assert rows[0]["status"] == "pending-resume"
+
+
+def test_poll_open_benchmarks_lm_eval_running_bucket_survives_zero_startup_window(monkeypatch):
+    """phase="lm_eval_running" is the fine-grained sub-phase the coordinator
+    reports while status="benchmarking" — it must use
+    BENCHMARK_EXECUTION_STALE_SECONDS, not BENCHMARK_STARTUP_STALE_SECONDS.
+    Previously this fell through to the startup bucket since only the
+    coarse "benchmarking" string was recognized, not the fine-grained phase
+    actually reported by /status."""
+    monkeypatch.setattr(common_settings, "BENCHMARK_STARTUP_STALE_SECONDS", 0)
+    conn = make_db()
+    submission = make_submission(claims=[Claim(b="mmlu", s=0.7)])
+    insert_candidate(conn, "hk1", submission, status="benchmarking", measured_memory_kb=999)
+    store.insert_benchmark_result(conn, "comp1", "hk1", "mmlu", "user/repo", "a" * 40, "run-lm-eval-running")
+    conn.commit()
+
+    class LmEvalRunningPhaseCoordinator:
+        def __init__(self):
+            self._n = 0
+
+        def poll(self, run_id):
+            from competition.benchmark_client import RunStatus, RunStatusCode
+            self._n += 1
+            if self._n < 3:
+                return RunStatus(run_id=run_id, status=RunStatusCode.RUNNING, phase="lm_eval_running")
+            return RunStatus(run_id=run_id, status=RunStatusCode.COMPLETED, scores={"mmlu": 0.7})
+
+    coordinator = LmEvalRunningPhaseCoordinator()
+    spec = make_spec()
+    for _ in range(4):
+        scorer.poll_open_benchmarks(conn, "comp1", spec, coordinator, current_block=15)
+
+    candidate = store.get_candidate(conn, "comp1", "hk1")
+    assert candidate["status"] == "done"

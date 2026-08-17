@@ -23,11 +23,23 @@ _hf_api = HfApi()
 
 # Coordinator phases bucketed by expected stall tolerance — see
 # BENCHMARK_STARTUP_STALE_SECONDS / BENCHMARK_EXECUTION_STALE_SECONDS.
+_QUEUED_PHASES = {"queued", "retry_waiting"}
 _STARTUP_PHASES = {
-    "requested", "quoted", "queued", "provisioning",
-    "worker_booting", "downloading_model", "hashing_model", "preflight",
+    "requested", "quoted",
+    "provisioning", "preparing_worker", "validating_model_server",
+    "model_server_validated", "creating_provider_worker",
+    "provider_worker_provisioned", "provider_worker_recording",
+    "provider_worker_recorded", "local_evaluator_starting",
+    "worker_booting",
+    "downloading_model", "waiting_for_model_server",
+    "hashing_model",
+    "preflight", "model_server_ready",
 }
-_EXECUTION_PHASES = {"benchmarking", "collecting_results"}
+_EXECUTION_PHASES = {
+    "benchmarking", "lm_eval_running",
+    "collecting_results", "lm_eval_finished", "parsing_results",
+    "results_ready", "sending_completion_callback",
+}
 
 # Buffer applied to the coordinator's own estimated_seconds_remaining before
 # using it to extend the stale window — a safety margin on a number the
@@ -38,6 +50,8 @@ _ESTIMATE_SAFETY_FACTOR = 1.5
 def _stale_window(phase: Optional[str]) -> float:
     if phase in _EXECUTION_PHASES:
         return common_settings.BENCHMARK_EXECUTION_STALE_SECONDS
+    if phase in _QUEUED_PHASES:
+        return common_settings.BENCHMARK_QUEUED_STALE_SECONDS
     return common_settings.BENCHMARK_STARTUP_STALE_SECONDS
 
 

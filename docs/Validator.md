@@ -2,72 +2,121 @@
 
 ## Prerequisites
 
-- Python 3.11+
-- [`uv`](https://docs.astral.sh/uv/) installed
-- Bittensor wallet registered on the TPN subnet
-- Registered hotkey on netuid (see `btcli subnet register`)
+- Linux host with sudo access
+- `git`, `curl`, build tools, Python 3.12, Node/npm, `uv`, PM2, and `btcli`
+- Bittensor wallet present on the host, normally under `~/.bittensor/wallets`
+- Validator hotkey registered on the TPN subnet (see `btcli subnets register`)
+- Only the primary scoring validator should use `VALIDATOR_MODE=leader`
+- Every additional validator should use `VALIDATOR_MODE=follower`
 
-## Setup
+## Follower hardware
+
+Follower validators do not download models, run Docker prechecks, or benchmark
+submissions. They read scoring results from the primary validator and submit
+weights on chain.
+
+Minimum:
+
+- 2 vCPU
+- 4 GB RAM
+- 20-40 GB disk
+- Stable outbound network
+
+Comfortable:
+
+- 4 vCPU
+- 8 GB RAM
+- 50+ GB disk
+
+No GPU is required. Docker is not required for follower mode.
+
+## Install dependencies
+
+Ubuntu/Debian follower example:
+
+```bash
+sudo apt-get update
+sudo apt-get install -y \
+  git curl ca-certificates build-essential pkg-config libssl-dev \
+  python3 python3-dev python3-venv python3-pip \
+  nodejs npm
+
+curl -LsSf https://astral.sh/uv/install.sh | sh
+export PATH="$HOME/.local/bin:$PATH"
+
+uv python install 3.12
+sudo npm install -g pm2
+sudo env PATH="$PATH:/usr/bin:/usr/local/bin:/bin" pm2 startup systemd -u "$USER" --hp "$HOME"
+```
+
+Install `btcli` if it is not already on `PATH`:
+
+```bash
+mkdir -p "$HOME/.local/bin"
+python3 -m venv "$HOME/.local/share/truepn/bittensor-venv"
+"$HOME/.local/share/truepn/bittensor-venv/bin/python" -m pip install --upgrade pip wheel setuptools
+"$HOME/.local/share/truepn/bittensor-venv/bin/python" -m pip install --upgrade bittensor bittensor-cli
+ln -sf "$HOME/.local/share/truepn/bittensor-venv/bin/btcli" "$HOME/.local/bin/btcli"
+```
+
+## Prepare repo
+
+Clone the repo, then sync the workspace:
+
+```bash
+git clone https://github.com/taofu-labs/tao-performance-network.git
+cd tao-performance-network
+uv sync
+```
+
+Create the validator env file:
 
 ```bash
 cp .env.example .env
-# Edit .env — set WALLET_COLDKEY, WALLET_HOTKEY, NETUID
 ```
 
-Key env vars:
+For a normal follower validator on mainnet, set:
+
+```dotenv
+VALIDATOR_MODE=follower
+LEADER_VALIDATOR_URL=https://val0.trueperformancenetwork.com
+WALLET_COLDKEY=<coldkey>
+WALLET_HOTKEY=<hotkey>
+```
+
+For a testnet follower, use:
+
+```dotenv
+VALIDATOR_MODE=follower
+LEADER_VALIDATOR_URL=https://tval0.trueperformancenetwork.com
+NETWORK=test
+NETUID=533
+WALLET_COLDKEY=<coldkey>
+WALLET_HOTKEY=<hotkey>
+```
+
+If your wallet directory is not the Bittensor default, also set:
+
+```dotenv
+WALLET_PATH=/path/to/wallets
+```
+
+Do not set `VALIDATOR_MODE=leader` unless you are operating the primary scoring
+validator. Running multiple leaders can produce conflicting scoring state.
+
+## Optional env vars
 
 | Variable | Default | Description |
 |---|---|---|
-| `BITTENSOR` | `True` | Set `False` to run without chain |
-| `NETUID` | `0` | Subnet UID |
 | `NETWORK` | `finney` | Chain endpoint or `ws://...` |
-| `WALLET_COLDKEY` | `test` | Coldkey name in `~/.bittensor/wallets` |
-| `WALLET_HOTKEY` | `m1` | Hotkey name |
+| `NETUID` | `65` | Subnet UID |
 | `WALLET_PATH` | (bittensor default) | Override wallet directory |
 | `LAUNCH_HEALTH` | `False` | Set `True` to enable health endpoint on port 9100 |
-| `VALIDATOR_MODE` | `leader` | `leader` or `follower` |
-
-**Leader mode:**
-
-| Variable | Default | Description |
-|---|---|---|
-| `LEADER_API_HOST` | `0.0.0.0` | Bind host for the leader read/admin API |
-| `LEADER_API_PORT` | `9200` | Bind port for the leader read/admin API |
-| `ADMIN_API_KEY` | (none) | Bearer token gating `POST /v1/competitions`. Unset makes the write endpoint refuse all requests (503) rather than being open |
-
-**Follower mode:**
-
-| Variable | Default | Description |
-|---|---|---|
-| `LEADER_VALIDATOR_URL` | (none) | Leader's API base URL to follow |
 | `FOLLOWER_POLL_INTERVAL` | `60` | Seconds between polls of the leader's scoring results |
 
-**Scoring / precheck tuning:**
-
-| Variable | Default | Description |
-|---|---|---|
-| `RAM_CHECK_LYING_TOLERANCE` | `0.01` | Allowed relative diff between self-reported and measured `max_memory` before disqualification |
-| `BENCHMARK_BACKEND` | `mock` | `mock` (in-process fake) or `http` (real coordinator) |
-| `COORDINATOR_BASE_URL` | (taofulabs bench endpoint) | Benchmark coordinator base URL, `http` backend only |
-| `COORDINATOR_API_KEY` | (none) | Auth for the benchmark coordinator, `http` backend only |
-| `PRECHECK_IMAGE` | `ghcr.io/taofu-labs/tpn-precheck` | Docker image used for provenance/RAM precheck |
-| `PRECHECK_HOST_PORT` | `8081` | Host port the precheck container binds to (loopback-only) |
-| `BENCHMARK_STARTUP_STALE_SECONDS` | `900` | Give up on a benchmark run if no coordinator progress (provisioning/model download/preflight) for this long |
-| `BENCHMARK_EXECUTION_STALE_SECONDS` | `1800` | Give up on a benchmark run if no coordinator progress (benchmarking/collecting_results) for this long — extended dynamically if the coordinator reports `estimated_seconds_remaining` |
-| `BENCHMARK_QUEUED_STALE_SECONDS` | `86400` | Give up on a benchmark run stuck in `queued` (or `retry_waiting`, the phase used while a transiently-failed run is auto-requeued) for this long — last_log_at never advances while merely queued, so this window is long enough to cover legitimate multi-hour queue waits |
-
-**Loop timing:**
-
-| Variable | Default | Description |
-|---|---|---|
-| `VALIDATOR_LOOP_INTERVAL` | `60` (`10` if `BITTENSOR=False`) | Seconds between leader scoring-loop iterations |
-| `WEIGHT_SUBMIT_INTERVAL` | `1260` (`10` if `BITTENSOR=False`) | Seconds between on-chain weight submissions |
-
-Competition configs live in the leader's SQLite store now, not GitHub. Leader mode
-reads/writes them directly; follower mode and the CLI read them over the leader's
-`GET /v1/competitions` API. See `src/validator/README.md` for the full API and
-`scripts/seed_competitions.py` for seeding a new leader from the JSON files still
-kept in `competitions/` for reference.
+Competition configs and scoring results come from the primary validator API.
+Followers read them over `GET /v1/competitions` and follower scoring endpoints.
+See `src/validator/README.md` for API details and primary-validator settings.
 
 ## Running
 
@@ -75,6 +124,7 @@ kept in `competitions/` for reference.
 
 ```bash
 ./scripts/start_autoupdater_pm2.sh
+pm2 save
 ```
 
 Starts the validator as a pm2 daemon. Checks for updates every 15 minutes, restarts automatically on new releases.
@@ -102,7 +152,9 @@ The validator stores persistent state in:
 - Linux/macOS: `~/.tpn/validator-storage/`
 - Windows: `%APPDATA%/tpn/validator-storage/`
 
-This includes ban records, scored submission history, and — in leader mode — full scoring run history and weights history, used to avoid rescoring, enforce bans across restarts, and serve the leader's read API. Wipe with `--clean` flag on startup.
+This includes local scored submission history. On the primary scoring validator,
+it also includes full scoring runs, ban records, and weights history. Wipe with
+`--clean` flag on startup.
 
 ## pm2 management
 

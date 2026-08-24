@@ -2,7 +2,7 @@
 Fetches competition specs from a leader validator's public HTTP API.
 
 Drop-in replacement for the removed github_config.py — same function names/shapes,
-but keyed by a leader validator base_url (e.g. https://leader.tpn.internal) instead
+but keyed by a leader validator base_url (e.g. https://val0.trueperformancenetwork.com) instead
 of a path/URL to index.json.
 """
 import time

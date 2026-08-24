@@ -57,7 +57,7 @@ endpoint (503), it does not make it public.
 ### Follower mode
 
 ```
-LEADER_VALIDATOR_URL=https://leader.tpn.internal   # required
+LEADER_VALIDATOR_URL=https://val0.trueperformancenetwork.com   # required
 FOLLOWER_POLL_INTERVAL=60
 ```
 

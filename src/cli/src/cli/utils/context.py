@@ -4,7 +4,7 @@ from typing import Optional
 
 _DEFAULT_NETWORK = "finney"
 _DEFAULT_NETUID = 65
-_DEFAULT_LEADER_URL = "https://leader.tpn.internal"
+_DEFAULT_LEADER_URL = "https://val0.trueperformancenetwork.com"
 
 
 @dataclass

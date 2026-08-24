@@ -4,7 +4,7 @@ Create or update one competition on a leader validator from a single spec file.
 
 Usage:
     ADMIN_API_KEY=... python scripts/push_competition.py \\
-        --leader-url https://leader.tpn.internal \\
+        --leader-url https://val0.trueperformancenetwork.com \\
         competitions/tpn-001.json
 """
 import argparse

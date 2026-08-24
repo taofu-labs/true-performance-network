@@ -106,7 +106,7 @@ For local development or non-standard setups, all commands accept these global f
 | `--network` | `finney` | Chain endpoint |
 | `--netuid` | `65` | Subnet UID |
 | `--wallet-path` | `~/.bittensor/wallets` | Override wallet directory |
-| `--leader-url` | `https://leader.tpn.internal` | Override leader validator API (serves competition configs) |
+| `--leader-url` | `https://val0.trueperformancenetwork.com` | Override leader validator API (serves competition configs) |
 | `--block-time` | `12.0` | Seconds per block (use `0.300` for localnet) |
 
 Example:

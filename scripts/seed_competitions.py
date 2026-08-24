@@ -5,7 +5,7 @@ admin endpoint, seeding its DB from the old git-hosted configs.
 
 Usage:
     ADMIN_API_KEY=... python scripts/seed_competitions.py \\
-        --leader-url https://leader.tpn.internal \\
+        --leader-url https://val0.trueperformancenetwork.com \\
         --dir competitions
 """
 import argparse

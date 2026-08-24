@@ -414,7 +414,8 @@ async def test_run_stage_2_prechecks_standby_candidates(monkeypatch):
 @pytest.mark.asyncio
 async def test_run_stage_2_backfills_on_precheck_failure(monkeypatch):
     """A failed precheck must not stop the whole competition — the next
-    standby is tried on the same pass since queue_slots stays open."""
+    standby is picked up on the following pass, since only one candidate
+    is prechecked at a time."""
     metagraph = FakeMetagraph(hotkeys=["hk1", "hk2"], uids=[0, 1], stake=[1.0, 1.0], weights=[[1.0, 0.0], [0.0, 1.0]], validator_permit=[True, True])
     v = make_validator(monkeypatch, metagraph=metagraph)
     store.set_stage(v._db, "comp1", "stage2_scoring")
@@ -440,7 +441,60 @@ async def test_run_stage_2_backfills_on_precheck_failure(monkeypatch):
     await v.run_stage_2(spec, current_block=15)
 
     assert store.get_candidate(v._db, "comp1", "hk1")["status"] == "failed"
+    assert store.get_candidate(v._db, "comp1", "hk2")["status"] == "standby"
+
+    await v.run_stage_2(spec, current_block=15)
+
     assert store.get_candidate(v._db, "comp1", "hk2")["status"] == "queued"
+
+
+@pytest.mark.asyncio
+async def test_run_stage_2_precheck_raise_fails_candidate_not_stranded(monkeypatch):
+    """precheck_one raising (e.g. an unguarded check inside it) must resolve
+    the candidate to 'failed', not leave it stuck in 'prechecking' forever —
+    nothing re-selects a 'prechecking' row once admitted."""
+    metagraph = FakeMetagraph(hotkeys=["hk1"], uids=[0], stake=[1.0], weights=[[1.0]], validator_permit=[True])
+    v = make_validator(monkeypatch, metagraph=metagraph)
+    store.set_stage(v._db, "comp1", "stage2_scoring")
+    store.insert_revealed_candidate(v._db, "comp1", "hk1", rank=0, submission_json=make_submission().model_dump_json(), reveal_block=5, status="standby")
+    v._db.commit()
+
+    monkeypatch.setattr("competition.benchmark_client.make_coordinator", lambda: type(
+        "C", (), {"poll": lambda self, run_id: None}
+    )())
+    monkeypatch.setattr("competition.precheck_client.PrecheckContainer.launch", lambda self: None)
+    monkeypatch.setattr("competition.precheck_client.is_container_up", lambda cid: True)
+
+    def raising_precheck(hotkey, submission, spec, ctr, conn):
+        raise RuntimeError("HF API list_repo_files failed: connection reset")
+    monkeypatch.setattr("validator.scorer.precheck_one", raising_precheck)
+
+    spec = make_spec(top_n=1)
+    await v.run_stage_2(spec, current_block=15)
+
+    candidate = store.get_candidate(v._db, "comp1", "hk1")
+    assert candidate["status"] == "failed"
+    assert "precheck raised" in candidate["failure_reason"]
+
+
+def test_reset_stale_candidate_statuses_recovers_orphaned_prechecking_row(monkeypatch):
+    """A candidate left in 'prechecking' by a process that died mid-call
+    (kill, OOM, restart) must be swept back to 'standby' on the next
+    Validator startup for any competition still in stage2_scoring."""
+    db_path = Path(tempfile.mkstemp(suffix=".db")[1])
+    monkeypatch.setattr(store, "validator_db_path", lambda: db_path)
+    monkeypatch.setattr(common_settings, "BITTENSOR", False)
+    monkeypatch.setattr(common_settings, "VALIDATOR_MODE", "leader", raising=False)
+
+    db = store.init_db()
+    store.upsert_competition(db, make_spec(id="comp1"))
+    store.set_stage(db, "comp1", "stage2_scoring")
+    store.insert_revealed_candidate(db, "comp1", "hk1", rank=0, submission_json=make_submission().model_dump_json(), reveal_block=5, status="prechecking")
+    db.commit()
+
+    Validator(wallet=FakeWallet(), subtensor=FakeSubtensor(metagraph=None), metagraph=None)
+
+    assert store.get_candidate(db, "comp1", "hk1")["status"] == "standby"
 
 
 @pytest.mark.asyncio

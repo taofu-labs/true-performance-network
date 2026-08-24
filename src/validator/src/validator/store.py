@@ -260,6 +260,19 @@ def set_candidate_status(
     conn.commit()
 
 
+def reset_stale_candidate_statuses(conn: sqlite3.Connection, competition_id: str) -> int:
+    """Recover candidates left mid-precheck by a process that died before
+    writing a terminal status. Safe only at startup — nothing is genuinely
+    in flight the moment a fresh process boots. Returns count reset."""
+    cur = conn.execute(
+        """UPDATE revealed_candidates SET status = 'standby', updated_at = ?
+           WHERE competition_id = ? AND status = 'prechecking'""",
+        (time.time(), competition_id),
+    )
+    conn.commit()
+    return cur.rowcount
+
+
 def mark_precheck_passed(
     conn: sqlite3.Connection,
     competition_id: str,

@@ -49,6 +49,10 @@ class Validator(HealthServerMixin, LeaderApiMixin):
                 if store.get_stage(self._db, spec["id"]) == "stage2_scoring"
             ]
             cleanup_stale_containers(keep_competition_ids=in_flight)
+            for cid in in_flight:
+                reset_count = store.reset_stale_candidate_statuses(self._db, cid)
+                if reset_count:
+                    logger.info(f"{cid}: reset {reset_count} candidate(s) stuck in 'prechecking' from a previous run")
 
         if self.mode == "follower":
             from validator.leader_client import LeaderClient
@@ -354,14 +358,22 @@ class Validator(HealthServerMixin, LeaderApiMixin):
             logger.debug(f"{cid}: precheck container not ready yet, skipping precheck this tick")
             return
 
-        in_queue = store.count_candidates_by_status(db, cid, ("benchmarking", "queued"))
-        queue_slots = (spec.top_n + concurrency_cap) - in_queue
-        if queue_slots > 0:
-            standbys = store.candidates_by_status(db, cid, ("standby",))[:queue_slots]
+        pipeline_count = store.count_candidates_by_status(
+            db, cid, ("done", "benchmarking", "queued", "prechecking")
+        )
+        pipeline_has_room = pipeline_count < spec.top_n + concurrency_cap
+        precheck_in_flight = store.count_candidates_by_status(db, cid, ("prechecking",)) > 0
+        if pipeline_has_room and not precheck_in_flight:
+            standbys = store.candidates_by_status(db, cid, ("standby",))[:1]
             for row in standbys:
                 submission = MinerSubmission.model_validate_json(row["submission_json"])
                 store.set_candidate_status(db, cid, row["hotkey"], "prechecking")
-                result = await asyncio.to_thread(precheck_one, row["hotkey"], submission, spec, precheck_ctr, db)
+                try:
+                    result = await asyncio.to_thread(precheck_one, row["hotkey"], submission, spec, precheck_ctr, db)
+                except Exception as e:
+                    logger.warning(f"{row['hotkey'][:12]} precheck raised: {e} — backfilling")
+                    store.set_candidate_status(db, cid, row["hotkey"], "failed", f"precheck raised: {e}")
+                    continue
                 if result.passed:
                     store.mark_precheck_passed(db, cid, row["hotkey"], result.gguf_file, result.measured_memory_kb)
                 else:

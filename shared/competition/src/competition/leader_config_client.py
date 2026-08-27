@@ -14,6 +14,10 @@ from common.models.competition import CompetitionSpec
 from common.urls import validate_base_url
 
 _CACHE_TTL = 600
+# Hard ceiling on serving a stale cache when the leader is unreachable. Past this
+# the follower gets nothing and falls back to chain-copy weights rather than
+# scoring against specs that may have been edited or deleted hours ago.
+_CACHE_MAX_STALE = 3600
 
 _cache: Dict[str, Dict[str, CompetitionSpec]] = {}
 _cache_time: Dict[str, float] = {}
@@ -31,9 +35,11 @@ def get_all_competitions(
     specs = _fetch_all(base_url)
     if specs is None:
         cached = _cache.get(base_url)
-        if cached:
-            logger.warning("Competition fetch failed, using cached competition list")
+        if cached and age < _CACHE_MAX_STALE:
+            logger.warning(f"Competition fetch failed, using cached competition list ({age:.0f}s old)")
             return list(cached.values())
+        if cached:
+            logger.error(f"Competition fetch failed and cache is {age:.0f}s stale — serving no competitions")
         return []
 
     new_cache = {spec.id: spec for spec in specs}

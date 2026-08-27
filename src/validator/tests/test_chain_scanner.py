@@ -6,6 +6,9 @@ from validator import store
 from validator.chain_scanner import scan_reveals
 
 
+GRACE = 15
+
+
 def make_spec(commit_end_block=100) -> CompetitionSpec:
     return CompetitionSpec(
         id="comp1",
@@ -16,6 +19,7 @@ def make_spec(commit_end_block=100) -> CompetitionSpec:
         emission_distribution=[1.0],
         top_n=1,
         benchmarks=[BenchmarkTask(name="mmlu", min_score=0.5, weight=1.0)],
+        reveal_grace_blocks=GRACE,
     )
 
 
@@ -63,7 +67,7 @@ def test_scan_reveals_rejects_block_before_window(monkeypatch):
 
 def test_scan_reveals_accepts_within_grace_window(monkeypatch):
     spec = make_spec(commit_end_block=100)
-    reveals = {"hk1": [(make_payload(), 103)]}
+    reveals = {"hk1": [(make_payload(), 100 + GRACE - 1)]}
     monkeypatch.setattr("validator.chain_scanner.read_revealed_commitments", lambda subtensor, netuid: reveals)
 
     result = scan_reveals(FakeSubtensor(reveals), spec, make_db())
@@ -72,7 +76,7 @@ def test_scan_reveals_accepts_within_grace_window(monkeypatch):
 
 def test_scan_reveals_rejects_block_after_window(monkeypatch):
     spec = make_spec(commit_end_block=100)
-    reveals = {"hk1": [(make_payload(), 105)]}
+    reveals = {"hk1": [(make_payload(), 100 + GRACE)]}
     monkeypatch.setattr("validator.chain_scanner.read_revealed_commitments", lambda subtensor, netuid: reveals)
 
     result = scan_reveals(FakeSubtensor(reveals), spec, make_db())

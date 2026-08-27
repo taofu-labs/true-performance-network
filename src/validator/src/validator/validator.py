@@ -183,6 +183,9 @@ class Validator(HealthServerMixin, LeaderApiMixin):
                         reverse=True,
                     )
                     hotkey_weights = compute_emission_weights(ranked, spec.emission_distribution)
+                    if not any(w > 0 for w in hotkey_weights.values()):
+                        logger.warning(f"{spec.id}: leader published results but no non-zero weights — retrying next tick")
+                        continue
 
                     logger.info(f"{spec.id}: following leader — weights: "
                                 f"{[(k[:8], v) for k, v in hotkey_weights.items() if v > 0]}")
@@ -403,6 +406,11 @@ class Validator(HealthServerMixin, LeaderApiMixin):
              for r in results),
             key=lambda r: r.final_score, reverse=True,
         )
+
+        if not ranked:
+            logger.warning(f"{cid}: no candidate was scored — terminal, no weights will be published")
+            store.mark_scored(self._db, cid, status="failed_no_participants")
+            return
 
         hotkey_weights = compute_emission_weights(ranked, spec.emission_distribution)
         logger.debug(f"{cid}: final ranking: {[(r.hotkey[:12], r.final_score) for r in ranked]}")

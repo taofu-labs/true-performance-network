@@ -97,3 +97,18 @@ def test_is_competition(monkeypatch):
     )
     assert client.is_competition("http://leader", "comp-a") is True
     assert client.is_competition("http://leader", "comp-missing") is False
+
+
+def test_stale_cache_dropped_past_max_stale(monkeypatch):
+    monkeypatch.setattr(
+        client.requests, "get",
+        lambda url, timeout: FakeResponse({"competitions": [make_spec("comp-a")]}),
+    )
+    assert len(client.get_all_competitions("http://leader")) == 1
+
+    def raise_error(url, timeout):
+        raise ConnectionError("down")
+
+    monkeypatch.setattr(client.requests, "get", raise_error)
+    client._cache_time["http://leader"] -= client._CACHE_MAX_STALE + 1
+    assert client.get_all_competitions("http://leader") == []

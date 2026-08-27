@@ -1,3 +1,4 @@
+import asyncio
 import tempfile
 from pathlib import Path
 
@@ -5,6 +6,7 @@ import pytest
 
 from common import settings as common_settings
 from common.models.competition import BenchmarkTask, CompetitionSpec
+from validator import settings as validator_settings
 from validator import store
 from validator.validator import Validator
 
@@ -342,7 +344,7 @@ async def test_run_stage_2_finalizes_when_scoring_window_closed(monkeypatch):
     spec = make_spec()  # scoring_end_block=20
     await v.run_stage_2(spec, current_block=25)  # window closed
 
-    assert store.get_stage(v._db, "comp1") == "finalized"
+    assert store.get_stage(v._db, "comp1") == "failed_no_participants"
     assert store.is_scored(v._db, "comp1") is True
 
 
@@ -378,7 +380,9 @@ async def test_run_stage_2_finalizes_when_candidates_exhausted(monkeypatch):
     spec = make_spec(top_n=5, emission_distribution=[0.4, 0.3, 0.15, 0.1, 0.05])
     await v.run_stage_2(spec, current_block=15)
 
-    assert store.get_stage(v._db, "comp1") == "finalized"
+    assert store.scored_status(v._db, "comp1") == "failed_no_participants"
+    assert store.get_stage(v._db, "comp1") == "failed_no_participants"
+    assert store.latest_weights_for_competition(v._db, "comp1") is None
 
 
 @pytest.mark.asyncio
@@ -554,3 +558,55 @@ async def test_stage2_scoring_state_survives_across_separate_validator_instances
     candidate = store.get_candidate(v2._db, "comp1", "hk1")
     assert candidate["status"] == "queued"
     assert candidate["gguf_file"] == "model.gguf"
+
+
+# ---------------------------------------------------------------------------
+# follower loop
+# ---------------------------------------------------------------------------
+
+async def _run_one_follower_tick(monkeypatch, v, results, scored_status):
+    """Drive exactly one iteration of the follower loop, then stop it."""
+    class FakeLeaderClient:
+        def get_scoring_results(self, competition_id):
+            return results, scored_status
+
+    v._leader_client = FakeLeaderClient()
+
+    async def stop(_interval):
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(asyncio, "sleep", stop)
+    with pytest.raises(asyncio.CancelledError):
+        await v._follower_loop()
+
+
+@pytest.mark.asyncio
+async def test_follower_does_not_mark_scored_when_all_weights_zero(monkeypatch):
+    metagraph = FakeMetagraph(hotkeys=["hk1"], uids=[0], stake=[1.0], weights=[[1.0]], validator_permit=[True])
+    monkeypatch.setattr(validator_settings, "LEADER_VALIDATOR_URL", "http://leader")
+    v = make_validator(monkeypatch, metagraph=metagraph, mode="follower")
+    spec = make_spec(reveal_grace_blocks=2, scoring_end_block=100)
+    monkeypatch.setattr(v, "_get_active_competitions", lambda current_block: [spec])
+    monkeypatch.setattr("validator.validator.get_current_block", lambda subtensor: 15)
+    monkeypatch.setattr("competition.scoring.compute_emission_weights", lambda ranked, dist: {"hk1": 0.0})
+
+    results = [{"hotkey": "hk1", "competition_id": "comp1", "final_score": 0.7, "max_memory_kb": 1000}]
+    await _run_one_follower_tick(monkeypatch, v, results, "scored")
+
+    assert store.is_scored(v._db, "comp1") is False
+
+
+@pytest.mark.asyncio
+async def test_follower_marks_scored_on_real_weights(monkeypatch):
+    metagraph = FakeMetagraph(hotkeys=["hk1"], uids=[0], stake=[1.0], weights=[[1.0]], validator_permit=[True])
+    monkeypatch.setattr(validator_settings, "LEADER_VALIDATOR_URL", "http://leader")
+    v = make_validator(monkeypatch, metagraph=metagraph, mode="follower")
+    spec = make_spec(reveal_grace_blocks=2, scoring_end_block=100)
+    monkeypatch.setattr(v, "_get_active_competitions", lambda current_block: [spec])
+    monkeypatch.setattr("validator.validator.get_current_block", lambda subtensor: 15)
+
+    results = [{"hotkey": "hk1", "competition_id": "comp1", "final_score": 0.7, "max_memory_kb": 1000}]
+    await _run_one_follower_tick(monkeypatch, v, results, "scored")
+
+    assert store.is_scored(v._db, "comp1") is True
+    assert store.latest_weights_for_competition(v._db, "comp1") == {"hk1": 1.0}

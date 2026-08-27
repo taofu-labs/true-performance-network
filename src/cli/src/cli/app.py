@@ -1,4 +1,6 @@
 import typer
+from rich.console import Console
+from common.urls import InvalidBaseUrl, validate_base_url
 from cli.commands.register import register
 from cli.commands.competitions import competitions
 from cli.commands.upload import upload
@@ -49,6 +51,12 @@ def main(
         help="Seconds per block (default 12.0 for mainnet; use 0.25 for fast-runtime localnet)",
     ),
 ):
+    try:
+        leader_url = validate_base_url(leader_url, setting_name="--leader-url")
+    except InvalidBaseUrl as e:
+        Console().print(f"[red]{e}[/red]")
+        raise typer.Exit(1)
+
     set_context(network=network, netuid=netuid, leader_url=leader_url, wallet_path=wallet_path, block_time=block_time)
 
 

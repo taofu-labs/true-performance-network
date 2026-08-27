@@ -279,18 +279,29 @@ class Validator(HealthServerMixin, LeaderApiMixin):
         ranked_candidates = sort_by_self_reported({hk: sub for hk, (sub, _block) in eligible.items()}, spec)
         logger.debug(f"Ranked candidates by self-reported score: {[hk[:12] for hk, _ in ranked_candidates]}")
 
+        candidates = [
+            {
+                "hotkey": hotkey,
+                "rank": rank,
+                "submission_json": submission.model_dump_json(),
+                "reveal_block": reveals[hotkey][1],
+                "status": "standby",
+            }
+            for rank, (hotkey, submission) in enumerate(ranked_candidates)
+        ] + [
+            {
+                "hotkey": hotkey,
+                "rank": -1,
+                "submission_json": reveals[hotkey][0].model_dump_json(),
+                "reveal_block": reveals[hotkey][1],
+                "status": "failed",
+                "failure_reason": reason,
+            }
+            for hotkey, reason in {**collateral_failed, **dedup_failed}.items()
+        ]
+
         try:
-            for rank, (hotkey, submission) in enumerate(ranked_candidates):
-                store.insert_revealed_candidate(
-                    self._db, spec.id, hotkey, rank, submission.model_dump_json(),
-                    reveals[hotkey][1], status="standby",
-                )
-            for hotkey, reason in {**collateral_failed, **dedup_failed}.items():
-                store.insert_revealed_candidate(
-                    self._db, spec.id, hotkey, -1, reveals[hotkey][0].model_dump_json(),
-                    reveals[hotkey][1], status="failed", failure_reason=reason,
-                )
-            self._db.commit()
+            store.insert_revealed_candidates(self._db, spec.id, candidates)
         except Exception as e:
             self._bump_stage1_or_fail(spec.id, f"failed to persist revealed_candidates: {e}")
             return
@@ -327,7 +338,7 @@ class Validator(HealthServerMixin, LeaderApiMixin):
         coordinator = self._get_coordinator()
 
         try:
-            await asyncio.to_thread(poll_open_benchmarks, db, cid, spec, coordinator, current_block)
+            await asyncio.to_thread(poll_open_benchmarks, db, cid, spec, coordinator)
         except Exception as e:
             logger.warning(f"{cid}: poll_open_benchmarks error (will retry next tick): {e}")
 

@@ -11,6 +11,7 @@ import requests
 from loguru import logger
 
 from common.models.competition import CompetitionSpec
+from common.urls import validate_base_url
 
 _CACHE_TTL = 600
 
@@ -67,11 +68,12 @@ def is_competition(base_url: str, competition_id: str) -> bool:
 
 
 def _fetch_all(base_url: str) -> Optional[List[CompetitionSpec]]:
+    validated = validate_base_url(base_url, setting_name="leader URL")
     try:
-        resp = requests.get(f"{base_url.rstrip('/')}/v1/competitions", timeout=10)
+        resp = requests.get(f"{validated}/v1/competitions", timeout=10)
         resp.raise_for_status()
         data = resp.json()
         return [CompetitionSpec.model_validate(item) for item in data.get("competitions", [])]
     except Exception as e:
-        logger.error(f"Failed to fetch competitions from {base_url}: {e}")
+        logger.error(f"Failed to fetch competitions from {validated}: {e}")
         return None

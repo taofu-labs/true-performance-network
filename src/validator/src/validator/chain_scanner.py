@@ -62,4 +62,4 @@ def scan_reveals(
 
 
 def _matches_block(reveal_block: int, commit_end_block: int) -> bool:
-    return commit_end_block <= reveal_block < commit_end_block + 5
+    return commit_end_block <= reveal_block < commit_end_block + 15

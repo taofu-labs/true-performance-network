@@ -5,12 +5,14 @@ from typing import List, Optional
 
 import requests
 
+from common.urls import validate_base_url
+
 
 class LeaderClient:
     def __init__(self, base_url: str, timeout: int = 30):
         if not base_url:
             raise ValueError("LeaderClient requires a base_url (LEADER_VALIDATOR_URL)")
-        self._base = base_url.rstrip("/")
+        self._base = validate_base_url(base_url, setting_name="LEADER_VALIDATOR_URL")
         self._timeout = timeout
 
     def get_scoring_results(self, competition_id: str) -> tuple[List[dict], Optional[str]]:

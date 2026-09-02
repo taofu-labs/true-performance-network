@@ -253,14 +253,19 @@ def test_update_benchmark_result_without_score_preserves_existing_score(tmp_path
     assert rows[0]["score"] == 0.5
 
 
-def test_open_benchmark_results_includes_pending_resume(tmp_path):
+def test_legacy_pending_resume_rows_are_migrated_to_submitted(tmp_path):
+    """Rows left at the retired 'pending-resume' status by an older validator
+    would otherwise be stranded: neither open nor terminal."""
     conn = make_conn(tmp_path)
-    store.insert_benchmark_result(conn, "comp1", "hk1", "mmlu", "user/repo", "a" * 40, "run-1", status="pending-resume")
+    store.insert_benchmark_result(conn, "comp1", "hk1", "mmlu", "user/repo", "a" * 40, "run-1")
+    conn.execute("UPDATE benchmark_results SET status = 'pending-resume'")
     conn.commit()
+
+    store._migrate_scored_competitions_stage_columns(conn)
 
     open_rows = store.open_benchmark_results(conn, "comp1")
     assert len(open_rows) == 1
-    assert open_rows[0]["status"] == "pending-resume"
+    assert open_rows[0]["status"] == "submitted"
 
 
 def test_open_benchmark_results_excludes_completed_and_failed(tmp_path):
@@ -298,3 +303,40 @@ def test_record_scoring_result_is_idempotent_on_conflict(tmp_path):
     results = store.scoring_results_for_competition(conn, "comp1")
     assert len(results) == 1
     assert results[0]["final_score"] == 0.9
+
+
+def test_concurrent_writers_share_one_connection_safely(tmp_path):
+    """Two threads driving the shared Connection must not lose or corrupt writes.
+
+    Mirrors the validator's real shape: the event-loop thread and the single
+    asyncio.to_thread worker both call store functions on the same handle.
+    Without @_locked this trips sqlite3 "recursive use of cursors" /
+    "InterfaceError" or silently drops rows.
+    """
+    import threading
+
+    conn = make_conn(tmp_path)
+    errors = []
+
+    def writer(prefix):
+        try:
+            for i in range(100):
+                store.insert_revealed_candidate(
+                    conn, "comp1", f"{prefix}{i}", rank=i,
+                    submission_json="{}", reveal_block=i, status="standby",
+                )
+                store.set_candidate_status(conn, "comp1", f"{prefix}{i}", "queued")
+                store.candidates_by_status(conn, "comp1", ("standby", "queued"))
+        except Exception as e:
+            errors.append(e)
+
+    threads = [threading.Thread(target=writer, args=(p,)) for p in ("a", "b")]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert errors == []
+    rows = store.all_candidates_for_competition(conn, "comp1")
+    assert len(rows) == 200
+    assert all(r["status"] == "queued" for r in rows)

@@ -4,6 +4,7 @@ Scorer for TPN — no full model download in the validator process.
 import sqlite3
 import time
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Dict, Optional
 
 from huggingface_hub import HfApi
@@ -45,6 +46,19 @@ _EXECUTION_PHASES = {
 # using it to extend the stale window — a safety margin on a number the
 # coordinator already computed, not an independently tunable knob.
 _ESTIMATE_SAFETY_FACTOR = 1.5
+
+
+def _log_age_seconds(last_log_at: Optional[str]) -> Optional[float]:
+    """Seconds since the coordinator's newest run log, or None if unmeasurable."""
+    if not last_log_at:
+        return None
+    try:
+        parsed = datetime.fromisoformat(last_log_at)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return max(0.0, (datetime.now(timezone.utc) - parsed).total_seconds())
 
 
 def _stale_window(phase: Optional[str]) -> float:
@@ -169,23 +183,18 @@ def submit_benchmarks_for_candidate(
     spec: CompetitionSpec,
     coordinator: Coordinator,
 ) -> Optional[str]:
-    try:
-        for task in spec.benchmarks:
+    for task in spec.benchmarks:
+        try:
             run_id = coordinator.submit(
                 submission.repository, submission.huggingface_revision, task.name, [gguf_file],
             )
-            store.insert_benchmark_result(
-                conn, competition_id, hotkey, task.name,
-                submission.repository, submission.huggingface_revision, run_id,
-            )
-    except Exception as e:
-        return f"benchmark submit error: {e}"
-    conn.commit()
+        except Exception as e:
+            return f"benchmark submit error: {e}"
+        store.insert_benchmark_result(
+            conn, competition_id, hotkey, task.name,
+            submission.repository, submission.huggingface_revision, run_id,
+        )
     return None
-
-
-_last_log_at: Dict[tuple, Optional[str]] = {}
-_last_progress_wall: Dict[tuple, float] = {}
 
 
 def poll_open_benchmarks(
@@ -193,15 +202,12 @@ def poll_open_benchmarks(
     competition_id: str,
     spec: CompetitionSpec,
     coordinator: Coordinator,
-    current_block: Optional[int] = None,
 ) -> None:
     rows = store.open_benchmark_results(conn, competition_id)
-    now = time.monotonic()
     touched_hotkeys = set()
 
     for row in rows:
         hotkey, bname = row["hotkey"], row["benchmark_name"]
-        key = (competition_id, hotkey, bname)
         touched_hotkeys.add(hotkey)
 
         try:
@@ -215,8 +221,6 @@ def poll_open_benchmarks(
             score = status.scores.get(bname, 0.0)
             store.update_benchmark_result(conn, competition_id, hotkey, bname, "completed", score=score)
             logger.debug(f"{hotkey[:12]} {bname}={score:.4f}")
-            _last_log_at.pop(key, None)
-            _last_progress_wall.pop(key, None)
             continue
 
         if status.status == RunStatusCode.FAILED:
@@ -225,11 +229,6 @@ def poll_open_benchmarks(
             logger.warning(f"{hotkey[:12]} {reason}")
             _fail_candidate(conn, competition_id, hotkey, reason)
             continue
-
-        if status.last_log_at != _last_log_at.get(key):
-            _last_log_at[key] = status.last_log_at
-            _last_progress_wall[key] = now
-        _last_progress_wall.setdefault(key, now)
 
         store.update_benchmark_result(
             conn, competition_id, hotkey, bname, row["status"],
@@ -240,22 +239,16 @@ def poll_open_benchmarks(
             _stale_window(status.phase),
             (status.estimated_seconds_remaining or 0) * _ESTIMATE_SAFETY_FACTOR,
         )
-        if now - _last_progress_wall[key] <= window:
+        age = _log_age_seconds(status.last_log_at)
+        if age is None or age <= window:
             continue
 
-        window_open = current_block is None or current_block < spec.scoring_end_block
-        if window_open:
-            logger.warning(
-                f"{hotkey[:12]} {bname} stalled (no progress past stale window) — "
-                f"scoring window still open, resuming next tick"
-            )
-            store.update_benchmark_result(conn, competition_id, hotkey, bname, "pending-resume")
-        else:
-            logger.warning(f"{hotkey[:12]} {bname} stalled, scoring window closed")
-            store.update_benchmark_result(conn, competition_id, hotkey, bname, "failed")
-            _fail_candidate(conn, competition_id, hotkey, f"benchmark poll timed out (stale progress): {bname}")
-
-    conn.commit()
+        logger.warning(
+            f"{hotkey[:12]} {bname} stalled — no coordinator log for {age:.0f}s "
+            f"(window {window:.0f}s)"
+        )
+        store.update_benchmark_result(conn, competition_id, hotkey, bname, "failed")
+        _fail_candidate(conn, competition_id, hotkey, f"benchmark stalled: no progress for {age:.0f}s")
 
     for hotkey in touched_hotkeys:
         _resolve_candidate_if_terminal(conn, competition_id, hotkey, spec)
@@ -310,6 +303,4 @@ def _resolve_candidate_if_terminal(
 
     score = final_score(actual_scores, measured_memory_kb, spec)
     logger.info(f"{hotkey[:12]} SCORED final={score:.6f} scores={actual_scores}")
-    store.record_scoring_result(conn, competition_id, hotkey, score, measured_memory_kb)
-    store.set_candidate_status(conn, competition_id, hotkey, "done")
-    conn.commit()
+    store.finalize_candidate(conn, competition_id, hotkey, score, measured_memory_kb)

@@ -43,7 +43,7 @@ def scan_reveals(
         # Accept reveals landing within a small window after commit_end_block —
         # the chain's TLE auto-decrypt lands within ~5 blocks, not exactly on it.
         for raw, reveal_block in entries:
-            if _matches_block(reveal_block, competition.commit_end_block):
+            if _matches_block(reveal_block, competition.commit_end_block, competition.reveal_grace_blocks):
                 submission = parse_reveal_payload(raw)
                 if submission is None:
                     logger.debug(f"Malformed reveal payload for {hotkey[:12]}")
@@ -61,5 +61,5 @@ def scan_reveals(
     return results
 
 
-def _matches_block(reveal_block: int, commit_end_block: int) -> bool:
-    return commit_end_block <= reveal_block < commit_end_block + 5
+def _matches_block(reveal_block: int, commit_end_block: int, grace_blocks: int) -> bool:
+    return commit_end_block <= reveal_block < commit_end_block + grace_blocks

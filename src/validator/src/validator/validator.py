@@ -183,6 +183,9 @@ class Validator(HealthServerMixin, LeaderApiMixin):
                         reverse=True,
                     )
                     hotkey_weights = compute_emission_weights(ranked, spec.emission_distribution)
+                    if not any(w > 0 for w in hotkey_weights.values()):
+                        logger.warning(f"{spec.id}: leader published results but no non-zero weights — retrying next tick")
+                        continue
 
                     logger.info(f"{spec.id}: following leader — weights: "
                                 f"{[(k[:8], v) for k, v in hotkey_weights.items() if v > 0]}")
@@ -279,18 +282,29 @@ class Validator(HealthServerMixin, LeaderApiMixin):
         ranked_candidates = sort_by_self_reported({hk: sub for hk, (sub, _block) in eligible.items()}, spec)
         logger.debug(f"Ranked candidates by self-reported score: {[hk[:12] for hk, _ in ranked_candidates]}")
 
+        candidates = [
+            {
+                "hotkey": hotkey,
+                "rank": rank,
+                "submission_json": submission.model_dump_json(),
+                "reveal_block": reveals[hotkey][1],
+                "status": "standby",
+            }
+            for rank, (hotkey, submission) in enumerate(ranked_candidates)
+        ] + [
+            {
+                "hotkey": hotkey,
+                "rank": -1,
+                "submission_json": reveals[hotkey][0].model_dump_json(),
+                "reveal_block": reveals[hotkey][1],
+                "status": "failed",
+                "failure_reason": reason,
+            }
+            for hotkey, reason in {**collateral_failed, **dedup_failed}.items()
+        ]
+
         try:
-            for rank, (hotkey, submission) in enumerate(ranked_candidates):
-                store.insert_revealed_candidate(
-                    self._db, spec.id, hotkey, rank, submission.model_dump_json(),
-                    reveals[hotkey][1], status="standby",
-                )
-            for hotkey, reason in {**collateral_failed, **dedup_failed}.items():
-                store.insert_revealed_candidate(
-                    self._db, spec.id, hotkey, -1, reveals[hotkey][0].model_dump_json(),
-                    reveals[hotkey][1], status="failed", failure_reason=reason,
-                )
-            self._db.commit()
+            store.insert_revealed_candidates(self._db, spec.id, candidates)
         except Exception as e:
             self._bump_stage1_or_fail(spec.id, f"failed to persist revealed_candidates: {e}")
             return
@@ -327,7 +341,7 @@ class Validator(HealthServerMixin, LeaderApiMixin):
         coordinator = self._get_coordinator()
 
         try:
-            await asyncio.to_thread(poll_open_benchmarks, db, cid, spec, coordinator, current_block)
+            await asyncio.to_thread(poll_open_benchmarks, db, cid, spec, coordinator)
         except Exception as e:
             logger.warning(f"{cid}: poll_open_benchmarks error (will retry next tick): {e}")
 
@@ -392,6 +406,11 @@ class Validator(HealthServerMixin, LeaderApiMixin):
              for r in results),
             key=lambda r: r.final_score, reverse=True,
         )
+
+        if not ranked:
+            logger.warning(f"{cid}: no candidate was scored — terminal, no weights will be published")
+            store.mark_scored(self._db, cid, status="failed_no_participants")
+            return
 
         hotkey_weights = compute_emission_weights(ranked, spec.emission_distribution)
         logger.debug(f"{cid}: final ranking: {[(r.hotkey[:12], r.final_score) for r in ranked]}")

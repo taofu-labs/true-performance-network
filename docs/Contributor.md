@@ -2,7 +2,7 @@
 
 ## Prerequisites
 
-- Python 3.11+
+- Python 3.12+
 - [`uv`](https://docs.astral.sh/uv/)
 - Docker + Docker Compose
 - [`btcli`](https://docs.bittensor.com/btcli) on PATH

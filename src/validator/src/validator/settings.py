@@ -1,11 +1,9 @@
 import os
 
-import os as _os
 from common.settings import BITTENSOR
 
-WEIGHT_SUBMIT_INTERVAL: int = int(_os.getenv("WEIGHT_SUBMIT_INTERVAL", 10 if not BITTENSOR else 60 * 21))
-ORCHESTRATOR_HEALTH_CHECK_INTERVAL: int = 60
-VALIDATOR_LOOP_INTERVAL: int = int(_os.getenv("VALIDATOR_LOOP_INTERVAL", 10 if not BITTENSOR else 60))
+WEIGHT_SUBMIT_INTERVAL: int = int(os.getenv("WEIGHT_SUBMIT_INTERVAL", 10 if not BITTENSOR else 60 * 21))
+VALIDATOR_LOOP_INTERVAL: int = int(os.getenv("VALIDATOR_LOOP_INTERVAL", 10 if not BITTENSOR else 60))
 
 # Health settings
 LAUNCH_HEALTH = os.getenv("LAUNCH_HEALTH") == "True"
@@ -19,12 +17,6 @@ WALLET_PATH = os.getenv("WALLET_PATH", None)  # None = use bittensor default (~/
 
 REQUEST_RETRY_COUNT = int(os.getenv("REQUEST_RETRY_COUNT", 3))
 CLIENT_REQUEST_TIMEOUT = int(os.getenv("CLIENT_REQUEST_TIMEOUT", 30))
-
-# Benchmark submit and poll have different coordinator capacity profiles —
-# submitting many jobs at once can hit rate/queue limits even though polling
-# them in parallel afterward is fine. Caps concurrent *submits* only; polling
-# stays unbounded/parallel once a run_id is accepted.
-BENCHMARK_SUBMIT_CONCURRENCY: int = int(os.getenv("BENCHMARK_SUBMIT_CONCURRENCY", 1))
 
 SCORING_QUEUE_CONCURRENCY: int = int(os.getenv("SCORING_QUEUE_CONCURRENCY", 5))
 

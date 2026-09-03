@@ -19,7 +19,6 @@ from competition.precheck_client import PrecheckContainer
 from competition.scoring import final_score, passes_floors, passes_memory_cap
 from validator import store
 
-_HF_RESOLVE = "https://huggingface.co/{repo}/resolve/{revision}/{file}"
 _hf_api = HfApi()
 
 # Coordinator phases bucketed by expected stall tolerance — see
@@ -121,18 +120,35 @@ def precheck_one(
     except Exception as e:
         return PrecheckResult(False, f"HF API list_repo_files failed: {e}")
 
-    gguf_file = next((f for f in files if f.endswith(".gguf")), None)
-    if not gguf_file:
-        return PrecheckResult(False, "no .gguf file found at revision")
+    # Match the submitted filename exactly. Picking "the first .gguf" measures
+    # RAM on, benchmarks, and hashes a file the miner may not have submitted —
+    # and a hash mismatch there bans the hotkey permanently.
+    gguf_file = submission.file
+    if gguf_file:
+        if gguf_file not in files:
+            available = ", ".join(f for f in files if f.endswith(".gguf")) or "none"
+            return PrecheckResult(
+                False,
+                f"submitted file '{gguf_file}' not found at revision (.gguf present: {available})",
+            )
+    else:
+        gguf_file = next((f for f in files if f.endswith(".gguf")), None)
+        if not gguf_file:
+            return PrecheckResult(False, "no .gguf file found at revision")
+        logger.warning(f"{hotkey[:12]} submission has no file field — falling back to {gguf_file}")
 
-    download_url = _HF_RESOLVE.format(
-        repo=submission.repository,
-        revision=submission.huggingface_revision,
-        file=gguf_file,
+    logger.debug(
+        f"{hotkey[:12]} starting precheck | {submission.repository}"
+        f"@{submission.huggingface_revision[:12]}/{gguf_file}"
+        f" | context_length={spec.ram_check_context_length}"
     )
-    logger.debug(f"{hotkey[:12]} starting precheck | url={download_url} | context_length={spec.ram_check_context_length}")
     started = time.monotonic()
-    verdict = precheck_ctr.check(download_url, spec.ram_check_context_length)
+    verdict = precheck_ctr.check(
+        submission.repository,
+        submission.huggingface_revision,
+        gguf_file,
+        spec.ram_check_context_length,
+    )
     logger.debug(f"{hotkey[:12]} precheck call took {time.monotonic() - started:.1f}s")
 
     if verdict.error:

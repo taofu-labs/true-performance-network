@@ -64,7 +64,7 @@ def insert_candidate(conn, hotkey, submission, status="standby", **extra):
 class FakeContainer:
     """Precheck container stub used for tests that only need to get past the
     early guards, not exercise real RAM/sha256/provenance checks."""
-    def check(self, url, context_length):
+    def check(self, repository, revision, filename, context_length):
         from competition.precheck_client import PrecheckVerdict
         return PrecheckVerdict(provenance=None, ram=None, sha256="a" * 64)
 
@@ -85,7 +85,7 @@ def test_precheck_one_fails_when_no_gguf_file(monkeypatch):
     monkeypatch.setattr(scorer._hf_api, "list_repo_files", lambda repo_id, revision: ["config.json", "README.md"])
     result = scorer.precheck_one("hk1", make_submission(), make_spec(), FakeContainer(), make_db())
     assert result.passed is False
-    assert "no .gguf file" in result.reason
+    assert "not found at revision" in result.reason
 
 
 def test_precheck_one_passes_with_measured_ram(monkeypatch):
@@ -95,7 +95,7 @@ def test_precheck_one_passes_with_measured_ram(monkeypatch):
     monkeypatch.setattr(scorer._hf_api, "list_repo_files", lambda repo_id, revision: ["model.gguf"])
 
     class RamContainer:
-        def check(self, url, context_length):
+        def check(self, repository, revision, filename, context_length):
             return PrecheckVerdict(provenance=None, sha256="a" * 64, ram=RamResult(passed=True, ram_bytes=1000 * 1024))
 
     result = scorer.precheck_one("hk1", make_submission(), make_spec(), RamContainer(), make_db())
@@ -111,7 +111,7 @@ def test_precheck_one_bans_on_sha256_mismatch(monkeypatch):
     monkeypatch.setattr(scorer._hf_api, "list_repo_files", lambda repo_id, revision: ["model.gguf"])
 
     class MismatchContainer:
-        def check(self, url, context_length):
+        def check(self, repository, revision, filename, context_length):
             return PrecheckVerdict(provenance=None, ram=None, sha256="f" * 64)
 
     conn = make_db()
@@ -128,7 +128,7 @@ def test_precheck_one_disqualifies_on_max_memory_lie(monkeypatch):
     monkeypatch.setattr(scorer._hf_api, "list_repo_files", lambda repo_id, revision: ["model.gguf"])
 
     class LyingRamContainer:
-        def check(self, url, context_length):
+        def check(self, repository, revision, filename, context_length):
             return PrecheckVerdict(provenance=None, sha256="a" * 64, ram=RamResult(passed=True, ram_bytes=5_000_000))
 
     submission = make_submission(max_memory=1000)  # 1000 KB reported, 5MB ~ 4883 KB measured
@@ -606,3 +606,70 @@ def test_poll_open_benchmarks_lm_eval_running_bucket_survives_zero_startup_windo
 
     candidate = store.get_candidate(conn, "comp1", "hk1")
     assert candidate["status"] == "done"
+
+
+def test_precheck_one_uses_submitted_filename_not_first_gguf(monkeypatch):
+    """The submitted file must be checked, even when another .gguf sorts first."""
+    from competition.precheck_client import PrecheckVerdict, RamResult
+
+    monkeypatch.setattr(scorer, "check_repo_public", lambda repo: True)
+    monkeypatch.setattr(
+        scorer._hf_api, "list_repo_files",
+        lambda repo_id, revision: ["aaa-decoy.gguf", "model.gguf"],
+    )
+
+    seen = {}
+
+    class RecordingContainer:
+        def check(self, repository, revision, filename, context_length):
+            seen["filename"] = filename
+            return PrecheckVerdict(provenance=None, sha256="a" * 64,
+                                   ram=RamResult(passed=True, ram_bytes=1000 * 1024))
+
+    submission = make_submission(file="model.gguf")
+    result = scorer.precheck_one("hk1", submission, make_spec(), RecordingContainer(), make_db())
+    assert seen["filename"] == "model.gguf"
+    assert result.passed is True
+    assert result.gguf_file == "model.gguf"
+
+
+def test_precheck_one_fails_when_submitted_file_absent(monkeypatch):
+    """A missing submitted file fails cleanly — no ban, no fallback to another file."""
+    monkeypatch.setattr(scorer, "check_repo_public", lambda repo: True)
+    monkeypatch.setattr(
+        scorer._hf_api, "list_repo_files",
+        lambda repo_id, revision: ["something-else.gguf"],
+    )
+
+    conn = make_db()
+    submission = make_submission(file="model.gguf")
+    result = scorer.precheck_one("hk1", submission, make_spec(), FakeContainer(), conn)
+    assert result.passed is False
+    assert "not found at revision" in result.reason
+    assert "something-else.gguf" in result.reason
+    assert store.is_banned(conn, "hk1") is False
+
+
+def test_precheck_one_falls_back_to_first_gguf_when_file_empty(monkeypatch):
+    """Legacy submissions with no file field still resolve to the first .gguf."""
+    from competition.precheck_client import PrecheckVerdict, RamResult
+
+    monkeypatch.setattr(scorer, "check_repo_public", lambda repo: True)
+    monkeypatch.setattr(
+        scorer._hf_api, "list_repo_files",
+        lambda repo_id, revision: ["first.gguf", "second.gguf"],
+    )
+
+    seen = {}
+
+    class RecordingContainer:
+        def check(self, repository, revision, filename, context_length):
+            seen["filename"] = filename
+            return PrecheckVerdict(provenance=None, sha256="a" * 64,
+                                   ram=RamResult(passed=True, ram_bytes=1000 * 1024))
+
+    submission = make_submission()
+    object.__setattr__(submission, "file", "")  # pre-`file` payload shape
+    result = scorer.precheck_one("hk1", submission, make_spec(), RecordingContainer(), make_db())
+    assert seen["filename"] == "first.gguf"
+    assert result.passed is True

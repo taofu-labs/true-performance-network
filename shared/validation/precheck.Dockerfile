@@ -35,7 +35,7 @@ RUN pip install --no-cache-dir \
         requests==2.32.3 \
         gguf>=0.19.0 \
         numpy>=2.2.0 \
-        huggingface_hub>=0.23.0
+        huggingface_hub>=1.2.0
 
 COPY provenance_check.py precheck_api.py ./
 

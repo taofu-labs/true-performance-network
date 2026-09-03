@@ -2,7 +2,15 @@ import hashlib
 import subprocess
 from unittest.mock import patch
 
-from precheck_api import _RE_KV, _RE_WEIGHTS, _run_llama_cli, _sha256_file
+from precheck_api import (
+    _RE_KV,
+    _RE_WEIGHTS,
+    CheckRequest,
+    _DownloadError,
+    _download_hf,
+    _run_llama_cli,
+    _sha256_file,
+)
 
 
 def test_re_weights_extracts_last_match_in_mib():
@@ -92,3 +100,41 @@ def test_check_local_path_traversal_guard():
 
     traversal = Path("/data/../etc/passwd").resolve()
     assert not str(traversal).startswith(str(data_root))
+
+
+def test_download_hf_wraps_hub_failure_as_download_error():
+    """A hub failure must surface as _DownloadError so /check returns 422, not 500."""
+    with patch("precheck_api.hf_hub_download", side_effect=OSError("connection reset")):
+        try:
+            _download_hf("user/repo", "a" * 40, "model.gguf", "/tmp")
+        except _DownloadError as e:
+            assert "OSError" in str(e)
+            assert "connection reset" in str(e)
+        else:
+            raise AssertionError("expected _DownloadError")
+
+
+def test_download_hf_passes_hub_coordinates_through():
+    with patch("precheck_api.hf_hub_download", return_value="/tmp/model.gguf") as m:
+        path = _download_hf("user/repo", "b" * 40, "model.gguf", "/tmp/dest")
+    assert path == "/tmp/model.gguf"
+    kwargs = m.call_args.kwargs
+    assert kwargs["repo_id"] == "user/repo"
+    assert kwargs["revision"] == "b" * 40
+    assert kwargs["filename"] == "model.gguf"
+    assert kwargs["local_dir"] == "/tmp/dest"
+
+
+def test_check_request_requires_hub_coordinates():
+    """The legacy {"url": ...} body must no longer validate."""
+    import pydantic
+
+    try:
+        CheckRequest(url="https://huggingface.co/user/repo/resolve/abc/model.gguf")
+    except pydantic.ValidationError:
+        pass
+    else:
+        raise AssertionError("expected ValidationError for legacy url-only body")
+
+    req = CheckRequest(repository="user/repo", revision="c" * 40, filename="model.gguf")
+    assert req.context_length == 4096

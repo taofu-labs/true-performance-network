@@ -150,7 +150,7 @@ def test_launch_does_not_wait_for_health(monkeypatch):
 
 def test_check_returns_error_when_not_started():
     ctr = make_container()
-    verdict = ctr.check("https://example.com/model.gguf")
+    verdict = ctr.check("user/repo", "a" * 40, "model.gguf")
     assert verdict.error == "container not running"
 
 
@@ -158,7 +158,7 @@ def test_check_never_raises_on_connection_error(monkeypatch):
     ctr = make_container()
     ctr._container_name = "fake-container"
     monkeypatch.setattr(requests, "post", lambda *a, **k: (_ for _ in ()).throw(requests.ConnectionError("refused")))
-    verdict = ctr.check("https://example.com/model.gguf")
+    verdict = ctr.check("user/repo", "a" * 40, "model.gguf")
     assert verdict.error is not None
     assert "connection error" in verdict.error
 
@@ -167,7 +167,7 @@ def test_check_never_raises_on_timeout(monkeypatch):
     ctr = make_container()
     ctr._container_name = "fake-container"
     monkeypatch.setattr(requests, "post", lambda *a, **k: (_ for _ in ()).throw(requests.Timeout()))
-    verdict = ctr.check("https://example.com/model.gguf")
+    verdict = ctr.check("user/repo", "a" * 40, "model.gguf")
     assert verdict.error is not None
     assert "timed out" in verdict.error
 
@@ -179,7 +179,7 @@ def test_check_503_returns_not_ready_error(monkeypatch):
     class _Resp:
         status_code = 503
     monkeypatch.setattr(requests, "post", lambda *a, **k: _Resp())
-    verdict = ctr.check("https://example.com/model.gguf")
+    verdict = ctr.check("user/repo", "a" * 40, "model.gguf")
     assert "not ready" in verdict.error
 
 

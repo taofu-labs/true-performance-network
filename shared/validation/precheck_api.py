@@ -11,8 +11,9 @@ Endpoints:
   GET  /health
     → {"ready": bool, "error": str|null}
 
-  POST /check {"url": "https://...", "context_length": 4096}
-    Validator path. Downloads submitted GGUF, runs all checks, deletes it.
+  POST /check {"repository": "user/repo", "revision": "<sha>",
+               "filename": "model.gguf", "context_length": 4096}
+    Validator path. Downloads the GGUF from the Hub, runs all checks, deletes it.
     → PrecheckResponse
 
   POST /check-local {"path": "/data/model.gguf", "context_length": 4096}
@@ -30,11 +31,14 @@ PrecheckResponse:
 import hashlib
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
 import threading
+import time
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from pathlib import Path
 
 try:
@@ -42,13 +46,12 @@ try:
     from fastapi.responses import JSONResponse
     from pydantic import BaseModel as ApiModel
     import uvicorn
-    import requests as http_requests
 except ImportError:
-    print("ERROR: pip install fastapi uvicorn requests", file=sys.stderr)
+    print("ERROR: pip install fastapi uvicorn", file=sys.stderr)
     sys.exit(2)
 
 try:
-    from huggingface_hub import snapshot_download
+    from huggingface_hub import hf_hub_download, snapshot_download
 except ImportError:
     print("ERROR: pip install huggingface_hub", file=sys.stderr)
     sys.exit(2)
@@ -63,18 +66,28 @@ from provenance_check import check_provenance
 BASE_MODEL_REPO: str = os.environ.get("BASE_MODEL_REPO", "")
 BASE_MODEL_DIR: Path = Path("/base_model")
 MAX_MODEL_BYTES: int = int(os.environ.get("MAX_MODEL_BYTES", str(50 * 1024 ** 3)))  # 50 GiB
-DOWNLOAD_TIMEOUT_SECONDS: int = int(os.environ.get("DOWNLOAD_TIMEOUT_SECONDS", "600"))
 BASE_MODEL_DOWNLOAD_TIMEOUT_SECONDS: int = int(os.environ.get("BASE_MODEL_DOWNLOAD_TIMEOUT_SECONDS", "7200"))
 CKA_THRESHOLD: float = float(os.environ.get("CKA_THRESHOLD", "0.80"))
 N_TOKENS: int = int(os.environ.get("N_TOKENS", "4096"))
 RAM_CHECK_TIMEOUT_SECONDS: int = int(os.environ.get("RAM_CHECK_TIMEOUT_SECONDS", "600"))
 LLAMA_THREADS: int = int(os.environ.get("LLAMA_THREADS", "8"))
 PRECHECK_LOG_LEVEL: str = os.environ.get("PRECHECK_LOG_LEVEL", "INFO")
+HF_TOKEN: str = os.environ.get("HF_TOKEN", "")
+
+
+_STARTED = time.monotonic()
+
+
+def _log(msg: str, level: str = "INFO") -> None:
+    """Timestamped stderr line: wall-clock UTC + seconds since process start."""
+    stamp = datetime.now(timezone.utc).strftime("%H:%M:%S")
+    print(f"{stamp} +{time.monotonic() - _STARTED:7.1f}s {level}: {msg}",
+          file=sys.stderr, flush=True)
 
 
 def _debug(msg: str) -> None:
     if PRECHECK_LOG_LEVEL == "DEBUG":
-        print(f"DEBUG: {msg}", file=sys.stderr, flush=True)
+        _log(msg, "DEBUG")
 
 # ---------------------------------------------------------------------------
 # App + state
@@ -90,24 +103,29 @@ def _download_base_model() -> None:
         _ready.set()
         return
 
-    print(f"Downloading base model: {BASE_MODEL_REPO} -> {BASE_MODEL_DIR}", flush=True)
+    _log(f"Downloading base model: {BASE_MODEL_REPO} -> {BASE_MODEL_DIR}")
+    started = time.monotonic()
     try:
         BASE_MODEL_DIR.mkdir(parents=True, exist_ok=True)
         snapshot_download(
             repo_id=BASE_MODEL_REPO,
             local_dir=str(BASE_MODEL_DIR),
             ignore_patterns=["*.md", ".gitattributes", "*.txt"],
+            token=HF_TOKEN or None,
         )
+        elapsed = max(time.monotonic() - started, 1e-6)
         ggufs = list(BASE_MODEL_DIR.rglob("*.gguf"))
         if not ggufs:
             _startup_error = f"No .gguf files found in {BASE_MODEL_REPO}"
-            print(f"ERROR: {_startup_error}", file=sys.stderr)
+            _log(_startup_error, "ERROR")
             return
-        print(f"Base model ready: {ggufs[0]}", flush=True)
+        total = sum(f.stat().st_size for f in ggufs)
+        _log(f"Base model ready: {ggufs[0]} ({total:,} bytes in {elapsed:.1f}s, "
+             f"{total / elapsed / 1e6:.1f} MB/s)")
         _ready.set()
     except Exception as e:
-        _startup_error = f"Base model download failed: {e}"
-        print(f"ERROR: {_startup_error}", file=sys.stderr)
+        _startup_error = f"Base model download failed after {time.monotonic() - started:.1f}s: {e}"
+        _log(_startup_error, "ERROR")
 
 
 @asynccontextmanager
@@ -121,7 +139,7 @@ async def lifespan(app):
             _startup_error = (
                 f"base model download timed out after {BASE_MODEL_DOWNLOAD_TIMEOUT_SECONDS}s"
             )
-            print(f"ERROR: {_startup_error}", file=sys.stderr)
+            _log(_startup_error, "ERROR")
     threading.Thread(target=_with_timeout, daemon=True).start()
     yield
 
@@ -130,7 +148,9 @@ app = FastAPI(title="TPN Precheck API", docs_url=None, redoc_url=None, lifespan=
 
 
 class CheckRequest(ApiModel):
-    url: str
+    repository: str          # bare HF repo id, "user/repo"
+    revision: str            # immutable commit SHA
+    filename: str            # file within the repo, e.g. "model.gguf"
     context_length: int = 4096
 
 
@@ -153,24 +173,31 @@ def check(req: CheckRequest) -> JSONResponse:
     if not _ready.is_set():
         raise HTTPException(status_code=503, detail=_startup_error or "not ready")
 
-    url = req.url.strip()
-    if not url.startswith("https://"):
-        raise HTTPException(status_code=400, detail="url must start with https://")
-
-    tmp_path: str = ""
+    tmp_dir = tempfile.mkdtemp(prefix="candidate-")
     try:
-        tmp_fd, tmp_path = tempfile.mkstemp(suffix=".gguf")
-        os.close(tmp_fd)
+        _log(f"Downloading {req.repository}@{req.revision[:12]}/{req.filename}")
+        started = time.monotonic()
         try:
-            print(f"Downloading {url}", flush=True)
-            _download_url(url, tmp_path)
-            _debug(f"Downloaded {Path(tmp_path).stat().st_size:,} bytes to {tmp_path}")
+            gguf_path = _download_hf(req.repository, req.revision, req.filename, tmp_dir)
         except _DownloadError as e:
-            raise HTTPException(status_code=422, detail=f"download failed: {e}")
+            raise HTTPException(
+                status_code=422,
+                detail=f"download failed after {time.monotonic() - started:.1f}s: {e}",
+            )
 
-        return JSONResponse(_run_checks(tmp_path, req.context_length, run_provenance=True))
+        elapsed = max(time.monotonic() - started, 1e-6)
+        size = Path(gguf_path).stat().st_size
+        _log(f"Downloaded {size:,} bytes in {elapsed:.1f}s ({size / elapsed / 1e6:.1f} MB/s)")
+
+        if size > MAX_MODEL_BYTES:
+            raise HTTPException(
+                status_code=422,
+                detail=f"file too large: {size:,} bytes > cap {MAX_MODEL_BYTES:,}",
+            )
+
+        return JSONResponse(_run_checks(gguf_path, req.context_length, run_provenance=True))
     finally:
-        _delete(tmp_path)
+        shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
 @app.post("/check-local")
@@ -198,7 +225,7 @@ def _run_checks(gguf_path: str, context_length: int, run_provenance: bool) -> di
     try:
         return _run_checks_inner(gguf_path, context_length, run_provenance)
     except Exception as e:
-        print(f"Checks failed unexpectedly for {gguf_path}: {e}", file=sys.stderr, flush=True)
+        _log(f"Checks failed unexpectedly for {gguf_path}: {e}", "ERROR")
         return {"provenance": None, "ram": None, "sha256": None, "error": f"precheck error: {e}"}
 
 
@@ -208,7 +235,9 @@ def _run_checks_inner(gguf_path: str, context_length: int, run_provenance: bool)
     error = None
 
     size_bytes = Path(gguf_path).stat().st_size
-    print(f"Running checks on {gguf_path} ({size_bytes:,} bytes, context_length={context_length}, provenance={run_provenance})", flush=True)
+    checks_started = time.monotonic()
+    _log(f"Running checks on {gguf_path} ({size_bytes:,} bytes, "
+         f"context_length={context_length}, provenance={run_provenance})")
 
     # Provenance check
     if run_provenance and BASE_MODEL_REPO:
@@ -217,6 +246,7 @@ def _run_checks_inner(gguf_path: str, context_length: int, run_provenance: bool)
             error = "base model GGUF missing"
         else:
             _debug(f"Provenance check: base={base_ggufs[0]} candidate={gguf_path}")
+            phase_started = time.monotonic()
             try:
                 result = check_provenance(
                     path_a=str(base_ggufs[0]),
@@ -234,33 +264,38 @@ def _run_checks_inner(gguf_path: str, context_length: int, run_provenance: bool)
                     "cka": result.embeddings.cka if result.embeddings else 0.0,
                     "notes": notes,
                 }
-                _debug(f"Provenance result: is_derivative={result.is_derivative} cka={provenance_result['cka']:.3f} notes={notes}")
+                _log(f"Provenance done in {time.monotonic() - phase_started:.1f}s: "
+                     f"is_derivative={result.is_derivative} cka={provenance_result['cka']:.3f}")
+                _debug(f"Provenance notes={notes}")
             except Exception as e:
-                error = f"provenance check error: {e}"
+                error = f"provenance check error after {time.monotonic() - phase_started:.1f}s: {e}"
 
     # RAM check (always, even if provenance errored — independent gate)
     _debug(f"Starting RAM check (context_length={context_length})")
+    phase_started = time.monotonic()
     try:
         ram_result, ram_reason = _run_llama_cli(gguf_path, context_length)
-        _debug(f"RAM check result: {ram_result}")
+        _log(f"RAM check done in {time.monotonic() - phase_started:.1f}s: {ram_result}")
         if ram_reason and not error:
             error = f"ram check failed: {ram_reason}"
     except Exception as e:
         ram_result = _failed_ram()
         if not error:
-            error = f"ram check error: {e}"
+            error = f"ram check error after {time.monotonic() - phase_started:.1f}s: {e}"
 
     # sha256 (always, independent of provenance/ram outcome)
     sha256_result = None
+    phase_started = time.monotonic()
     try:
         _debug("Computing sha256")
         sha256_result = _sha256_file(gguf_path)
-        _debug(f"sha256={sha256_result}")
+        _log(f"sha256 done in {time.monotonic() - phase_started:.1f}s: {sha256_result}")
     except Exception as e:
         if not error:
             error = f"sha256 check error: {e}"
 
-    print(f"Checks complete for {gguf_path}: error={error}", flush=True)
+    _log(f"Checks complete for {gguf_path} in {time.monotonic() - checks_started:.1f}s total: "
+         f"error={error}")
     return {"provenance": provenance_result, "ram": ram_result, "sha256": sha256_result, "error": error}
 
 
@@ -308,7 +343,7 @@ def _run_llama_cli(gguf_path: str, context_length: int) -> tuple[dict, str | Non
         )
     except subprocess.TimeoutExpired:
         reason = f"llama-cli timed out after {RAM_CHECK_TIMEOUT_SECONDS}s (context_length={context_length})"
-        print(reason, file=sys.stderr)
+        _log(reason, "ERROR")
         return _failed_ram(), reason
 
     # llama-cli's generated output (--verbose logs the inference response) can
@@ -320,7 +355,7 @@ def _run_llama_cli(gguf_path: str, context_length: int) -> tuple[dict, str | Non
         # negative returncode == killed by signal (e.g. -9 SIGKILL from OOM killer)
         sig_note = f" (killed by signal {-result.returncode})" if result.returncode < 0 else ""
         reason = f"llama-cli exit {result.returncode}{sig_note}: {combined[-500:]}"
-        print(reason, file=sys.stderr)
+        _log(reason, "ERROR")
         return _failed_ram(), reason
 
     w_matches = _RE_WEIGHTS.findall(combined)
@@ -329,7 +364,7 @@ def _run_llama_cli(gguf_path: str, context_length: int) -> tuple[dict, str | Non
     if not w_matches or not kv_matches:
         missing = "weights" if not w_matches else "kv-cache"
         reason = f"llama-cli log parse failed (missing {missing} buffer line)"
-        print(f"{reason}. tail:\n{combined[-1000:]}", file=sys.stderr)
+        _log(f"{reason}. tail:\n{combined[-1000:]}", "ERROR")
         return _failed_ram(), reason
 
     weights_bytes = int(float(w_matches[-1]) * 1024 * 1024)
@@ -351,43 +386,51 @@ class _DownloadError(Exception):
     pass
 
 
-def _download_url(url: str, dest: str) -> None:
-    try:
-        resp = http_requests.get(url, stream=True, timeout=DOWNLOAD_TIMEOUT_SECONDS, allow_redirects=True)
-    except Exception as e:
-        raise _DownloadError(f"request failed: {e}")
-
-    if resp.status_code == 404:
-        raise _DownloadError("file not found (404)")
-    if resp.status_code in (401, 403):
-        raise _DownloadError(f"access denied ({resp.status_code}) — repo must be public")
-    if not resp.ok:
-        raise _DownloadError(f"HTTP {resp.status_code}")
-
-    content_length = resp.headers.get("Content-Length")
-    if content_length and int(content_length) > MAX_MODEL_BYTES:
-        raise _DownloadError(f"file too large: {int(content_length):,} bytes > cap {MAX_MODEL_BYTES:,}")
-
-    written = 0
-    try:
-        with open(dest, "wb") as f:
-            for chunk in resp.iter_content(chunk_size=8 * 1024 * 1024):
-                written += len(chunk)
-                if written > MAX_MODEL_BYTES:
-                    raise _DownloadError(f"download exceeded cap {MAX_MODEL_BYTES:,} bytes mid-stream")
-                f.write(chunk)
-    except _DownloadError:
-        raise
-    except Exception as e:
-        raise _DownloadError(f"write error: {e}")
+PROGRESS_INTERVAL_SECONDS = 15.0
 
 
-def _delete(path: str) -> None:
-    if path and Path(path).exists():
+def _log_progress(done: threading.Event, dest_dir: str) -> None:
+    """
+    Log bytes-on-disk every PROGRESS_INTERVAL_SECONDS until `done` is set.
+
+    Watches the destination rather than hooking the hub's tqdm bars: the hub
+    runs several bars (CAS fetch and file reconstruction) whose counters do not
+    agree, and tqdm's carriage-return redraw is unreadable in `docker logs`
+    anyway. Bytes landing on disk is the one number that means what it says.
+    """
+    started = time.monotonic()
+    while not done.wait(PROGRESS_INTERVAL_SECONDS):
         try:
-            Path(path).unlink()
-        except Exception:
-            pass
+            size = sum(f.stat().st_size for f in Path(dest_dir).rglob("*") if f.is_file())
+        except OSError:
+            continue
+        elapsed = max(time.monotonic() - started, 1e-6)
+        _log(f"  downloading: {size:,} bytes ({size / elapsed / 1e6:.1f} MB/s avg)")
+
+
+def _download_hf(repository: str, revision: str, filename: str, dest_dir: str) -> str:
+    """
+    Fetch one file from the Hub into dest_dir; returns its local path.
+
+    Uses huggingface_hub rather than a hand-rolled stream: it downloads in
+    parallel ranged chunks, retries on 429 using the RateLimit header, and
+    resumes partial transfers. A single long-lived HTTP stream against the
+    /resolve/ endpoint degrades badly on multi-GB files.
+    """
+    done = threading.Event()
+    threading.Thread(target=_log_progress, args=(done, dest_dir), daemon=True).start()
+    try:
+        return hf_hub_download(
+            repo_id=repository,
+            filename=filename,
+            revision=revision,
+            local_dir=dest_dir,
+            token=HF_TOKEN or None,
+        )
+    except Exception as e:
+        raise _DownloadError(f"{type(e).__name__}: {e}")
+    finally:
+        done.set()
 
 
 def _sha256_file(path: str) -> str:

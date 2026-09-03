@@ -8,12 +8,12 @@ The precheck container runs two checks on each submitted GGUF (one download each
 Lifecycle (per scoring run):
     ctr = PrecheckContainer(competition_id="comp1", base_repo=spec.model_repo)
     ctr.start()                                          # blocks until /health ready
-    verdict = ctr.check(url, context_length=4096)
+    verdict = ctr.check(repository, revision, filename, context_length=4096)
     ctr.stop()
 
 Or use as context manager:
     with PrecheckContainer(competition_id="comp1", base_repo=spec.model_repo) as ctr:
-        verdict = ctr.check(url)
+        verdict = ctr.check(repository, revision, filename)
 
 Non-blocking equivalents: launch() (start without waiting), is_container_up(),
 stop_container(competition_id).
@@ -27,6 +27,8 @@ Config (env):
     PRECHECK_HEALTH_POLL    Seconds between /health polls (default: 15)
     PRECHECK_CHECK_TIMEOUT  HTTP timeout for /check calls (default: 900)
     BASE_MODEL_DOWNLOAD_TIMEOUT_SECONDS  Forwarded to container (default: 7200)
+    HF_TOKEN                Forwarded to container for authenticated Hub downloads
+                            (optional; raises HF rate limits)
 """
 import hashlib
 import os
@@ -52,6 +54,7 @@ _HEALTH_TIMEOUT   = int(os.environ.get("PRECHECK_HEALTH_TIMEOUT", "7200"))
 _HEALTH_POLL      = int(os.environ.get("PRECHECK_HEALTH_POLL", "15"))
 _CHECK_TIMEOUT    = int(os.environ.get("PRECHECK_CHECK_TIMEOUT", "900"))
 _BASE_DL_TIMEOUT  = os.environ.get("BASE_MODEL_DOWNLOAD_TIMEOUT_SECONDS", "7200")
+_HF_TOKEN         = os.environ.get("HF_TOKEN", "")
 
 
 def container_name(competition_id: str) -> str:
@@ -143,6 +146,8 @@ class PrecheckContainer:
         if self._base_repo:
             cmd += ["-e", f"BASE_MODEL_REPO={self._base_repo}",
                     "-e", f"BASE_MODEL_DOWNLOAD_TIMEOUT_SECONDS={_BASE_DL_TIMEOUT}"]
+        if _HF_TOKEN:
+            cmd += ["-e", f"HF_TOKEN={_HF_TOKEN}"]
         cmd.append(self._image)
 
         logger.info(f"Starting precheck container {self._name} (base_repo={self._base_repo or 'none'})")
@@ -182,9 +187,16 @@ class PrecheckContainer:
 
     # ── Check ──────────────────────────────────────────────────────────
 
-    def check(self, gguf_download_url: str, context_length: int = 4096) -> PrecheckVerdict:
+    def check(
+        self,
+        repository: str,
+        revision: str,
+        filename: str,
+        context_length: int = 4096,
+    ) -> PrecheckVerdict:
         """
-        POST download URL to container; runs provenance + RAM check; deletes GGUF.
+        POST the Hub coordinates to the container; runs provenance + RAM check;
+        deletes the GGUF. The container downloads via huggingface_hub.
         Never raises — returns PrecheckVerdict with error set on failure.
         """
         if not self._container_name:
@@ -193,7 +205,12 @@ class PrecheckContainer:
         try:
             resp = requests.post(
                 f"{self._base_url}/check",
-                json={"url": gguf_download_url, "context_length": context_length},
+                json={
+                    "repository": repository,
+                    "revision": revision,
+                    "filename": filename,
+                    "context_length": context_length,
+                },
                 timeout=self._check_timeout,
             )
         except requests.Timeout:

@@ -27,7 +27,7 @@ dev = [
     "pytest-mock>=3.14.1",
     "fastapi>=0.110.0",
     "uvicorn>=0.29.0",
-    "huggingface_hub>=0.23.0",
+    "huggingface_hub>=1.2.0",
     "requests>=2.31.0",
 ]
 

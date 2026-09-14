@@ -36,6 +36,12 @@ def make_app(conn):
         "/v1/competitions/{competition_id}/reset-scoring",
         _require_admin_auth(v._h_reset_competition_scoring),
     )
+    app.router.add_post(
+        "/v1/competitions/{competition_id}/pause", _require_admin_auth(v._h_pause_competition)
+    )
+    app.router.add_post(
+        "/v1/competitions/{competition_id}/resume", _require_admin_auth(v._h_resume_competition)
+    )
     return app
 
 
@@ -571,3 +577,132 @@ async def test_reset_scoring_refuses_when_window_closed(conn, monkeypatch):
         assert body["current_block"] == 500
         assert body["scoring_end_block"] == 200
         assert store.is_scored(conn, "comp1") is True
+
+
+# ── pause / resume ───────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_pause_requires_auth(conn, monkeypatch):
+    monkeypatch.setattr(validator_settings, "ADMIN_API_KEY", "secret-key")
+    async with TestClient(TestServer(make_app(conn))) as client:
+        await _seed_open_competition(client)
+        resp = await client.post("/v1/competitions/comp1/pause")
+        assert resp.status == 401
+        assert store.is_paused(conn, "comp1") is False
+
+
+@pytest.mark.asyncio
+async def test_pause_unknown_competition_404(conn, monkeypatch):
+    monkeypatch.setattr(validator_settings, "ADMIN_API_KEY", "secret-key")
+    async with TestClient(TestServer(make_app(conn))) as client:
+        resp = await client.post(
+            "/v1/competitions/ghost/pause", headers={"Authorization": "Bearer secret-key"}
+        )
+        assert resp.status == 404
+
+
+@pytest.mark.asyncio
+async def test_pause_sets_flag_and_is_idempotent(conn, monkeypatch):
+    monkeypatch.setattr(validator_settings, "ADMIN_API_KEY", "secret-key")
+    async with TestClient(TestServer(make_app(conn))) as client:
+        await _seed_open_competition(client)
+
+        resp = await client.post(
+            "/v1/competitions/comp1/pause", headers={"Authorization": "Bearer secret-key"}
+        )
+        assert resp.status == 200
+        body = await resp.json()
+        assert body["paused"] is True
+        assert body["paused_at"] is not None
+        assert store.is_paused(conn, "comp1") is True
+
+        # re-pausing is a 200, not a conflict
+        resp = await client.post(
+            "/v1/competitions/comp1/pause", headers={"Authorization": "Bearer secret-key"}
+        )
+        assert resp.status == 200
+        assert store.is_paused(conn, "comp1") is True
+
+
+@pytest.mark.asyncio
+async def test_resume_clears_pause(conn, monkeypatch):
+    monkeypatch.setattr(validator_settings, "ADMIN_API_KEY", "secret-key")
+    async with TestClient(TestServer(make_app(conn))) as client:
+        await _seed_open_competition(client)
+        await client.post(
+            "/v1/competitions/comp1/pause", headers={"Authorization": "Bearer secret-key"}
+        )
+        assert store.is_paused(conn, "comp1") is True
+
+        resp = await client.post(
+            "/v1/competitions/comp1/resume", headers={"Authorization": "Bearer secret-key"}
+        )
+        assert resp.status == 200
+        body = await resp.json()
+        assert body["paused"] is False
+        assert body["paused_at"] is None
+        assert store.is_paused(conn, "comp1") is False
+
+
+@pytest.mark.asyncio
+async def test_pause_refuses_finished_competition(conn, monkeypatch):
+    monkeypatch.setattr(validator_settings, "ADMIN_API_KEY", "secret-key")
+    async with TestClient(TestServer(make_app(conn))) as client:
+        await _seed_open_competition(client)
+        store.mark_scored(conn, "comp1", status="scored")
+
+        resp = await client.post(
+            "/v1/competitions/comp1/pause", headers={"Authorization": "Bearer secret-key"}
+        )
+        assert resp.status == 409
+        assert store.is_paused(conn, "comp1") is False
+
+
+@pytest.mark.asyncio
+async def test_pause_does_not_block_resume_of_finished_competition(conn, monkeypatch):
+    """Resume has no guard — unpausing anything is always safe."""
+    monkeypatch.setattr(validator_settings, "ADMIN_API_KEY", "secret-key")
+    async with TestClient(TestServer(make_app(conn))) as client:
+        await _seed_open_competition(client)
+        await client.post(
+            "/v1/competitions/comp1/pause", headers={"Authorization": "Bearer secret-key"}
+        )
+        store.mark_scored(conn, "comp1", status="scored")
+
+        resp = await client.post(
+            "/v1/competitions/comp1/resume", headers={"Authorization": "Bearer secret-key"}
+        )
+        assert resp.status == 200
+        assert store.is_paused(conn, "comp1") is False
+
+
+@pytest.mark.asyncio
+async def test_reset_scoring_clears_pause(conn, monkeypatch):
+    """reset-scoring drops the scored_competitions row, so it implicitly resumes."""
+    monkeypatch.setattr(validator_settings, "ADMIN_API_KEY", "secret-key")
+    async with TestClient(TestServer(make_app(conn))) as client:
+        await _seed_open_competition(client)
+        await client.post(
+            "/v1/competitions/comp1/pause", headers={"Authorization": "Bearer secret-key"}
+        )
+        assert store.is_paused(conn, "comp1") is True
+
+        resp = await client.post(
+            "/v1/competitions/comp1/reset-scoring", headers={"Authorization": "Bearer secret-key"}
+        )
+        assert resp.status == 200
+        assert store.is_paused(conn, "comp1") is False
+
+
+@pytest.mark.asyncio
+async def test_pause_surfaces_in_full_state(conn, monkeypatch):
+    monkeypatch.setattr(validator_settings, "ADMIN_API_KEY", "secret-key")
+    async with TestClient(TestServer(make_app(conn))) as client:
+        await _seed_open_competition(client)
+        await client.post(
+            "/v1/competitions/comp1/pause", headers={"Authorization": "Bearer secret-key"}
+        )
+        resp = await client.get("/v1/state/competitions/comp1")
+        assert resp.status == 200
+        assert (await resp.json())["paused_at"] is not None

@@ -148,3 +148,22 @@ weights history stays as an audit trail of what was already set on chain.
 
 After a reset the leader picks the competition up on its next loop tick; no restart
 needed.
+
+`POST /v1/competitions/{competition_id}/pause` (requires `Authorization: Bearer <ADMIN_API_KEY>`)
+`POST /v1/competitions/{competition_id}/resume` (requires `Authorization: Bearer <ADMIN_API_KEY>`)
+
+Halt the leader's scoring loop for one competition, and start it again — for stopping
+a competition mid-flight without losing its state.
+
+Pause stops only the leader's per-tick scoring work (stage 1 and stage 2) for that
+competition. Weights already recorded keep distributing, followers are unaffected, and
+block-based phases keep advancing — a long pause can run a competition past its
+`scoring_end_block`, and the next unpaused tick then finalizes it with whatever was
+scored.
+
+Takes effect at the next tick boundary; work already in flight finishes. Candidates
+left in `prechecking` or `benchmarking` keep that status and resume from there.
+
+Both routes are idempotent. 404 if not found. Pause returns 409 once a competition has
+finished scoring; resume has no such guard. `reset-scoring` clears the flag along with
+the rest of the row. `paused_at` is exposed on `GET /v1/state/competitions/{id}`.

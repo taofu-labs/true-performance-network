@@ -70,6 +70,14 @@ class LeaderApiMixin:
             "/v1/competitions/{competition_id}/reset-scoring",
             _require_admin_auth(self._h_reset_competition_scoring),
         )
+        app.router.add_post(
+            "/v1/competitions/{competition_id}/pause",
+            _require_admin_auth(self._h_pause_competition),
+        )
+        app.router.add_post(
+            "/v1/competitions/{competition_id}/resume",
+            _require_admin_auth(self._h_resume_competition),
+        )
 
         self.leader_api_runner = web.AppRunner(app)
         await self.leader_api_runner.setup()
@@ -238,4 +246,37 @@ class LeaderApiMixin:
             "previous_stage": stage,
             "previous_status": previous_status,
             "deleted": deleted,
+        })
+
+    async def _h_pause_competition(self, request: web.Request) -> web.Response:
+        return await self._set_competition_paused(request, paused=True)
+
+    async def _h_resume_competition(self, request: web.Request) -> web.Response:
+        return await self._set_competition_paused(request, paused=False)
+
+    async def _set_competition_paused(self, request: web.Request, paused: bool) -> web.Response:
+        """Set or clear one competition's pause flag. Idempotent."""
+        competition_id = request.match_info["competition_id"]
+        if store.get_competition(self._db, competition_id) is None:
+            return web.json_response({"error": "competition not found"}, status=404)
+
+        if paused and store.is_scored(self._db, competition_id):
+            return web.json_response(
+                {
+                    "error": "competition has already finished scoring; nothing to pause",
+                    "stage": store.get_stage(self._db, competition_id),
+                    "scored_status": store.scored_status(self._db, competition_id),
+                },
+                status=409,
+            )
+
+        store.set_paused(self._db, competition_id, paused)
+        logger.warning(
+            f"Competition {competition_id} {'paused' if paused else 'resumed'} via admin API"
+        )
+        return web.json_response({
+            "competition_id": competition_id,
+            "paused": paused,
+            "paused_at": store.paused_at(self._db, competition_id),
+            "stage": store.get_stage(self._db, competition_id),
         })

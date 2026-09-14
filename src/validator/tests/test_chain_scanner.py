@@ -56,9 +56,20 @@ def test_scan_reveals_accepts_exact_block_match(monkeypatch):
     assert set(result) == {"hk1"}
 
 
+def test_scan_reveals_accepts_grace_blocks_before_commit_end(monkeypatch):
+    """The window is symmetric around commit_end_block — a reveal landing up to
+    grace_blocks early still counts."""
+    spec = make_spec(commit_end_block=100)
+    reveals = {"hk1": [(make_payload(), 100 - GRACE)]}
+    monkeypatch.setattr("validator.chain_scanner.read_revealed_commitments", lambda subtensor, netuid: reveals)
+
+    result = scan_reveals(FakeSubtensor(reveals), spec, make_db())
+    assert set(result) == {"hk1"}
+
+
 def test_scan_reveals_rejects_block_before_window(monkeypatch):
     spec = make_spec(commit_end_block=100)
-    reveals = {"hk1": [(make_payload(), 99)]}
+    reveals = {"hk1": [(make_payload(), 100 - GRACE - 1)]}
     monkeypatch.setattr("validator.chain_scanner.read_revealed_commitments", lambda subtensor, netuid: reveals)
 
     result = scan_reveals(FakeSubtensor(reveals), spec, make_db())

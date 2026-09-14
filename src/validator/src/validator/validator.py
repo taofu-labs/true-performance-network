@@ -135,6 +135,9 @@ class Validator(HealthServerMixin, LeaderApiMixin):
                     elif phase == CompetitionPhase.SCORING:
                         if store.is_scored(self._db, spec.id):
                             continue
+                        if store.is_paused(self._db, spec.id):
+                            logger.info(f"{spec.id}: paused — skipping scoring tick")
+                            continue
                         stage = store.get_stage(self._db, spec.id)
                         if stage == "stage1_ranking":
                             await self.run_stage_1(spec)

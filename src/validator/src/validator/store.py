@@ -47,7 +47,8 @@ CREATE TABLE IF NOT EXISTS scored_competitions (
     stage TEXT NOT NULL DEFAULT 'stage1_ranking',
     stage1_attempts INTEGER NOT NULL DEFAULT 0,
     scored_at REAL,
-    status TEXT NOT NULL DEFAULT 'scoring'
+    status TEXT NOT NULL DEFAULT 'scoring',
+    paused_at REAL
 );
 
 CREATE TABLE IF NOT EXISTS revealed_candidates (
@@ -192,6 +193,8 @@ def _migrate_scored_competitions_stage_columns(conn: sqlite3.Connection) -> None
         conn.execute("ALTER TABLE scored_competitions ADD COLUMN stage TEXT NOT NULL DEFAULT 'finalized'")
     if "stage1_attempts" not in existing:
         conn.execute("ALTER TABLE scored_competitions ADD COLUMN stage1_attempts INTEGER NOT NULL DEFAULT 0")
+    if "paused_at" not in existing:
+        conn.execute("ALTER TABLE scored_competitions ADD COLUMN paused_at REAL")
     conn.execute("UPDATE benchmark_results SET status = 'submitted' WHERE status = 'pending-resume'")
     conn.commit()
 
@@ -230,6 +233,32 @@ def set_stage(conn: sqlite3.Connection, competition_id: str, stage: str) -> None
         (competition_id, stage),
     )
     conn.commit()
+
+
+@_locked
+def set_paused(conn: sqlite3.Connection, competition_id: str, paused: bool) -> None:
+    conn.execute(
+        "INSERT INTO scored_competitions (competition_id, paused_at) VALUES (?, ?) "
+        "ON CONFLICT(competition_id) DO UPDATE SET paused_at = excluded.paused_at",
+        (competition_id, time.time() if paused else None),
+    )
+    conn.commit()
+
+
+@_locked
+def is_paused(conn: sqlite3.Connection, competition_id: str) -> bool:
+    row = conn.execute(
+        "SELECT paused_at FROM scored_competitions WHERE competition_id = ?", (competition_id,)
+    ).fetchone()
+    return row is not None and row["paused_at"] is not None
+
+
+@_locked
+def paused_at(conn: sqlite3.Connection, competition_id: str) -> Optional[float]:
+    row = conn.execute(
+        "SELECT paused_at FROM scored_competitions WHERE competition_id = ?", (competition_id,)
+    ).fetchone()
+    return row["paused_at"] if row else None
 
 
 @_locked
@@ -573,6 +602,7 @@ def full_state_for_competition(conn: sqlite3.Connection, competition_id: str) ->
         "results": results,
         "weights_history": weights_history_for_competition(conn, competition_id),
         "scored_status": scored_status(conn, competition_id),
+        "paused_at": paused_at(conn, competition_id),
     }
 
 

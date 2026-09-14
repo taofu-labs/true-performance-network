@@ -610,3 +610,68 @@ async def test_follower_marks_scored_on_real_weights(monkeypatch):
 
     assert store.is_scored(v._db, "comp1") is True
     assert store.latest_weights_for_competition(v._db, "comp1") == {"hk1": 1.0}
+
+
+# ---------------------------------------------------------------------------
+# pause
+# ---------------------------------------------------------------------------
+
+async def _run_one_leader_tick(monkeypatch, v, spec, current_block):
+    """Drive exactly one _leader_loop iteration.
+
+    The loop is infinite and always sleeps in its finally block, so the sleep
+    is what we hijack to break out after the first pass.
+    """
+    monkeypatch.setattr("validator.validator.get_current_block", lambda subtensor: current_block)
+    monkeypatch.setattr(v, "_get_active_competitions", lambda block: [spec])
+
+    async def stop_after_first_tick(_seconds):
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(asyncio, "sleep", stop_after_first_tick)
+    with pytest.raises(asyncio.CancelledError):
+        await v._leader_loop()
+
+
+@pytest.mark.asyncio
+async def test_leader_loop_skips_scoring_while_paused(monkeypatch):
+    """The point of the feature: a paused competition gets no stage work."""
+    metagraph = FakeMetagraph(hotkeys=["hk1"], uids=[0], stake=[1.0], weights=[[1.0]], validator_permit=[True])
+    v = make_validator(monkeypatch, metagraph=metagraph)
+    spec = make_spec(reveal_grace_blocks=0)
+
+    called = []
+
+    async def fake_stage_1(s):
+        called.append(s.id)
+
+    monkeypatch.setattr(v, "run_stage_1", fake_stage_1)
+    store.set_paused(v._db, "comp1", True)
+
+    # block 15 -> past commit_end_block=10 and grace, before scoring_end_block=20
+    await _run_one_leader_tick(monkeypatch, v, spec, current_block=15)
+
+    assert called == []
+    assert store.get_stage(v._db, "comp1") == "stage1_ranking"
+    assert store.is_scored(v._db, "comp1") is False
+
+
+@pytest.mark.asyncio
+async def test_leader_loop_runs_scoring_after_resume(monkeypatch):
+    """Same tick, same block — only the flag differs."""
+    metagraph = FakeMetagraph(hotkeys=["hk1"], uids=[0], stake=[1.0], weights=[[1.0]], validator_permit=[True])
+    v = make_validator(monkeypatch, metagraph=metagraph)
+    spec = make_spec(reveal_grace_blocks=0)
+
+    called = []
+
+    async def fake_stage_1(s):
+        called.append(s.id)
+
+    monkeypatch.setattr(v, "run_stage_1", fake_stage_1)
+    store.set_paused(v._db, "comp1", True)
+    store.set_paused(v._db, "comp1", False)
+
+    await _run_one_leader_tick(monkeypatch, v, spec, current_block=15)
+
+    assert called == ["comp1"]

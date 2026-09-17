@@ -1,7 +1,7 @@
 import pytest
 
 from common.models.competition import BenchmarkTask, CompetitionSpec, CompetitionType
-from common.models.submission import Claim, MinerSubmission, ScoringResult
+from common.models.submission import BenchmarkRun, MinerSubmission, ScoringResult
 from competition.scoring import (
     aggregate_competition_weights,
     benchmark_composite,
@@ -9,7 +9,7 @@ from competition.scoring import (
     final_score,
     passes_floors,
     passes_memory_cap,
-    sort_by_self_reported,
+    sort_by_verified_scores,
 )
 
 
@@ -172,10 +172,10 @@ def test_passes_memory_cap_only_enforced_for_ram_ceiling():
     assert passes_memory_cap(1001, ceiling) is False
 
 
-def make_submission(max_memory: int, scores: dict) -> MinerSubmission:
+def make_submission(max_memory: int) -> MinerSubmission:
     return MinerSubmission(
         competition_id="rf",
-        claims=[Claim(b=name, s=score) for name, score in scores.items()],
+        runs=[BenchmarkRun(b="mmlu", r="r1"), BenchmarkRun(b="gsm8k", r="r2")],
         repository="user/repo",
         file="model.gguf",
         file_sha256="a" * 64,
@@ -184,24 +184,41 @@ def make_submission(max_memory: int, scores: dict) -> MinerSubmission:
     )
 
 
-def test_sort_by_self_reported_benchmark_floor_lowest_memory_first():
+def test_sort_by_verified_scores_benchmark_floor_lowest_memory_first():
+    """max_memory is still the miner's claim at ranking time — it is only
+    measured during precheck — so a benchmark_floor ranking stays
+    claim-ordered, with the verified scores acting as the floor filter."""
     spec = make_benchmark_floor_spec()
-    submissions = {
-        "hk_big": make_submission(2000, {"mmlu": 0.9, "gsm8k": 0.9}),
-        "hk_small": make_submission(1000, {"mmlu": 0.5, "gsm8k": 0.5}),
+    submissions = {"hk_big": make_submission(2000), "hk_small": make_submission(1000)}
+    verified = {
+        "hk_big": {"mmlu": 0.9, "gsm8k": 0.9},
+        "hk_small": {"mmlu": 0.5, "gsm8k": 0.5},
     }
-    ranked = sort_by_self_reported(submissions, spec)
+    ranked = sort_by_verified_scores(submissions, verified, spec)
     assert [hk for hk, _ in ranked] == ["hk_small", "hk_big"]
 
 
-def test_sort_by_self_reported_ram_ceiling_highest_composite_first():
+def test_sort_by_verified_scores_ram_ceiling_highest_composite_first():
     spec = make_ram_ceiling_spec()
-    submissions = {
-        "hk_low": make_submission(500, {"mmlu": 0.4, "gsm8k": 0.4}),
-        "hk_high": make_submission(500, {"mmlu": 0.9, "gsm8k": 0.9}),
+    submissions = {"hk_low": make_submission(500), "hk_high": make_submission(500)}
+    verified = {
+        "hk_low": {"mmlu": 0.4, "gsm8k": 0.4},
+        "hk_high": {"mmlu": 0.9, "gsm8k": 0.9},
     }
-    ranked = sort_by_self_reported(submissions, spec)
+    ranked = sort_by_verified_scores(submissions, verified, spec)
     assert [hk for hk, _ in ranked] == ["hk_high", "hk_low"]
+
+
+
+def test_sort_by_verified_scores_candidate_with_no_verified_scores_ranks_last():
+    """Every run rejected -> all zeros -> bottom of the ranking, but still
+    present so the floors can reject it with a record."""
+    spec = make_ram_ceiling_spec()
+    submissions = {"hk_ok": make_submission(500), "hk_rejected": make_submission(500)}
+    verified = {"hk_ok": {"mmlu": 0.7, "gsm8k": 0.7}, "hk_rejected": {"mmlu": 0.0, "gsm8k": 0.0}}
+    ranked = sort_by_verified_scores(submissions, verified, spec)
+    assert [hk for hk, _ in ranked] == ["hk_ok", "hk_rejected"]
+
 
 
 def make_result(hotkey: str, final: float) -> ScoringResult:

@@ -2,12 +2,13 @@
 
 Two validator modes, controlled by `VALIDATOR_MODE` (`.env`):
 
-- **leader** (default) — scans chain reveals, prechecks and benchmarks submissions,
+- **leader** (default) — scans chain reveals, verifies the benchmark run ids
+  miners committed, ranks on those verified scores, prechecks the top candidates,
   computes and sets weights, persists every scoring run to SQLite, and serves a
   read-only HTTP API for followers and dashboards.
 - **follower** — parses competitions itself but reads scoring results from a leader
-  validator's API instead of scanning/prechecking/benchmarking. Recomputes emission
-  weights locally from the leader's `ScoringResult`s and sets its own weights.
+  validator's API instead of verifying/prechecking. Recomputes emission weights
+  locally from the leader's `ScoringResult`s and sets its own weights.
 
 Both modes run the same chain-copy `weight_loop()` fallback in parallel — if a
 follower can't reach its leader, it just skips that competition's cycle and keeps
@@ -114,7 +115,7 @@ spec that fails validation. 413 on a body over 256 KB.
 Remove one competition spec — intended for an id pushed by mistake, before anything
 has been scored against it. 404 if not found, 401/503 on auth as above.
 
-Refuses with 409 once the competition has scoring state (reveals, benchmark results,
+Refuses with 409 once the competition has scoring state (reveals, run verifications,
 scoring results, weights, or a scoring stage), because those tables key off
 `competition_id` with no foreign key — dropping the spec would leave their rows
 unreachable but still present. Append `?force=true` to delete the spec anyway;
@@ -128,7 +129,7 @@ window is still open. Without this the only recovery was `--clean`, which wipes 
 competition's history plus the ban list.
 
 Deletes that competition's `revealed_candidates`, `benchmark_results`,
-`benchmark_runs`, `scoring_results`, and its `scored_competitions` row, and reports
+`scoring_results`, and its `scored_competitions` row, and reports
 the per-table counts. **Bans and weights history are preserved** — a ban records
 proven miner misbehaviour that a validator-side infra failure does not undo, and
 weights history stays as an audit trail of what was already set on chain.
@@ -161,8 +162,8 @@ block-based phases keep advancing — a long pause can run a competition past it
 `scoring_end_block`, and the next unpaused tick then finalizes it with whatever was
 scored.
 
-Takes effect at the next tick boundary; work already in flight finishes. Candidates
-left in `prechecking` or `benchmarking` keep that status and resume from there.
+Takes effect at the next tick boundary; work already in flight finishes. A candidate
+left in `prechecking` keeps that status and resumes from there.
 
 Both routes are idempotent. 404 if not found. Pause returns 409 once a competition has
 finished scoring; resume has no such guard. `reset-scoring` clears the flag along with

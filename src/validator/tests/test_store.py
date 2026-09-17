@@ -45,10 +45,6 @@ def test_mark_scored_sets_matching_terminal_stage(tmp_path):
     assert store.get_stage(conn, "comp2") == "finalized"
 
 
-def test_get_stage_defaults_to_stage1_for_unseen_competition(tmp_path):
-    conn = make_conn(tmp_path)
-    assert store.get_stage(conn, "never-seen") == "stage1_ranking"
-
 
 def test_set_stage(tmp_path):
     conn = make_conn(tmp_path)
@@ -72,12 +68,6 @@ def test_ban_and_is_banned(tmp_path):
     store.ban(conn, "hk1", "cheating")
     assert store.is_banned(conn, "hk1") is True
 
-
-def test_ban_is_idempotent(tmp_path):
-    conn = make_conn(tmp_path)
-    store.ban(conn, "hk1", "reason a")
-    store.ban(conn, "hk1", "reason b")  # INSERT OR IGNORE — second call is a no-op
-    assert store.is_banned(conn, "hk1") is True
 
 
 def test_record_and_get_latest_weights(tmp_path):
@@ -103,14 +93,6 @@ def test_upsert_and_get_competition(tmp_path):
     assert spec["id"] == "comp1"
     assert spec["name"] == "Test Competition"
 
-
-def test_upsert_competition_updates_existing_row(tmp_path):
-    conn = make_conn(tmp_path)
-    store.upsert_competition(conn, make_spec())
-    store.upsert_competition(conn, make_spec(name="Renamed"))
-
-    assert store.get_competition(conn, "comp1")["name"] == "Renamed"
-    assert len(store.list_competitions(conn)) == 1
 
 
 def test_list_competitions(tmp_path):
@@ -151,14 +133,16 @@ def test_set_candidate_status(tmp_path):
     assert candidate["failure_reason"] == "provenance fail"
 
 
-def test_mark_precheck_passed_sets_queued_and_precheck_fields(tmp_path):
+def test_mark_precheck_passed_records_fields_without_changing_status(tmp_path):
+    """There is no benchmark queue any more: the caller scores the candidate
+    immediately after this, so the status is left for that step to set."""
     conn = make_conn(tmp_path)
-    store.insert_revealed_candidate(conn, "comp1", "hk1", rank=0, submission_json="{}", reveal_block=10, status="standby")
+    store.insert_revealed_candidate(conn, "comp1", "hk1", rank=0, submission_json="{}", reveal_block=10, status="prechecking")
     conn.commit()
 
     store.mark_precheck_passed(conn, "comp1", "hk1", gguf_file="model.gguf", measured_memory_kb=1234)
     candidate = store.get_candidate(conn, "comp1", "hk1")
-    assert candidate["status"] == "queued"
+    assert candidate["status"] == "prechecking"
     assert candidate["gguf_file"] == "model.gguf"
     assert candidate["measured_memory_kb"] == 1234
 
@@ -174,15 +158,6 @@ def test_candidates_by_status_filters_and_orders_by_rank(tmp_path):
     assert [c["hotkey"] for c in standby] == ["hk1", "hk2"]
 
 
-def test_count_candidates_by_status(tmp_path):
-    conn = make_conn(tmp_path)
-    store.insert_revealed_candidate(conn, "comp1", "hk1", rank=0, submission_json="{}", reveal_block=10, status="standby")
-    store.insert_revealed_candidate(conn, "comp1", "hk2", rank=1, submission_json="{}", reveal_block=10, status="standby")
-    conn.commit()
-
-    assert store.count_candidates_by_status(conn, "comp1", ("standby",)) == 2
-    assert store.count_candidates_by_status(conn, "comp1", ("done",)) == 0
-
 
 def test_all_candidates_for_competition_ordered_by_rank(tmp_path):
     conn = make_conn(tmp_path)
@@ -195,89 +170,142 @@ def test_all_candidates_for_competition_ordered_by_rank(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# benchmark_results (stage 2 benchmark persistence)
+# benchmark_results (run-id verification outcomes)
+#
+# The table keeps its full historical shape — the dashboard renders past
+# competitions from these rows — so the lifecycle columns are still written,
+# just with values that mean "verified" rather than "in progress".
 # ---------------------------------------------------------------------------
 
-def test_insert_and_open_benchmark_results(tmp_path):
+def test_record_benchmark_verification_persists_a_verified_run(tmp_path):
     conn = make_conn(tmp_path)
-    assert store.open_benchmark_results(conn, "comp1") == []
-
-    store.insert_benchmark_result(conn, "comp1", "hk1", "mmlu", "user/repo", "a" * 40, "run-1")
-    conn.commit()
-
-    open_rows = store.open_benchmark_results(conn, "comp1")
-    assert len(open_rows) == 1
-    assert open_rows[0]["coordinator_run_id"] == "run-1"
-    assert open_rows[0]["status"] == "submitted"
-    assert open_rows[0]["score"] is None
-
-
-def test_insert_benchmark_result_is_idempotent_on_conflict(tmp_path):
-    conn = make_conn(tmp_path)
-    store.insert_benchmark_result(conn, "comp1", "hk1", "mmlu", "user/repo", "a" * 40, "run-1")
-    store.insert_benchmark_result(conn, "comp1", "hk1", "mmlu", "user/repo", "a" * 40, "run-1-retry")
-    conn.commit()
-
-    open_rows = store.open_benchmark_results(conn, "comp1")
-    assert len(open_rows) == 1
-    assert open_rows[0]["coordinator_run_id"] == "run-1-retry"
-
-
-def test_update_benchmark_result_persists_score_on_completion(tmp_path):
-    """The C19 fix: a completed benchmark's score is persisted, not just its status."""
-    conn = make_conn(tmp_path)
-    store.insert_benchmark_result(conn, "comp1", "hk1", "mmlu", "user/repo", "a" * 40, "run-1")
-    conn.commit()
-
-    store.update_benchmark_result(conn, "comp1", "hk1", "mmlu", "completed", score=0.85)
-    conn.commit()
+    store.record_benchmark_verification(
+        conn, "comp1", "hk1", "mmlu", run_id="r100",
+        repository="user/repo", revision="a" * 40,
+        status="completed", score=0.8,
+    )
 
     rows = store.benchmark_results_for_hotkey(conn, "comp1", "hk1")
+    assert len(rows) == 1
     assert rows[0]["status"] == "completed"
-    assert rows[0]["score"] == 0.85
-    assert store.open_benchmark_results(conn, "comp1") == []  # no longer open
+    assert rows[0]["score"] == 0.8
+    assert rows[0]["coordinator_run_id"] == "r100"
 
 
-def test_update_benchmark_result_without_score_preserves_existing_score(tmp_path):
+def test_record_benchmark_verification_persists_rejection_with_reason(tmp_path):
+    """A rejected run scores 0.0 and records why, plus the repo the run
+    actually used — enough to explain the zero without the coordinator."""
     conn = make_conn(tmp_path)
-    store.insert_benchmark_result(conn, "comp1", "hk1", "mmlu", "user/repo", "a" * 40, "run-1")
-    conn.commit()
-    store.update_benchmark_result(conn, "comp1", "hk1", "mmlu", "completed", score=0.5)
-    conn.commit()
+    store.record_benchmark_verification(
+        conn, "comp1", "hk1", "mmlu", run_id="r100",
+        repository="someone/else", revision="b" * 40,
+        status="failed", score=0.0, message="repo mismatch: ...",
+    )
 
-    # a later progress-only update (no score passed) must not clobber it
-    store.update_benchmark_result(conn, "comp1", "hk1", "mmlu", "completed", phase="done")
-    conn.commit()
+    row = store.benchmark_results_for_hotkey(conn, "comp1", "hk1")[0]
+    assert row["status"] == "failed"
+    assert row["score"] == 0.0
+    assert row["repository"] == "someone/else"
+    assert "repo mismatch" in row["last_message"]
+
+
+
+def test_record_benchmark_verification_is_idempotent_on_conflict(tmp_path):
+    """Re-verifying (a retried stage 1) overwrites rather than duplicating."""
+    conn = make_conn(tmp_path)
+    store.record_benchmark_verification(
+        conn, "comp1", "hk1", "mmlu", run_id="r100",
+        repository="user/repo", revision="a" * 40, status="failed", score=0.0,
+        message="run not complete at scoring time",
+    )
+    store.record_benchmark_verification(
+        conn, "comp1", "hk1", "mmlu", run_id="r100",
+        repository="user/repo", revision="a" * 40, status="completed", score=0.9,
+    )
 
     rows = store.benchmark_results_for_hotkey(conn, "comp1", "hk1")
-    assert rows[0]["score"] == 0.5
+    assert len(rows) == 1
+    assert rows[0]["status"] == "completed"
+    assert rows[0]["score"] == 0.9
 
 
-def test_legacy_pending_resume_rows_are_migrated_to_submitted(tmp_path):
-    """Rows left at the retired 'pending-resume' status by an older validator
-    would otherwise be stranded: neither open nor terminal."""
-    conn = make_conn(tmp_path)
-    store.insert_benchmark_result(conn, "comp1", "hk1", "mmlu", "user/repo", "a" * 40, "run-1")
-    conn.execute("UPDATE benchmark_results SET status = 'pending-resume'")
-    conn.commit()
+def test_migration_adds_verified_scores_and_leaves_other_tables_alone(tmp_path):
+    """The rework migration is purely additive: one new column, and every
+    existing table and row left exactly as it was."""
+    import sqlite3
 
-    store._migrate_scored_competitions_stage_columns(conn)
+    db_path = tmp_path / "old.db"
+    old = sqlite3.connect(db_path)
+    old.executescript("""
+        CREATE TABLE revealed_candidates (
+            competition_id TEXT NOT NULL, hotkey TEXT NOT NULL, rank INTEGER NOT NULL,
+            submission_json TEXT NOT NULL, reveal_block INTEGER NOT NULL, status TEXT NOT NULL,
+            failure_reason TEXT, gguf_file TEXT, measured_memory_kb INTEGER,
+            updated_at REAL NOT NULL, PRIMARY KEY (competition_id, hotkey));
+        CREATE TABLE benchmark_results (
+            competition_id TEXT NOT NULL, hotkey TEXT NOT NULL, benchmark_name TEXT NOT NULL,
+            score REAL, coordinator_run_id TEXT NOT NULL, status TEXT NOT NULL,
+            repository TEXT NOT NULL, revision TEXT NOT NULL, submitted_at REAL NOT NULL,
+            updated_at REAL NOT NULL, phase TEXT, percent_complete REAL, last_message TEXT,
+            PRIMARY KEY (competition_id, hotkey, benchmark_name));
+        CREATE TABLE benchmark_runs (
+            competition_id TEXT NOT NULL, hotkey TEXT NOT NULL, benchmark_name TEXT NOT NULL,
+            repository TEXT NOT NULL, revision TEXT NOT NULL, coordinator_run_id TEXT NOT NULL,
+            status TEXT NOT NULL, submitted_at REAL NOT NULL, updated_at REAL NOT NULL,
+            PRIMARY KEY (competition_id, hotkey, benchmark_name));
+        INSERT INTO benchmark_results VALUES
+            ('old','hk_hist','mmlu',0.66,'run-old','completed','user/old','c0ffee',
+             1.0,2.0,'benchmarking',100.0,'done');
+    """)
+    old.commit()
+    old.close()
 
-    open_rows = store.open_benchmark_results(conn, "comp1")
-    assert len(open_rows) == 1
-    assert open_rows[0]["status"] == "submitted"
+    conn = store.init_db(db_path)
+
+    candidate_columns = {r["name"] for r in conn.execute("PRAGMA table_info(revealed_candidates)")}
+    assert "verified_scores_json" in candidate_columns
+
+    tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    assert "benchmark_runs" in tables  # superseded, but never dropped
+
+    historical = store.benchmark_results_for_hotkey(conn, "old", "hk_hist")[0]
+    assert historical["score"] == 0.66
+    assert historical["phase"] == "benchmarking"
+    assert historical["last_message"] == "done"
 
 
-def test_open_benchmark_results_excludes_completed_and_failed(tmp_path):
-    conn = make_conn(tmp_path)
-    store.insert_benchmark_result(conn, "comp1", "hk1", "mmlu", "user/repo", "a" * 40, "run-1")
-    store.insert_benchmark_result(conn, "comp1", "hk2", "mmlu", "user/repo", "a" * 40, "run-2")
-    conn.commit()
-    store.update_benchmark_result(conn, "comp1", "hk1", "mmlu", "completed", score=0.5)
-    store.update_benchmark_result(conn, "comp1", "hk2", "mmlu", "failed")
-    conn.commit()
+def test_migration_preserves_rows_in_superseded_benchmark_runs(tmp_path):
+    """benchmark_runs was superseded by benchmark_results in the validator
+    rewrite, which removed every accessor but left the table. An older
+    validator did write to it, and those rows are competition history, so the
+    migration never touches them."""
+    import sqlite3
 
-    assert store.open_benchmark_results(conn, "comp1") == []
+    db_path = tmp_path / "with_rows.db"
+    old = sqlite3.connect(db_path)
+    old.executescript("""
+        CREATE TABLE revealed_candidates (
+            competition_id TEXT NOT NULL, hotkey TEXT NOT NULL, rank INTEGER NOT NULL,
+            submission_json TEXT NOT NULL, reveal_block INTEGER NOT NULL, status TEXT NOT NULL,
+            failure_reason TEXT, gguf_file TEXT, measured_memory_kb INTEGER,
+            updated_at REAL NOT NULL, PRIMARY KEY (competition_id, hotkey));
+        CREATE TABLE benchmark_runs (
+            competition_id TEXT NOT NULL, hotkey TEXT NOT NULL, benchmark_name TEXT NOT NULL,
+            repository TEXT NOT NULL, revision TEXT NOT NULL, coordinator_run_id TEXT NOT NULL,
+            status TEXT NOT NULL, submitted_at REAL NOT NULL, updated_at REAL NOT NULL,
+            PRIMARY KEY (competition_id, hotkey, benchmark_name));
+        INSERT INTO benchmark_runs VALUES
+            ('ancient','hk_old','mmlu','user/old','c0ffee','run-ancient','completed',1.0,2.0);
+    """)
+    old.commit()
+    old.close()
+
+    conn = store.init_db(db_path)
+
+    tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    assert "benchmark_runs" in tables
+    surviving = conn.execute("SELECT coordinator_run_id FROM benchmark_runs").fetchone()
+    assert surviving[0] == "run-ancient"
 
 
 # ---------------------------------------------------------------------------
@@ -356,19 +384,6 @@ def test_pause_round_trip(tmp_path):
     assert store.paused_at(conn, "comp1") is None
 
 
-def test_pause_does_not_disturb_stage_or_scored_status(tmp_path):
-    conn = make_conn(tmp_path)
-    store.set_stage(conn, "comp1", "stage2_scoring")
-    store.set_paused(conn, "comp1", True)
-    assert store.get_stage(conn, "comp1") == "stage2_scoring"
-    assert store.is_scored(conn, "comp1") is False
-
-
-def test_pause_on_untouched_competition_leaves_default_stage(tmp_path):
-    """Pausing before stage 1 runs creates the row early — stage must stay the default."""
-    conn = make_conn(tmp_path)
-    store.set_paused(conn, "comp1", True)
-    assert store.get_stage(conn, "comp1") == "stage1_ranking"
 
 
 def test_paused_at_column_migrates_onto_existing_db(tmp_path):

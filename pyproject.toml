@@ -42,3 +42,7 @@ testpaths = [
 markers = [
     "integration: exercises real external deps (docker/localnet); run manually, not part of default suite",
 ]
+# Integration tests are opt-in: the marker documented them as manual-only but
+# nothing enforced it, so they ran (and failed) in the default suite.
+# Run them with: uv run python -m pytest -m integration
+addopts = "-m 'not integration'"

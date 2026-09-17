@@ -135,6 +135,9 @@ class Validator(HealthServerMixin, LeaderApiMixin):
                     elif phase == CompetitionPhase.SCORING:
                         if store.is_scored(self._db, spec.id):
                             continue
+                        if store.is_paused(self._db, spec.id):
+                            logger.info(f"{spec.id}: paused — skipping scoring tick")
+                            continue
                         stage = store.get_stage(self._db, spec.id)
                         if stage == "stage1_ranking":
                             await self.run_stage_1(spec)
@@ -162,8 +165,6 @@ class Validator(HealthServerMixin, LeaderApiMixin):
                 specs = self._get_active_competitions(current_block)
 
                 for spec in specs:
-                    if store.is_scored(self._db, spec.id):
-                        continue
                     phase = spec.phase(current_block)
                     if phase not in (CompetitionPhase.SCORING, CompetitionPhase.DISTRIBUTING, CompetitionPhase.COMPLETE):
                         continue
@@ -171,8 +172,9 @@ class Validator(HealthServerMixin, LeaderApiMixin):
                     results, scored_status = self._leader_client.get_scoring_results(spec.id)
                     if not results:
                         if scored_status in ("failed_no_reveals", "failed_no_participants", "failed_stage1_infra"):
-                            logger.warning(f"{spec.id}: leader gave up ({scored_status}) — marking scored, no weights")
-                            store.mark_scored(self._db, spec.id, status=scored_status)
+                            if not store.is_scored(self._db, spec.id):
+                                logger.warning(f"{spec.id}: leader gave up ({scored_status}) — marking scored, no weights")
+                                store.mark_scored(self._db, spec.id, status=scored_status)
                         else:
                             logger.debug(f"{spec.id}: no scoring results from leader yet")
                         continue
@@ -185,6 +187,9 @@ class Validator(HealthServerMixin, LeaderApiMixin):
                     hotkey_weights = compute_emission_weights(ranked, spec.emission_distribution)
                     if not any(w > 0 for w in hotkey_weights.values()):
                         logger.warning(f"{spec.id}: leader published results but no non-zero weights — retrying next tick")
+                        continue
+
+                    if hotkey_weights == store.latest_weights_for_competition(self._db, spec.id):
                         continue
 
                     logger.info(f"{spec.id}: following leader — weights: "

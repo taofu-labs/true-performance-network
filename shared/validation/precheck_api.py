@@ -315,6 +315,8 @@ def _run_llama_cli(gguf_path: str, context_length: int) -> tuple[dict, str | Non
     """Returns (ram_result, reason). reason is None on success, else why it failed."""
     # --single-turn: exit after one response (b10020 stays as server otherwise)
     # --no-warmup: skip warmup pass to avoid SIGABRT on encoder-only models
+    # -n 1: buffer sizes are logged at load; generating a full reply just burns
+    #       the timeout budget (a model with a broken chat template never stops)
     # findall[-1]: model loads twice internally; last match has real values (not 0.00 MiB)
     cmd = [
         "llama-cli",
@@ -331,6 +333,7 @@ def _run_llama_cli(gguf_path: str, context_length: int) -> tuple[dict, str | Non
         "--verbose",
         "--single-turn",
         "--no-warmup",
+        "-n", "1",
         "-p", "hi",
     ]
     _debug(f"llama-cli command: {' '.join(cmd)}")

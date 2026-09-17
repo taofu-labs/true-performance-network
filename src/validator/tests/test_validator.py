@@ -610,3 +610,125 @@ async def test_follower_marks_scored_on_real_weights(monkeypatch):
 
     assert store.is_scored(v._db, "comp1") is True
     assert store.latest_weights_for_competition(v._db, "comp1") == {"hk1": 1.0}
+
+
+# ---------------------------------------------------------------------------
+# pause
+# ---------------------------------------------------------------------------
+
+async def _run_one_leader_tick(monkeypatch, v, spec, current_block):
+    """Drive exactly one _leader_loop iteration.
+
+    The loop is infinite and always sleeps in its finally block, so the sleep
+    is what we hijack to break out after the first pass.
+    """
+    monkeypatch.setattr("validator.validator.get_current_block", lambda subtensor: current_block)
+    monkeypatch.setattr(v, "_get_active_competitions", lambda block: [spec])
+
+    async def stop_after_first_tick(_seconds):
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(asyncio, "sleep", stop_after_first_tick)
+    with pytest.raises(asyncio.CancelledError):
+        await v._leader_loop()
+
+
+@pytest.mark.asyncio
+async def test_leader_loop_skips_scoring_while_paused(monkeypatch):
+    """The point of the feature: a paused competition gets no stage work."""
+    metagraph = FakeMetagraph(hotkeys=["hk1"], uids=[0], stake=[1.0], weights=[[1.0]], validator_permit=[True])
+    v = make_validator(monkeypatch, metagraph=metagraph)
+    spec = make_spec(reveal_grace_blocks=0)
+
+    called = []
+
+    async def fake_stage_1(s):
+        called.append(s.id)
+
+    monkeypatch.setattr(v, "run_stage_1", fake_stage_1)
+    store.set_paused(v._db, "comp1", True)
+
+    # block 15 -> past commit_end_block=10 and grace, before scoring_end_block=20
+    await _run_one_leader_tick(monkeypatch, v, spec, current_block=15)
+
+    assert called == []
+    assert store.get_stage(v._db, "comp1") == "stage1_ranking"
+    assert store.is_scored(v._db, "comp1") is False
+
+
+@pytest.mark.asyncio
+async def test_leader_loop_runs_scoring_after_resume(monkeypatch):
+    """Same tick, same block — only the flag differs."""
+    metagraph = FakeMetagraph(hotkeys=["hk1"], uids=[0], stake=[1.0], weights=[[1.0]], validator_permit=[True])
+    v = make_validator(monkeypatch, metagraph=metagraph)
+    spec = make_spec(reveal_grace_blocks=0)
+
+    called = []
+
+    async def fake_stage_1(s):
+        called.append(s.id)
+
+    monkeypatch.setattr(v, "run_stage_1", fake_stage_1)
+    store.set_paused(v._db, "comp1", True)
+    store.set_paused(v._db, "comp1", False)
+
+    await _run_one_leader_tick(monkeypatch, v, spec, current_block=15)
+
+    assert called == ["comp1"]
+
+
+@pytest.mark.asyncio
+async def test_follower_tracks_leader_result_changes_after_finalizing(monkeypatch):
+    """The leader's winners can be altered by an admin after it first finalized.
+    A follower that latched on the first answer would keep paying the old winner."""
+    metagraph = FakeMetagraph(hotkeys=["hk1", "hk2"], uids=[0, 1], stake=[1.0, 1.0],
+                              weights=[[1.0], [1.0]], validator_permit=[True, True])
+    monkeypatch.setattr(validator_settings, "LEADER_VALIDATOR_URL", "http://leader")
+    v = make_validator(monkeypatch, metagraph=metagraph, mode="follower")
+    spec = make_spec(reveal_grace_blocks=2, scoring_end_block=100)
+    monkeypatch.setattr(v, "_get_active_competitions", lambda current_block: [spec])
+    monkeypatch.setattr("validator.validator.get_current_block", lambda subtensor: 15)
+
+    first = [{"hotkey": "hk1", "competition_id": "comp1", "final_score": 0.7, "max_memory_kb": 1000}]
+    await _run_one_follower_tick(monkeypatch, v, first, "scored")
+    assert store.latest_weights_for_competition(v._db, "comp1") == {"hk1": 1.0}
+
+    # admin corrects the winner on the leader
+    second = [{"hotkey": "hk2", "competition_id": "comp1", "final_score": 0.9, "max_memory_kb": 1000}]
+    await _run_one_follower_tick(monkeypatch, v, second, "scored")
+    assert store.latest_weights_for_competition(v._db, "comp1") == {"hk2": 1.0}
+
+
+@pytest.mark.asyncio
+async def test_follower_holds_weights_while_leader_is_mid_reset(monkeypatch):
+    """reset-scoring un-finalizes the leader, which then serves []. Dropping our
+    weights there would burn the subnet's emissions until it rescores."""
+    metagraph = FakeMetagraph(hotkeys=["hk1"], uids=[0], stake=[1.0], weights=[[1.0]], validator_permit=[True])
+    monkeypatch.setattr(validator_settings, "LEADER_VALIDATOR_URL", "http://leader")
+    v = make_validator(monkeypatch, metagraph=metagraph, mode="follower")
+    spec = make_spec(reveal_grace_blocks=2, scoring_end_block=100)
+    monkeypatch.setattr(v, "_get_active_competitions", lambda current_block: [spec])
+    monkeypatch.setattr("validator.validator.get_current_block", lambda subtensor: 15)
+
+    results = [{"hotkey": "hk1", "competition_id": "comp1", "final_score": 0.7, "max_memory_kb": 1000}]
+    await _run_one_follower_tick(monkeypatch, v, results, "scored")
+    await _run_one_follower_tick(monkeypatch, v, [], None)
+
+    assert store.latest_weights_for_competition(v._db, "comp1") == {"hk1": 1.0}
+
+
+@pytest.mark.asyncio
+async def test_follower_does_not_rewrite_unchanged_weights(monkeypatch):
+    """Polling every tick must not append a weights_history row per tick."""
+    metagraph = FakeMetagraph(hotkeys=["hk1"], uids=[0], stake=[1.0], weights=[[1.0]], validator_permit=[True])
+    monkeypatch.setattr(validator_settings, "LEADER_VALIDATOR_URL", "http://leader")
+    v = make_validator(monkeypatch, metagraph=metagraph, mode="follower")
+    spec = make_spec(reveal_grace_blocks=2, scoring_end_block=100)
+    monkeypatch.setattr(v, "_get_active_competitions", lambda current_block: [spec])
+    monkeypatch.setattr("validator.validator.get_current_block", lambda subtensor: 15)
+
+    results = [{"hotkey": "hk1", "competition_id": "comp1", "final_score": 0.7, "max_memory_kb": 1000}]
+    for _ in range(3):
+        await _run_one_follower_tick(monkeypatch, v, results, "scored")
+
+    assert len(store.weights_history_for_competition(v._db, "comp1")) == 1

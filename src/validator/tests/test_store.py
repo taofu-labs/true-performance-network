@@ -340,3 +340,62 @@ def test_concurrent_writers_share_one_connection_safely(tmp_path):
     rows = store.all_candidates_for_competition(conn, "comp1")
     assert len(rows) == 200
     assert all(r["status"] == "queued" for r in rows)
+
+
+def test_pause_round_trip(tmp_path):
+    conn = make_conn(tmp_path)
+    assert store.is_paused(conn, "comp1") is False
+    assert store.paused_at(conn, "comp1") is None
+
+    store.set_paused(conn, "comp1", True)
+    assert store.is_paused(conn, "comp1") is True
+    assert store.paused_at(conn, "comp1") > 0
+
+    store.set_paused(conn, "comp1", False)
+    assert store.is_paused(conn, "comp1") is False
+    assert store.paused_at(conn, "comp1") is None
+
+
+def test_pause_does_not_disturb_stage_or_scored_status(tmp_path):
+    conn = make_conn(tmp_path)
+    store.set_stage(conn, "comp1", "stage2_scoring")
+    store.set_paused(conn, "comp1", True)
+    assert store.get_stage(conn, "comp1") == "stage2_scoring"
+    assert store.is_scored(conn, "comp1") is False
+
+
+def test_pause_on_untouched_competition_leaves_default_stage(tmp_path):
+    """Pausing before stage 1 runs creates the row early — stage must stay the default."""
+    conn = make_conn(tmp_path)
+    store.set_paused(conn, "comp1", True)
+    assert store.get_stage(conn, "comp1") == "stage1_ranking"
+
+
+def test_paused_at_column_migrates_onto_existing_db(tmp_path):
+    """A DB created before paused_at existed gets the column added on open."""
+    import sqlite3
+
+    path = tmp_path / "validator.db"
+    legacy = sqlite3.connect(path)
+    legacy.executescript(
+        """
+        CREATE TABLE scored_competitions (
+            competition_id TEXT PRIMARY KEY,
+            stage TEXT NOT NULL DEFAULT 'stage1_ranking',
+            stage1_attempts INTEGER NOT NULL DEFAULT 0,
+            scored_at REAL,
+            status TEXT NOT NULL DEFAULT 'scoring'
+        );
+        """
+    )
+    legacy.execute(
+        "INSERT INTO scored_competitions (competition_id, stage) VALUES ('comp1', 'stage2_scoring')"
+    )
+    legacy.commit()
+    legacy.close()
+
+    conn = store.init_db(path)
+    assert store.get_stage(conn, "comp1") == "stage2_scoring"
+    assert store.is_paused(conn, "comp1") is False
+    store.set_paused(conn, "comp1", True)
+    assert store.is_paused(conn, "comp1") is True

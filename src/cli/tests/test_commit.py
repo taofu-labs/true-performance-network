@@ -81,7 +81,7 @@ def test_commit_dry_run_does_not_write_to_chain(monkeypatch, tmp_path):
         "file": "model.gguf",
         "file_sha256": "a" * 64,
         "huggingface_revision": "a" * 40,
-        "claims": [{"b": "mmlu", "s": 0.7}],
+        "runs": [{"b": "mmlu", "r": "r1234"}],
         "max_memory": 1000,
     }))
 
@@ -108,3 +108,74 @@ def test_commit_missing_upload_fields_exits_nonzero(monkeypatch, tmp_path):
     ])
     assert result.exit_code == 1
     assert "Missing upload data" in result.stdout
+
+
+def test_commit_accepts_runs_flag(monkeypatch, tmp_path):
+    stub_leader(monkeypatch)
+    patch_chain_seam(monkeypatch, tmp_path, registered=True)
+
+    config_file = tmp_path / "cfg.json"
+    config_file.write_text(json.dumps({
+        "repository": "user/repo",
+        "file": "model.gguf",
+        "file_sha256": "a" * 64,
+        "huggingface_revision": "a" * 40,
+        "max_memory": 1000,
+    }))
+
+    result = runner.invoke(app, [
+        "--leader-url", LEADER_URL,
+        "commit", "--wallet", "alice", "--competition", "comp-a",
+        "--config", str(config_file), "--runs", '[{"b":"mmlu","r":"r1234"}]',
+        "--dry-run",
+    ])
+    assert result.exit_code == 0
+    assert "r1234" in result.stdout
+
+
+def test_commit_rejects_malformed_run_id_before_writing_to_chain(monkeypatch, tmp_path):
+    """A typo must fail at commit time. Left to reveal, it would silently
+    score 0.0 for that benchmark with no way to correct it."""
+    stub_leader(monkeypatch)
+    patch_chain_seam(monkeypatch, tmp_path, registered=True)
+
+    config_file = tmp_path / "cfg.json"
+    config_file.write_text(json.dumps({
+        "repository": "user/repo",
+        "file": "model.gguf",
+        "file_sha256": "a" * 64,
+        "huggingface_revision": "a" * 40,
+        "max_memory": 1000,
+    }))
+
+    result = runner.invoke(app, [
+        "--leader-url", LEADER_URL,
+        "commit", "--wallet", "alice", "--competition", "comp-a",
+        "--config", str(config_file), "--runs", '[{"b":"mmlu","r":"not a run id"}]',
+        "--dry-run",
+    ])
+    assert result.exit_code == 1
+    assert "Invalid run id" in result.stdout
+
+
+
+def test_commit_saves_runs_to_config(monkeypatch, tmp_path):
+    """`tpn status` and a later re-commit both read runs back out of here."""
+    stub_leader(monkeypatch)
+    patch_chain_seam(monkeypatch, tmp_path, registered=True)
+
+    import cli.utils.config as cfg_mod
+    cfg_mod.save_competition_config("alice", "default", "comp-a", {
+        "repository": "user/repo", "file": "model.gguf", "file_sha256": "a" * 64,
+        "huggingface_revision": "a" * 40, "max_memory": 1000,
+    })
+
+    result = runner.invoke(app, [
+        "--leader-url", LEADER_URL,
+        "commit", "--wallet", "alice", "--competition", "comp-a",
+        "--runs", '[{"b":"mmlu","r":"r1234"}]', "--dry-run",
+    ])
+    assert result.exit_code == 0, result.stdout
+
+    saved = cfg_mod.load_competition_config("alice", "default", "comp-a")
+    assert saved["runs"] == [{"b": "mmlu", "r": "r1234"}]

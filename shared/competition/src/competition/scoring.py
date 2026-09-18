@@ -44,19 +44,29 @@ def passes_memory_cap(max_memory_kb: int, spec: CompetitionSpec) -> bool:
     return max_memory_kb <= spec.max_memory_kb
 
 
-def sort_by_self_reported(
+def sort_by_verified_scores(
     submissions: Dict[str, MinerSubmission],
+    verified_scores: Dict[str, Dict[str, float]],
     spec: CompetitionSpec,
 ) -> List[Tuple[str, MinerSubmission]]:
-    """Sort {hotkey: submission} dict descending by self-reported final score
-    (lowest claimed memory first for benchmark_floor, highest claimed benchmark for
-    ram_ceiling). Ties broken by benchmark composite. Returns list of
-    (hotkey, submission) tuples."""
+    """
+    Sort {hotkey: submission} descending by final score computed from the
+    miner's *verified* benchmark scores (lowest memory first for
+    benchmark_floor, highest benchmark composite for ram_ceiling). Ties broken
+    by benchmark composite.
+
+    `verified_scores` maps hotkey -> {benchmark_name: score}; a benchmark whose
+    run failed verification is present with 0.0. `max_memory` is still the
+    miner's self-reported value at this point — it is only measured during
+    precheck — so a benchmark_floor ranking remains claim-ordered until then.
+
+    Returns a list of (hotkey, submission) tuples.
+    """
     return sorted(
         submissions.items(),
         key=lambda item: (
-            final_score(item[1].self_reported_scores, item[1].max_memory, spec),
-            benchmark_composite(item[1].self_reported_scores, spec.benchmarks),
+            final_score(verified_scores.get(item[0], {}), item[1].max_memory, spec),
+            benchmark_composite(verified_scores.get(item[0], {}), spec.benchmarks),
         ),
         reverse=True,
     )

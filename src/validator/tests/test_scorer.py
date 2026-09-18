@@ -1,18 +1,9 @@
 import sqlite3
-from datetime import datetime, timedelta, timezone
 
-import pytest
-
-from common import settings as common_settings
 from common.models.competition import BenchmarkTask, CompetitionSpec
-from common.models.submission import Claim, MinerSubmission
-from competition.benchmark_client import MockCoordinator
+from common.models.submission import BenchmarkRun, MinerSubmission
+from competition.benchmark_client import RunStatus, RunStatusCode
 from validator import scorer, store
-
-
-def iso_ago(seconds: float) -> str:
-    """ISO-8601 UTC timestamp `seconds` in the past, as the coordinator renders it."""
-    return (datetime.now(timezone.utc) - timedelta(seconds=seconds)).isoformat()
 
 
 def make_spec(**overrides) -> CompetitionSpec:
@@ -28,15 +19,32 @@ def make_spec(**overrides) -> CompetitionSpec:
 def make_submission(**overrides) -> MinerSubmission:
     fields = dict(
         competition_id="comp1",
-        claims=[Claim(b="mmlu", s=0.7)],
+        runs=[BenchmarkRun(b="mmlu", r="r100")],
         repository="user/repo",
         file="model.gguf",
         file_sha256="a" * 64,
         max_memory=1000,
-        huggingface_revision="a" * 40,
+        huggingface_revision="b" * 40,
     )
     fields.update(overrides)
     return MinerSubmission(**fields)
+
+
+def make_status(**overrides) -> RunStatus:
+    """A run that verifies cleanly against make_submission()."""
+    fields = dict(
+        run_id="r100",
+        status=RunStatusCode.COMPLETED,
+        scores={"mmlu": 0.8},
+        repo="user/repo",
+        revision="b" * 40,
+        model_files=["model.gguf"],
+        file_hashes={"model.gguf": ("sha256", "a" * 64)},
+        benchmarks=["mmlu"],
+        item_status={"mmlu": "completed"},
+    )
+    fields.update(overrides)
+    return RunStatus(**fields)
 
 
 def make_db():
@@ -46,95 +54,310 @@ def make_db():
     return conn
 
 
-def insert_candidate(conn, hotkey, submission, status="standby", **extra):
-    store.insert_revealed_candidate(
-        conn, "comp1", hotkey, rank=0, submission_json=submission.model_dump_json(),
-        reveal_block=5, status=status,
-    )
-    conn.commit()
-    if extra:
-        conn.execute(
-            "UPDATE revealed_candidates SET " + ", ".join(f"{k} = ?" for k in extra) +
-            " WHERE competition_id = 'comp1' AND hotkey = ?",
-            (*extra.values(), hotkey),
-        )
-        conn.commit()
+class StubCoordinator:
+    """Returns a canned status per run id; records what was polled."""
+
+    def __init__(self, by_run_id: dict):
+        self._by_run_id = by_run_id
+        self.polled = []
+
+    def poll(self, run_id):
+        self.polled.append(run_id)
+        status = self._by_run_id.get(run_id)
+        if status is None:
+            raise RuntimeError(f"unknown run {run_id}")
+        return status
 
 
 class FakeContainer:
-    """Precheck container stub used for tests that only need to get past the
-    early guards, not exercise real RAM/sha256/provenance checks."""
+    """Precheck container stub for tests that only need to pass the early guards."""
     def check(self, repository, revision, filename, context_length):
         from competition.precheck_client import PrecheckVerdict
         return PrecheckVerdict(provenance=None, ram=None, sha256="a" * 64)
 
 
 # ---------------------------------------------------------------------------
-# precheck_one
+# verify_run — binding a miner-supplied run to the committed model
+#
+# This is the security core of the rework: without it a run id proves nothing,
+# and a miner can benchmark a strong model while committing a weak one.
 # ---------------------------------------------------------------------------
 
-def test_precheck_one_fails_when_repo_not_public(monkeypatch):
-    monkeypatch.setattr(scorer, "check_repo_public", lambda repo: False)
-    result = scorer.precheck_one("hk1", make_submission(), make_spec(), FakeContainer(), make_db())
-    assert result.passed is False
-    assert "not publicly accessible" in result.reason
+def test_verify_run_accepts_matching_run():
+    result = scorer.verify_run(make_submission(), "mmlu", "r100", make_status())
+    assert result.ok is True
+    assert result.score == 0.8
+    assert result.reason == ""
 
 
-def test_precheck_one_fails_when_no_gguf_file(monkeypatch):
-    monkeypatch.setattr(scorer, "check_repo_public", lambda repo: True)
-    monkeypatch.setattr(scorer._hf_api, "list_repo_files", lambda repo_id, revision: ["config.json", "README.md"])
-    result = scorer.precheck_one("hk1", make_submission(), make_spec(), FakeContainer(), make_db())
-    assert result.passed is False
-    assert "not found at revision" in result.reason
+def test_verify_run_rejects_repo_mismatch():
+    """The headline attack: benchmark one repo, commit another."""
+    status = make_status(repo="attacker/strong-model")
+    result = scorer.verify_run(make_submission(), "mmlu", "r100", status)
+    assert result.ok is False
+    assert result.score == 0.0
+    assert "repo mismatch" in result.reason
+    # The repo the run actually used is recorded, so the rejection is legible
+    # without re-querying the coordinator.
+    assert result.repo == "attacker/strong-model"
 
 
-def test_precheck_one_passes_with_measured_ram(monkeypatch):
-    from competition.precheck_client import PrecheckVerdict, RamResult
-
-    monkeypatch.setattr(scorer, "check_repo_public", lambda repo: True)
-    monkeypatch.setattr(scorer._hf_api, "list_repo_files", lambda repo_id, revision: ["model.gguf"])
-
-    class RamContainer:
-        def check(self, repository, revision, filename, context_length):
-            return PrecheckVerdict(provenance=None, sha256="a" * 64, ram=RamResult(passed=True, ram_bytes=1000 * 1024))
-
-    result = scorer.precheck_one("hk1", make_submission(), make_spec(), RamContainer(), make_db())
-    assert result.passed is True
-    assert result.gguf_file == "model.gguf"
-    assert result.measured_memory_kb == 1000
+def test_verify_run_repo_comparison_is_case_insensitive():
+    """HF repo ids are case-insensitive; a case difference is not an attack."""
+    status = make_status(repo="User/Repo")
+    assert scorer.verify_run(make_submission(), "mmlu", "r100", status).ok is True
 
 
-def test_precheck_one_bans_on_sha256_mismatch(monkeypatch):
-    from competition.precheck_client import PrecheckVerdict
+def test_verify_run_rejects_revision_mismatch():
+    """Same repo, different commit — the miner benchmarked another version."""
+    status = make_status(revision="c" * 40)
+    result = scorer.verify_run(make_submission(), "mmlu", "r100", status)
+    assert result.ok is False
+    assert "revision mismatch" in result.reason
 
-    monkeypatch.setattr(scorer, "check_repo_public", lambda repo: True)
-    monkeypatch.setattr(scorer._hf_api, "list_repo_files", lambda repo_id, revision: ["model.gguf"])
 
-    class MismatchContainer:
-        def check(self, repository, revision, filename, context_length):
-            return PrecheckVerdict(provenance=None, ram=None, sha256="f" * 64)
+def test_verify_run_rejects_when_committed_file_not_in_run():
+    """Same repo and revision, but the run loaded a different .gguf — the
+    second form of the substitution attack, within one repo."""
+    status = make_status(model_files=["other-model.gguf"], file_hashes={})
+    result = scorer.verify_run(make_submission(), "mmlu", "r100", status)
+    assert result.ok is False
+    assert "not among run's model files" in result.reason
+    assert "other-model.gguf" in result.reason
 
+
+def test_verify_run_rejects_sha256_mismatch():
+    status = make_status(file_hashes={"model.gguf": ("sha256", "f" * 64)})
+    result = scorer.verify_run(make_submission(), "mmlu", "r100", status)
+    assert result.ok is False
+    assert "file hash mismatch" in result.reason
+
+
+def test_verify_run_skips_hash_check_for_non_sha256_algorithms():
+    """HF serves a true content sha256 only for LFS files; `xet` and
+    `git_blob` values are not comparable to the miner's file_sha256. Repo +
+    revision + path already pin the content and precheck rehashes the real
+    file, so a non-sha256 algorithm must skip the check, not fail the run."""
+    for algorithm in ("xet", "git_blob"):
+        status = make_status(file_hashes={"model.gguf": (algorithm, "not-a-sha256")})
+        result = scorer.verify_run(make_submission(), "mmlu", "r100", status)
+        assert result.ok is True, f"{algorithm} should skip the hash check"
+
+
+
+def test_verify_run_rejects_when_benchmark_not_covered_by_run():
+    """A valid run for the wrong benchmark cannot be reused for this one."""
+    status = make_status(benchmarks=["gsm8k"], item_status={"gsm8k": "completed"})
+    result = scorer.verify_run(make_submission(), "mmlu", "r100", status)
+    assert result.ok is False
+    assert "does not cover benchmark" in result.reason
+
+
+def test_verify_run_rejects_failed_benchmark_item_in_suite():
+    """A partially completed suite is terminal overall, but a child that
+    failed must not be scored from whatever the parent reported."""
+    status = make_status(
+        benchmarks=["mmlu", "gsm8k"],
+        item_status={"mmlu": "failed", "gsm8k": "completed"},
+    )
+    result = scorer.verify_run(make_submission(), "mmlu", "r100", status)
+    assert result.ok is False
+    assert "did not complete in run" in result.reason
+
+
+def test_verify_run_rejects_failed_run():
+    status = make_status(status=RunStatusCode.FAILED, failure_reason="out of memory")
+    result = scorer.verify_run(make_submission(), "mmlu", "r100", status)
+    assert result.ok is False
+    assert "out of memory" in result.reason
+
+
+def test_verify_run_rejects_still_running_run():
+    """Hard cutoff — scoring has started, so a run still in flight is out of
+    time. Miners have the whole commit window to finish."""
+    status = make_status(status=RunStatusCode.RUNNING, scores={})
+    result = scorer.verify_run(make_submission(), "mmlu", "r100", status)
+    assert result.ok is False
+    assert "not complete at scoring time" in result.reason
+
+
+def test_verify_run_rejects_run_without_model_identity():
+    """A coordinator response with no model_source cannot be bound to
+    anything, so it must not be trusted by default."""
+    status = make_status(repo=None)
+    result = scorer.verify_run(make_submission(), "mmlu", "r100", status)
+    assert result.ok is False
+    assert "no model identity" in result.reason
+
+
+def test_verify_run_rejects_completed_run_missing_the_score():
+    status = make_status(scores={})
+    result = scorer.verify_run(make_submission(), "mmlu", "r100", status)
+    assert result.ok is False
+    assert "no score" in result.reason
+
+
+# ---------------------------------------------------------------------------
+# verify_candidate_runs
+# ---------------------------------------------------------------------------
+
+def test_verify_candidate_runs_covers_every_spec_benchmark():
+    spec = make_spec(benchmarks=[
+        BenchmarkTask(name="mmlu", min_score=0.5, weight=0.5),
+        BenchmarkTask(name="gsm8k", min_score=0.5, weight=0.5),
+    ])
+    submission = make_submission(runs=[
+        BenchmarkRun(b="mmlu", r="r100"),
+        BenchmarkRun(b="gsm8k", r="r200"),
+    ])
+    coordinator = StubCoordinator({
+        "r100": make_status(),
+        "r200": make_status(run_id="r200", scores={"gsm8k": 0.6},
+                            benchmarks=["gsm8k"], item_status={"gsm8k": "completed"}),
+    })
+
+    results = scorer.verify_candidate_runs(submission, spec, coordinator)
+    assert {r.benchmark for r in results} == {"mmlu", "gsm8k"}
+    assert all(r.ok for r in results)
+
+
+def test_verify_candidate_runs_scores_zero_for_missing_run_id():
+    """A benchmark the miner submitted no run for scores 0.0 — floors decide
+    whether that is survivable, per decision 6."""
+    spec = make_spec(benchmarks=[
+        BenchmarkTask(name="mmlu", min_score=0.5, weight=0.5),
+        BenchmarkTask(name="gsm8k", min_score=0.5, weight=0.5),
+    ])
+    submission = make_submission(runs=[BenchmarkRun(b="mmlu", r="r100")])
+    coordinator = StubCoordinator({"r100": make_status()})
+
+    results = {r.benchmark: r for r in scorer.verify_candidate_runs(submission, spec, coordinator)}
+    assert results["gsm8k"].ok is False
+    assert results["gsm8k"].score == 0.0
+    assert "no run id submitted" in results["gsm8k"].reason
+    assert coordinator.polled == ["r100"]  # no wasted call for the missing one
+
+
+def test_verify_candidate_runs_ignores_runs_for_benchmarks_not_in_spec():
+    """A miner submitting extra run ids cannot add benchmarks to the
+    competition — only the spec's benchmarks are ever scored."""
+    submission = make_submission(runs=[
+        BenchmarkRun(b="mmlu", r="r100"),
+        BenchmarkRun(b="not_in_spec", r="r999"),
+    ])
+    coordinator = StubCoordinator({"r100": make_status()})
+
+    results = scorer.verify_candidate_runs(submission, make_spec(), coordinator)
+    assert [r.benchmark for r in results] == ["mmlu"]
+    assert "r999" not in coordinator.polled
+
+
+
+# ---------------------------------------------------------------------------
+# verify_all_candidates — persistence + aggregate
+# ---------------------------------------------------------------------------
+
+def test_verify_all_candidates_returns_scores_and_persists_rows():
     conn = make_db()
-    result = scorer.precheck_one("hk1", make_submission(), make_spec(), MismatchContainer(), conn)
-    assert result.passed is False
-    assert "hotkey banned" in result.reason
-    assert store.is_banned(conn, "hk1") is True
+    submissions = {"hk1": make_submission()}
+    coordinator = StubCoordinator({"r100": make_status()})
+
+    scores = scorer.verify_all_candidates(conn, "comp1", submissions, make_spec(), coordinator)
+    assert scores == {"hk1": {"mmlu": 0.8}}
+
+    rows = store.benchmark_results_for_hotkey(conn, "comp1", "hk1")
+    assert len(rows) == 1
+    assert rows[0]["status"] == "completed"
+    assert rows[0]["score"] == 0.8
+    assert rows[0]["coordinator_run_id"] == "r100"
 
 
-def test_precheck_one_disqualifies_on_max_memory_lie(monkeypatch):
-    from competition.precheck_client import PrecheckVerdict, RamResult
+def test_verify_all_candidates_records_rejection_reason_and_actual_repo():
+    """A rejected row must say why, and carry the repo the run really used —
+    the dashboard reads these rows to explain a zero."""
+    conn = make_db()
+    submissions = {"hk1": make_submission()}
+    coordinator = StubCoordinator({"r100": make_status(repo="someone/else")})
 
-    monkeypatch.setattr(scorer, "check_repo_public", lambda repo: True)
-    monkeypatch.setattr(scorer._hf_api, "list_repo_files", lambda repo_id, revision: ["model.gguf"])
+    scores = scorer.verify_all_candidates(conn, "comp1", submissions, make_spec(), coordinator)
+    assert scores == {"hk1": {"mmlu": 0.0}}
 
-    class LyingRamContainer:
-        def check(self, repository, revision, filename, context_length):
-            return PrecheckVerdict(provenance=None, sha256="a" * 64, ram=RamResult(passed=True, ram_bytes=5_000_000))
+    row = store.benchmark_results_for_hotkey(conn, "comp1", "hk1")[0]
+    assert row["status"] == "failed"
+    assert row["score"] == 0.0
+    assert "repo mismatch" in row["last_message"]
+    assert row["repository"] == "someone/else"
 
-    submission = make_submission(max_memory=1000)  # 1000 KB reported, 5MB ~ 4883 KB measured
-    result = scorer.precheck_one("hk1", submission, make_spec(), LyingRamContainer(), make_db())
-    assert result.passed is False
-    assert "max_memory lie" in result.reason
+
+
+# ---------------------------------------------------------------------------
+# finalize_prechecked_candidate
+# ---------------------------------------------------------------------------
+
+def _insert_standby(conn, hotkey="hk1"):
+    store.insert_revealed_candidate(
+        conn, "comp1", hotkey, rank=0,
+        submission_json=make_submission().model_dump_json(),
+        reveal_block=5, status="prechecking",
+    )
+    conn.commit()
+
+
+def test_finalize_scores_candidate_that_passes_floors():
+    conn = make_db()
+    _insert_standby(conn)
+
+    scored = scorer.finalize_prechecked_candidate(
+        conn, "comp1", "hk1", make_spec(), {"mmlu": 0.8}, measured_memory_kb=900,
+    )
+    assert scored is True
+    assert store.get_candidate(conn, "comp1", "hk1")["status"] == "done"
+    results = store.scoring_results_for_competition(conn, "comp1")
+    assert len(results) == 1 and results[0]["hotkey"] == "hk1"
+
+
+def test_finalize_fails_candidate_below_floor():
+    """A candidate whose runs all scored 0.0 (every one rejected) reaches
+    here and is rejected by the floors, exactly like a genuinely weak model."""
+    conn = make_db()
+    _insert_standby(conn)
+
+    scored = scorer.finalize_prechecked_candidate(
+        conn, "comp1", "hk1", make_spec(), {"mmlu": 0.0}, measured_memory_kb=900,
+    )
+    assert scored is False
+    candidate = store.get_candidate(conn, "comp1", "hk1")
+    assert candidate["status"] == "failed"
+    assert "failed floors" in candidate["failure_reason"]
+    assert store.scoring_results_for_competition(conn, "comp1") == []
+
+
+def test_finalize_fails_candidate_over_memory_cap():
+    conn = make_db()
+    _insert_standby(conn)
+    spec = make_spec(competition_type="ram_ceiling", max_memory_kb=1000)
+
+    scored = scorer.finalize_prechecked_candidate(
+        conn, "comp1", "hk1", spec, {"mmlu": 0.8}, measured_memory_kb=5000,
+    )
+    assert scored is False
+    candidate = store.get_candidate(conn, "comp1", "hk1")
+    assert candidate["status"] == "failed"
+    assert "exceeded memory cap" in candidate["failure_reason"]
+
+
+def test_finalize_benchmark_floor_ranks_by_measured_memory():
+    """BENCHMARK_FLOOR scores the *measured* memory, not the claim — the
+    self-reported value only orders the precheck queue."""
+    conn = make_db()
+    _insert_standby(conn)
+
+    scorer.finalize_prechecked_candidate(
+        conn, "comp1", "hk1", make_spec(), {"mmlu": 0.8}, measured_memory_kb=900,
+    )
+    result = store.scoring_results_for_competition(conn, "comp1")[0]
+    assert result["final_score"] == -900.0
+    assert result["max_memory_kb"] == 900
 
 
 # ---------------------------------------------------------------------------
@@ -162,450 +385,70 @@ def test_dedup_winner_tie_break_by_hotkey():
 
 
 # ---------------------------------------------------------------------------
-# submit_benchmarks_for_candidate
+# precheck_one — unchanged by the rework, still the only ban path
 # ---------------------------------------------------------------------------
 
-def test_submit_benchmarks_persists_run_ids():
+def test_precheck_one_fails_when_repo_not_public(monkeypatch):
+    monkeypatch.setattr(scorer, "check_repo_public", lambda repo: False)
+    result = scorer.precheck_one("hk1", make_submission(), make_spec(), FakeContainer(), make_db())
+    assert result.passed is False
+    assert "not publicly accessible" in result.reason
+
+
+
+def test_precheck_one_passes_with_measured_ram(monkeypatch):
+    from competition.precheck_client import PrecheckVerdict, RamResult
+
+    monkeypatch.setattr(scorer, "check_repo_public", lambda repo: True)
+    monkeypatch.setattr(scorer._hf_api, "list_repo_files", lambda repo_id, revision: ["model.gguf"])
+
+    class RamContainer:
+        def check(self, repository, revision, filename, context_length):
+            return PrecheckVerdict(provenance=None, sha256="a" * 64, ram=RamResult(passed=True, ram_bytes=1000 * 1024))
+
+    result = scorer.precheck_one("hk1", make_submission(), make_spec(), RamContainer(), make_db())
+    assert result.passed is True
+    assert result.gguf_file == "model.gguf"
+    assert result.measured_memory_kb == 1000
+
+
+def test_precheck_one_bans_on_sha256_mismatch(monkeypatch):
+    """The only remaining ban path. Score-lying is no longer possible, since
+    scores come from the coordinator rather than the miner."""
+    from competition.precheck_client import PrecheckVerdict
+
+    monkeypatch.setattr(scorer, "check_repo_public", lambda repo: True)
+    monkeypatch.setattr(scorer._hf_api, "list_repo_files", lambda repo_id, revision: ["model.gguf"])
+
+    class MismatchContainer:
+        def check(self, repository, revision, filename, context_length):
+            return PrecheckVerdict(provenance=None, ram=None, sha256="f" * 64)
+
     conn = make_db()
-    submission = make_submission()
-    coordinator = MockCoordinator()
-
-    err = scorer.submit_benchmarks_for_candidate(
-        conn, "comp1", "hk1", submission, "model.gguf", make_spec(), coordinator,
-    )
-    assert err is None
-
-    rows = store.benchmark_results_for_hotkey(conn, "comp1", "hk1")
-    assert len(rows) == 1
-    assert rows[0]["benchmark_name"] == "mmlu"
-    assert rows[0]["status"] == "submitted"
-    assert rows[0]["coordinator_run_id"]
-
-
-def test_submit_benchmarks_returns_error_on_submit_failure():
-    conn = make_db()
-    submission = make_submission()
-
-    class FailingCoordinator:
-        def submit(self, *a, **k):
-            raise RuntimeError("coordinator unreachable")
-
-    err = scorer.submit_benchmarks_for_candidate(
-        conn, "comp1", "hk1", submission, "model.gguf", make_spec(), FailingCoordinator(),
-    )
-    assert err is not None
-    assert "benchmark submit error" in err
-
-
-# ---------------------------------------------------------------------------
-# poll_open_benchmarks
-# ---------------------------------------------------------------------------
-
-def _mock_score(repo: str, revision: str, benchmark: str) -> float:
-    """Mirror MockCoordinator's deterministic score derivation."""
-    import hashlib
-    import uuid
-    seed = f"{repo}:{revision}:{benchmark}"
-    run_id = str(uuid.UUID(hashlib.md5(seed.encode()).hexdigest()))
-    h = int(hashlib.sha256(run_id.encode()).hexdigest(), 16)
-    return round(0.55 + (h % 10000) / 10000 * 0.30, 4)
-
-
-def test_poll_open_benchmarks_scores_and_marks_done():
-    """The core C19 fix: score is persisted on benchmark_results the instant
-    it's observed complete, not just the status, and the candidate resolves
-    to 'done' with a scoring_results row."""
-    conn = make_db()
-    score = _mock_score("user/repo", "a" * 40, "mmlu")
-    submission = make_submission(claims=[Claim(b="mmlu", s=score)])
-    insert_candidate(conn, "hk1", submission, status="benchmarking", measured_memory_kb=999)
-
-    coordinator = MockCoordinator()
-    scorer.submit_benchmarks_for_candidate(conn, "comp1", "hk1", submission, "model.gguf", make_spec(), coordinator)
-
-    for _ in range(4):
-        scorer.poll_open_benchmarks(conn, "comp1", make_spec(), coordinator)
-
-    candidate = store.get_candidate(conn, "comp1", "hk1")
-    assert candidate["status"] == "done"
-    results = store.scoring_results_for_competition(conn, "comp1")
-    assert len(results) == 1
-    assert results[0]["hotkey"] == "hk1"
-
-    rows = store.benchmark_results_for_hotkey(conn, "comp1", "hk1")
-    assert rows[0]["status"] == "completed"
-    assert rows[0]["score"] is not None
-
-
-def test_poll_open_benchmarks_skips_completed_rows_no_resubmit():
-    """A benchmark already 'completed' (score persisted) must never be
-    touched again by poll_open_benchmarks — it's not in open_benchmark_results."""
-    conn = make_db()
-    submission = make_submission()
-    insert_candidate(conn, "hk1", submission, status="benchmarking")
-    store.insert_benchmark_result(conn, "comp1", "hk1", "mmlu", "user/repo", "a" * 40, "run-1")
-    conn.commit()
-    store.update_benchmark_result(conn, "comp1", "hk1", "mmlu", "completed", score=0.9)
-    conn.commit()
-
-    class ExplodingCoordinator:
-        def poll(self, run_id):
-            raise AssertionError("must not poll an already-completed benchmark")
-
-    scorer.poll_open_benchmarks(conn, "comp1", make_spec(), ExplodingCoordinator())
-    rows = store.benchmark_results_for_hotkey(conn, "comp1", "hk1")
-    assert rows[0]["score"] == 0.9
-
-
-def test_poll_open_benchmarks_fails_candidate_below_floor():
-    conn = make_db()
-    spec = make_spec(benchmarks=[BenchmarkTask(name="mmlu", min_score=0.999, weight=1.0)])
-    score = _mock_score("user/repo", "a" * 40, "mmlu")
-    submission = make_submission(claims=[Claim(b="mmlu", s=score)])
-    insert_candidate(conn, "hk1", submission, status="benchmarking", measured_memory_kb=999)
-
-    coordinator = MockCoordinator()
-    scorer.submit_benchmarks_for_candidate(conn, "comp1", "hk1", submission, "model.gguf", spec, coordinator)
-    for _ in range(4):
-        scorer.poll_open_benchmarks(conn, "comp1", spec, coordinator)
-
-    candidate = store.get_candidate(conn, "comp1", "hk1")
-    assert candidate["status"] == "failed"
-    assert "failed floors" in candidate["failure_reason"]
-
-
-def test_poll_open_benchmarks_bans_when_actual_lower_than_claimed():
-    conn = make_db()
-    # Claim well above the mock's actual deterministic score.
-    submission = make_submission(claims=[Claim(b="mmlu", s=0.99)])
-    insert_candidate(conn, "hk1", submission, status="benchmarking", measured_memory_kb=999)
-
-    coordinator = MockCoordinator()
-    scorer.submit_benchmarks_for_candidate(conn, "comp1", "hk1", submission, "model.gguf", make_spec(), coordinator)
-    for _ in range(4):
-        scorer.poll_open_benchmarks(conn, "comp1", make_spec(), coordinator)
-
-    candidate = store.get_candidate(conn, "comp1", "hk1")
-    assert candidate["status"] == "failed"
-    assert "hotkey banned" in candidate["failure_reason"]
+    result = scorer.precheck_one("hk1", make_submission(), make_spec(), MismatchContainer(), conn)
+    assert result.passed is False
+    assert "hotkey banned" in result.reason
     assert store.is_banned(conn, "hk1") is True
 
 
-def test_poll_open_benchmarks_does_not_ban_when_actual_higher_than_claimed():
+def test_precheck_one_disqualifies_on_max_memory_lie(monkeypatch):
+    """max_memory stays self-reported in the commit (decision 4). A lie fails
+    the candidate but does not ban — unlike a sha256 mismatch."""
+    from competition.precheck_client import PrecheckVerdict, RamResult
+
+    monkeypatch.setattr(scorer, "check_repo_public", lambda repo: True)
+    monkeypatch.setattr(scorer._hf_api, "list_repo_files", lambda repo_id, revision: ["model.gguf"])
+
+    class LyingRamContainer:
+        def check(self, repository, revision, filename, context_length):
+            return PrecheckVerdict(provenance=None, sha256="a" * 64, ram=RamResult(passed=True, ram_bytes=5_000_000))
+
     conn = make_db()
-    submission = make_submission(claims=[Claim(b="mmlu", s=0.01)])
-    insert_candidate(conn, "hk1", submission, status="benchmarking", measured_memory_kb=999)
-
-    coordinator = MockCoordinator()
-    scorer.submit_benchmarks_for_candidate(conn, "comp1", "hk1", submission, "model.gguf", make_spec(), coordinator)
-    for _ in range(4):
-        scorer.poll_open_benchmarks(conn, "comp1", make_spec(), coordinator)
-
-    candidate = store.get_candidate(conn, "comp1", "hk1")
-    assert candidate["status"] == "done"
+    submission = make_submission(max_memory=1000)  # 1000 KB reported, ~4883 KB measured
+    result = scorer.precheck_one("hk1", submission, make_spec(), LyingRamContainer(), conn)
+    assert result.passed is False
+    assert "max_memory lie" in result.reason
     assert store.is_banned(conn, "hk1") is False
-
-
-class NeverCompletingCoordinator:
-    """Always RUNNING with a last_log_at that never advances — simulates a
-    truly stalled coordinator run (no progress ever reported)."""
-    def __init__(self, log_age_seconds: float = 3600):
-        self._last_log_at = iso_ago(log_age_seconds)
-
-    def submit(self, *a, **k):
-        return "run-pending"
-
-    def poll(self, run_id):
-        from competition.benchmark_client import RunStatus, RunStatusCode
-        return RunStatus(run_id=run_id, status=RunStatusCode.RUNNING, phase="benchmarking",
-                         last_log_at=self._last_log_at)
-
-
-def test_poll_open_benchmarks_fails_when_log_older_than_window(monkeypatch):
-    monkeypatch.setattr(common_settings, "BENCHMARK_EXECUTION_STALE_SECONDS", 60)
-    conn = make_db()
-    insert_candidate(conn, "hk1", make_submission(), status="benchmarking")
-    store.insert_benchmark_result(conn, "comp1", "hk1", "mmlu", "user/repo", "a" * 40, "run-pending")
-    conn.commit()
-
-    scorer.poll_open_benchmarks(conn, "comp1", make_spec(), NeverCompletingCoordinator(log_age_seconds=3600))
-
-    rows = store.benchmark_results_for_hotkey(conn, "comp1", "hk1")
-    assert rows[0]["status"] == "failed"
-    candidate = store.get_candidate(conn, "comp1", "hk1")
-    assert candidate["status"] == "failed"
-    assert "stalled" in candidate["failure_reason"]
-
-
-def test_poll_open_benchmarks_keeps_running_when_log_within_window(monkeypatch):
-    monkeypatch.setattr(common_settings, "BENCHMARK_EXECUTION_STALE_SECONDS", 3600)
-    conn = make_db()
-    insert_candidate(conn, "hk1", make_submission(), status="benchmarking")
-    store.insert_benchmark_result(conn, "comp1", "hk1", "mmlu", "user/repo", "a" * 40, "run-pending")
-    conn.commit()
-
-    scorer.poll_open_benchmarks(conn, "comp1", make_spec(), NeverCompletingCoordinator(log_age_seconds=5))
-
-    rows = store.benchmark_results_for_hotkey(conn, "comp1", "hk1")
-    assert rows[0]["status"] == "submitted"
-    assert store.get_candidate(conn, "comp1", "hk1")["status"] == "benchmarking"
-
-
-def test_poll_open_benchmarks_never_stalls_without_a_usable_timestamp(monkeypatch):
-    """No last_log_at (or an unparseable one) means age is unmeasurable — a run
-    must never be failed on a stall we cannot actually observe."""
-    monkeypatch.setattr(common_settings, "BENCHMARK_EXECUTION_STALE_SECONDS", 0)
-
-    class NoTimestamp:
-        def __init__(self, value):
-            self.value = value
-
-        def poll(self, run_id):
-            from competition.benchmark_client import RunStatus, RunStatusCode
-            return RunStatus(run_id=run_id, status=RunStatusCode.RUNNING,
-                             phase="benchmarking", last_log_at=self.value)
-
-    for value in (None, "", "not-a-timestamp"):
-        conn = make_db()
-        insert_candidate(conn, "hk1", make_submission(), status="benchmarking")
-        store.insert_benchmark_result(conn, "comp1", "hk1", "mmlu", "user/repo", "a" * 40, "run-x")
-        conn.commit()
-
-        scorer.poll_open_benchmarks(conn, "comp1", make_spec(), NoTimestamp(value))
-
-        rows = store.benchmark_results_for_hotkey(conn, "comp1", "hk1")
-        assert rows[0]["status"] == "submitted", f"{value!r} should not stall"
-
-
-def test_poll_open_benchmarks_future_timestamp_clamps_to_zero_age(monkeypatch):
-    """A coordinator clock slightly ahead of ours must not read as a huge
-    negative age, nor stall the run."""
-    monkeypatch.setattr(common_settings, "BENCHMARK_EXECUTION_STALE_SECONDS", 0)
-    conn = make_db()
-    insert_candidate(conn, "hk1", make_submission(), status="benchmarking")
-    store.insert_benchmark_result(conn, "comp1", "hk1", "mmlu", "user/repo", "a" * 40, "run-future")
-    conn.commit()
-
-    scorer.poll_open_benchmarks(conn, "comp1", make_spec(), NeverCompletingCoordinator(log_age_seconds=-30))
-
-    rows = store.benchmark_results_for_hotkey(conn, "comp1", "hk1")
-    assert rows[0]["status"] == "submitted"
-
-
-def test_poll_open_benchmarks_survives_long_execution_phase_with_fresh_progress():
-    """A benchmark whose last_log_at keeps advancing must never be killed by
-    elapsed time alone."""
-    conn = make_db()
-    submission = make_submission(claims=[Claim(b="mmlu", s=0.7)])
-    insert_candidate(conn, "hk1", submission, status="benchmarking", measured_memory_kb=999)
-    store.insert_benchmark_result(conn, "comp1", "hk1", "mmlu", "user/repo", "a" * 40, "run-slow")
-    conn.commit()
-
-    class SlowButProgressingCoordinator:
-        def __init__(self):
-            self._n = 0
-
-        def poll(self, run_id):
-            from competition.benchmark_client import RunStatus, RunStatusCode
-            self._n += 1
-            if self._n < 5:
-                return RunStatus(run_id=run_id, status=RunStatusCode.RUNNING, phase="benchmarking", last_log_at=f"tick-{self._n}")
-            return RunStatus(run_id=run_id, status=RunStatusCode.COMPLETED, scores={"mmlu": 0.7})
-
-    coordinator = SlowButProgressingCoordinator()
-    spec = make_spec()
-    for _ in range(6):
-        scorer.poll_open_benchmarks(conn, "comp1", spec, coordinator)
-
-    candidate = store.get_candidate(conn, "comp1", "hk1")
-    assert candidate["status"] == "done"
-
-
-def test_poll_open_benchmarks_estimated_seconds_remaining_extends_stale_window(monkeypatch):
-    """A run reporting a large estimated_seconds_remaining must survive
-    longer than the static per-bucket stale window before being called stale."""
-    monkeypatch.setattr(common_settings, "BENCHMARK_EXECUTION_STALE_SECONDS", 0)
-    conn = make_db()
-    submission = make_submission(claims=[Claim(b="mmlu", s=0.7)])
-    insert_candidate(conn, "hk1", submission, status="benchmarking", measured_memory_kb=999)
-    store.insert_benchmark_result(conn, "comp1", "hk1", "mmlu", "user/repo", "a" * 40, "run-estimate")
-    conn.commit()
-
-    class LongEstimateCoordinator:
-        def __init__(self):
-            self._n = 0
-
-        def poll(self, run_id):
-            from competition.benchmark_client import RunStatus, RunStatusCode
-            self._n += 1
-            if self._n < 5:
-                return RunStatus(run_id=run_id, status=RunStatusCode.RUNNING, phase="benchmarking", estimated_seconds_remaining=1_000_000)
-            return RunStatus(run_id=run_id, status=RunStatusCode.COMPLETED, scores={"mmlu": 0.7})
-
-    coordinator = LongEstimateCoordinator()
-    spec = make_spec()
-    for _ in range(6):
-        scorer.poll_open_benchmarks(conn, "comp1", spec, coordinator)
-
-    candidate = store.get_candidate(conn, "comp1", "hk1")
-    assert candidate["status"] == "done"
-
-
-def test_poll_open_benchmarks_execution_bucket_survives_zero_startup_window(monkeypatch):
-    """phase="benchmarking" must use BENCHMARK_EXECUTION_STALE_SECONDS, not
-    BENCHMARK_STARTUP_STALE_SECONDS."""
-    monkeypatch.setattr(common_settings, "BENCHMARK_STARTUP_STALE_SECONDS", 0)
-    conn = make_db()
-    submission = make_submission(claims=[Claim(b="mmlu", s=0.7)])
-    insert_candidate(conn, "hk1", submission, status="benchmarking", measured_memory_kb=999)
-    store.insert_benchmark_result(conn, "comp1", "hk1", "mmlu", "user/repo", "a" * 40, "run-execution")
-    conn.commit()
-
-    class ExecutionPhaseCoordinator:
-        def __init__(self):
-            self._n = 0
-
-        def poll(self, run_id):
-            from competition.benchmark_client import RunStatus, RunStatusCode
-            self._n += 1
-            if self._n < 3:
-                return RunStatus(run_id=run_id, status=RunStatusCode.RUNNING, phase="benchmarking",
-                                 last_log_at=iso_ago(30))
-            return RunStatus(run_id=run_id, status=RunStatusCode.COMPLETED, scores={"mmlu": 0.7})
-
-    coordinator = ExecutionPhaseCoordinator()
-    spec = make_spec()
-    for _ in range(4):
-        scorer.poll_open_benchmarks(conn, "comp1", spec, coordinator)
-
-    candidate = store.get_candidate(conn, "comp1", "hk1")
-    assert candidate["status"] == "done"
-
-
-def test_poll_open_benchmarks_queued_bucket_survives_zero_startup_window(monkeypatch):
-    """phase="queued" must use BENCHMARK_QUEUED_STALE_SECONDS, not
-    BENCHMARK_STARTUP_STALE_SECONDS — a run merely waiting for a worker slot
-    must not be flagged stale just because the (unrelated) startup window is
-    tight."""
-    monkeypatch.setattr(common_settings, "BENCHMARK_STARTUP_STALE_SECONDS", 0)
-    conn = make_db()
-    submission = make_submission(claims=[Claim(b="mmlu", s=0.7)])
-    insert_candidate(conn, "hk1", submission, status="benchmarking", measured_memory_kb=999)
-    store.insert_benchmark_result(conn, "comp1", "hk1", "mmlu", "user/repo", "a" * 40, "run-queued")
-    conn.commit()
-
-    class QueuedPhaseCoordinator:
-        def __init__(self):
-            self._n = 0
-
-        def poll(self, run_id):
-            from competition.benchmark_client import RunStatus, RunStatusCode
-            self._n += 1
-            if self._n < 3:
-                return RunStatus(run_id=run_id, status=RunStatusCode.RUNNING, phase="queued",
-                                 last_log_at=iso_ago(30))
-            return RunStatus(run_id=run_id, status=RunStatusCode.COMPLETED, scores={"mmlu": 0.7})
-
-    coordinator = QueuedPhaseCoordinator()
-    spec = make_spec()
-    for _ in range(4):
-        scorer.poll_open_benchmarks(conn, "comp1", spec, coordinator)
-
-    candidate = store.get_candidate(conn, "comp1", "hk1")
-    assert candidate["status"] == "done"
-
-
-def test_poll_open_benchmarks_retry_waiting_bucket_survives_zero_startup_window(monkeypatch):
-    """phase="retry_waiting" (status stays "queued" but phase is relabeled
-    when a transiently-failed run is auto-requeued, see
-    schedule_run_retry in the coordinator) must use
-    BENCHMARK_QUEUED_STALE_SECONDS, not BENCHMARK_STARTUP_STALE_SECONDS —
-    same frozen-last_log_at situation as plain "queued"."""
-    monkeypatch.setattr(common_settings, "BENCHMARK_STARTUP_STALE_SECONDS", 0)
-    conn = make_db()
-    submission = make_submission(claims=[Claim(b="mmlu", s=0.7)])
-    insert_candidate(conn, "hk1", submission, status="benchmarking", measured_memory_kb=999)
-    store.insert_benchmark_result(conn, "comp1", "hk1", "mmlu", "user/repo", "a" * 40, "run-retry-waiting")
-    conn.commit()
-
-    class RetryWaitingPhaseCoordinator:
-        def __init__(self):
-            self._n = 0
-
-        def poll(self, run_id):
-            from competition.benchmark_client import RunStatus, RunStatusCode
-            self._n += 1
-            if self._n < 3:
-                return RunStatus(run_id=run_id, status=RunStatusCode.RUNNING, phase="retry_waiting",
-                                 last_log_at=iso_ago(30))
-            return RunStatus(run_id=run_id, status=RunStatusCode.COMPLETED, scores={"mmlu": 0.7})
-
-    coordinator = RetryWaitingPhaseCoordinator()
-    spec = make_spec()
-    for _ in range(4):
-        scorer.poll_open_benchmarks(conn, "comp1", spec, coordinator)
-
-    candidate = store.get_candidate(conn, "comp1", "hk1")
-    assert candidate["status"] == "done"
-
-
-def test_poll_open_benchmarks_queued_goes_stale_after_queued_window(monkeypatch):
-    """A run whose phase stays "queued" forever (last_log_at frozen, as the
-    coordinator never re-logs a merely-waiting run) must still eventually be
-    caught once BENCHMARK_QUEUED_STALE_SECONDS itself elapses."""
-    monkeypatch.setattr(common_settings, "BENCHMARK_QUEUED_STALE_SECONDS", 0)
-    conn = make_db()
-    submission = make_submission()
-    insert_candidate(conn, "hk1", submission, status="benchmarking")
-    store.insert_benchmark_result(conn, "comp1", "hk1", "mmlu", "user/repo", "a" * 40, "run-queued-stale")
-    conn.commit()
-
-    class NeverLeavingQueueCoordinator:
-        def poll(self, run_id):
-            from competition.benchmark_client import RunStatus, RunStatusCode
-            return RunStatus(run_id=run_id, status=RunStatusCode.RUNNING, phase="queued",
-                                 last_log_at=iso_ago(30))
-
-    scorer.poll_open_benchmarks(conn, "comp1", make_spec(), NeverLeavingQueueCoordinator())
-
-    rows = store.benchmark_results_for_hotkey(conn, "comp1", "hk1")
-    assert rows[0]["status"] == "failed"
-    assert store.get_candidate(conn, "comp1", "hk1")["status"] == "failed"
-
-
-def test_poll_open_benchmarks_lm_eval_running_bucket_survives_zero_startup_window(monkeypatch):
-    """phase="lm_eval_running" is the fine-grained sub-phase the coordinator
-    reports while status="benchmarking" — it must use
-    BENCHMARK_EXECUTION_STALE_SECONDS, not BENCHMARK_STARTUP_STALE_SECONDS.
-    Previously this fell through to the startup bucket since only the
-    coarse "benchmarking" string was recognized, not the fine-grained phase
-    actually reported by /status."""
-    monkeypatch.setattr(common_settings, "BENCHMARK_STARTUP_STALE_SECONDS", 0)
-    conn = make_db()
-    submission = make_submission(claims=[Claim(b="mmlu", s=0.7)])
-    insert_candidate(conn, "hk1", submission, status="benchmarking", measured_memory_kb=999)
-    store.insert_benchmark_result(conn, "comp1", "hk1", "mmlu", "user/repo", "a" * 40, "run-lm-eval-running")
-    conn.commit()
-
-    class LmEvalRunningPhaseCoordinator:
-        def __init__(self):
-            self._n = 0
-
-        def poll(self, run_id):
-            from competition.benchmark_client import RunStatus, RunStatusCode
-            self._n += 1
-            if self._n < 3:
-                return RunStatus(run_id=run_id, status=RunStatusCode.RUNNING, phase="lm_eval_running",
-                                 last_log_at=iso_ago(30))
-            return RunStatus(run_id=run_id, status=RunStatusCode.COMPLETED, scores={"mmlu": 0.7})
-
-    coordinator = LmEvalRunningPhaseCoordinator()
-    spec = make_spec()
-    for _ in range(4):
-        scorer.poll_open_benchmarks(conn, "comp1", spec, coordinator)
-
-    candidate = store.get_candidate(conn, "comp1", "hk1")
-    assert candidate["status"] == "done"
 
 
 def test_precheck_one_uses_submitted_filename_not_first_gguf(monkeypatch):
@@ -626,15 +469,13 @@ def test_precheck_one_uses_submitted_filename_not_first_gguf(monkeypatch):
             return PrecheckVerdict(provenance=None, sha256="a" * 64,
                                    ram=RamResult(passed=True, ram_bytes=1000 * 1024))
 
-    submission = make_submission(file="model.gguf")
-    result = scorer.precheck_one("hk1", submission, make_spec(), RecordingContainer(), make_db())
+    result = scorer.precheck_one("hk1", make_submission(file="model.gguf"), make_spec(), RecordingContainer(), make_db())
     assert seen["filename"] == "model.gguf"
     assert result.passed is True
-    assert result.gguf_file == "model.gguf"
 
 
 def test_precheck_one_fails_when_submitted_file_absent(monkeypatch):
-    """A missing submitted file fails cleanly — no ban, no fallback to another file."""
+    """A missing submitted file fails cleanly — no ban, no fallback."""
     monkeypatch.setattr(scorer, "check_repo_public", lambda repo: True)
     monkeypatch.setattr(
         scorer._hf_api, "list_repo_files",
@@ -642,34 +483,10 @@ def test_precheck_one_fails_when_submitted_file_absent(monkeypatch):
     )
 
     conn = make_db()
-    submission = make_submission(file="model.gguf")
-    result = scorer.precheck_one("hk1", submission, make_spec(), FakeContainer(), conn)
+    result = scorer.precheck_one("hk1", make_submission(file="model.gguf"), make_spec(), FakeContainer(), conn)
     assert result.passed is False
     assert "not found at revision" in result.reason
     assert "something-else.gguf" in result.reason
     assert store.is_banned(conn, "hk1") is False
 
 
-def test_precheck_one_falls_back_to_first_gguf_when_file_empty(monkeypatch):
-    """Legacy submissions with no file field still resolve to the first .gguf."""
-    from competition.precheck_client import PrecheckVerdict, RamResult
-
-    monkeypatch.setattr(scorer, "check_repo_public", lambda repo: True)
-    monkeypatch.setattr(
-        scorer._hf_api, "list_repo_files",
-        lambda repo_id, revision: ["first.gguf", "second.gguf"],
-    )
-
-    seen = {}
-
-    class RecordingContainer:
-        def check(self, repository, revision, filename, context_length):
-            seen["filename"] = filename
-            return PrecheckVerdict(provenance=None, sha256="a" * 64,
-                                   ram=RamResult(passed=True, ram_bytes=1000 * 1024))
-
-    submission = make_submission()
-    object.__setattr__(submission, "file", "")  # pre-`file` payload shape
-    result = scorer.precheck_one("hk1", submission, make_spec(), RecordingContainer(), make_db())
-    assert seen["filename"] == "first.gguf"
-    assert result.passed is True

@@ -5,6 +5,7 @@ from competition.benchmark_client import (
     HttpCoordinator,
     MockCoordinator,
     RunStatusCode,
+    _extract_model_identity,
     _extract_scores,
     make_coordinator,
 )
@@ -209,3 +210,122 @@ def test_http_coordinator_poll_retries_503_then_succeeds(monkeypatch):
     status = http.poll("run1")
     assert status.status == RunStatusCode.COMPLETED
     assert calls["n"] == 2
+
+
+# ---------------------------------------------------------------------------
+# Model identity extraction
+#
+# These fields are what bind a miner-supplied run id to the model they
+# committed on chain. Without them a run id proves nothing.
+# ---------------------------------------------------------------------------
+
+def _status_body(**overrides):
+    body = {
+        "run_id": "abc", "short_id": "r1234", "status": "completed",
+        "benchmark": "mmlu", "benchmarks": ["mmlu"],
+        "model_source": {"model": {
+            "repo": "user/repo",
+            "revision": "main",
+            "sha": "b" * 40,
+            "files": [
+                {"path": "model.gguf", "role": "model",
+                 "hash": {"algorithm": "sha256", "value": "a" * 64}, "size": 10},
+                {"path": "tokenizer.json", "role": "tokenizer",
+                 "hash": {"algorithm": "git_blob", "value": "deadbeef"}, "size": 1},
+            ],
+        }},
+        "benchmark_items": [
+            {"benchmark": "mmlu", "status": "completed",
+             "result": {"results": {"mmlu": {"acc,none": 0.71}}}},
+        ],
+        "result": {"results": {"mmlu": {"acc,none": 0.71}}},
+    }
+    body.update(overrides)
+    return body
+
+
+def test_extract_model_identity_prefers_resolved_sha_over_ref():
+    """`revision` may be a mutable ref like "main"; `sha` is the immutable
+    commit the coordinator resolved it to. Only the latter pins content."""
+    identity = _extract_model_identity(_status_body())
+    assert identity["revision"] == "b" * 40
+
+
+def test_extract_model_identity_collects_files_and_hash_algorithms():
+    identity = _extract_model_identity(_status_body())
+    assert identity["model_files"] == ["model.gguf", "tokenizer.json"]
+    assert identity["file_hashes"]["model.gguf"] == ("sha256", "a" * 64)
+    # Non-LFS files carry a git_blob hash, which is not a content sha256 —
+    # the algorithm must be preserved so verification can skip comparing it.
+    assert identity["file_hashes"]["tokenizer.json"] == ("git_blob", "deadbeef")
+
+
+def test_extract_model_identity_skips_files_without_a_usable_hash():
+    body = _status_body()
+    body["model_source"]["model"]["files"] = [
+        {"path": "model.gguf", "role": "model", "hash": {}},
+        {"path": "no-path-entry", "role": "model"},
+        {"role": "model", "hash": {"algorithm": "sha256", "value": "c" * 64}},  # no path
+    ]
+    identity = _extract_model_identity(body)
+    assert identity["model_files"] == ["model.gguf", "no-path-entry"]
+    assert identity["file_hashes"] == {}
+
+
+def test_extract_model_identity_tolerates_missing_model_source():
+    """A response without model_source must yield empty identity rather than
+    raising — verification then rejects it for having no identity."""
+    identity = _extract_model_identity({"status": "completed"})
+    assert identity["repo"] is None
+    assert identity["model_files"] == []
+    assert identity["benchmarks"] == []
+
+
+def test_http_poll_populates_verification_fields():
+    http = HttpCoordinator(base_url="http://example.invalid", api_key="k")
+    http._session.get = lambda *a, **k: _FakeResp(_status_body())
+
+    status = http.poll("r1234")
+    assert status.status == RunStatusCode.COMPLETED
+    assert status.repo == "user/repo"
+    assert status.revision == "b" * 40
+    assert "model.gguf" in status.model_files
+    assert status.benchmarks == ["mmlu"]
+    assert status.scores == {"mmlu": 0.71}
+
+
+def test_http_poll_partially_completed_is_terminal_with_partial_scores():
+    """A suite where some children succeeded and others failed is terminal.
+    Treating it as still-running would hang verification until the cutoff."""
+    http = HttpCoordinator(base_url="http://example.invalid", api_key="k")
+    http._session.get = lambda *a, **k: _FakeResp(_status_body(
+        status="partially_completed",
+        benchmarks=["mmlu", "gsm8k"],
+        result=None,
+        benchmark_items=[
+            {"benchmark": "mmlu", "status": "completed",
+             "result": {"results": {"mmlu": {"acc,none": 0.71}}}},
+            {"benchmark": "gsm8k", "status": "failed", "result": None},
+        ],
+    ))
+
+    status = http.poll("r1234")
+    assert status.status == RunStatusCode.COMPLETED
+    assert status.scores == {"mmlu": 0.71}
+    assert status.item_status == {"mmlu": "completed", "gsm8k": "failed"}
+
+
+def test_mock_coordinator_serves_identity_matching_what_was_submitted():
+    """The mock has to support verification end to end offline, otherwise
+    nothing below the HTTP layer can be tested without a network."""
+    c = MockCoordinator()
+    run_id = c.submit("user/repo", "b" * 40, "mmlu", ["model.gguf"])
+    for _ in range(3):
+        status = c.poll(run_id)
+
+    assert status.repo == "user/repo"
+    assert status.revision == "b" * 40
+    assert status.model_files == ["model.gguf"]
+    assert status.file_hashes["model.gguf"][0] == "sha256"
+    assert status.benchmarks == ["mmlu"]
+    assert status.item_status == {"mmlu": "completed"}

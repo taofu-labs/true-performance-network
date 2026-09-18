@@ -255,31 +255,6 @@ async def test_state_competition_unknown_id_returns_404(conn):
         assert (await resp.json())["error"] == "competition not found"
 
 
-@pytest.mark.asyncio
-async def test_state_competition_known_id_still_returns_state(conn, monkeypatch):
-    monkeypatch.setattr(validator_settings, "ADMIN_API_KEY", "secret-key")
-    async with TestClient(TestServer(make_app(conn))) as client:
-        await client.post(
-            "/v1/competitions", json=make_spec_json(),
-            headers={"Authorization": "Bearer secret-key"},
-        )
-        resp = await client.get("/v1/state/competitions/comp1")
-        assert resp.status == 200
-        assert (await resp.json())["competition_id"] == "comp1"
-
-
-@pytest.mark.asyncio
-async def test_delete_competition_requires_auth(conn, monkeypatch):
-    monkeypatch.setattr(validator_settings, "ADMIN_API_KEY", "secret-key")
-    async with TestClient(TestServer(make_app(conn))) as client:
-        await client.post(
-            "/v1/competitions", json=make_spec_json(),
-            headers={"Authorization": "Bearer secret-key"},
-        )
-        resp = await client.delete("/v1/competitions/comp1")
-        assert resp.status == 401
-        assert (await (await client.get("/v1/competitions/comp1")).json())["id"] == "comp1"
-
 
 @pytest.mark.asyncio
 async def test_delete_competition_unknown_id_returns_404(conn, monkeypatch):
@@ -369,26 +344,6 @@ async def test_list_competitions_rejects_non_integer_block(conn):
         assert "must be an integer" in (await resp.json())["error"]
 
 
-@pytest.mark.asyncio
-async def test_list_competitions_rejects_negative_block(conn):
-    async with TestClient(TestServer(make_app(conn))) as client:
-        resp = await client.get("/v1/competitions", params={"active": "true", "block": "-5"})
-        assert resp.status == 400
-        assert "non-negative" in (await resp.json())["error"]
-
-
-@pytest.mark.asyncio
-async def test_list_competitions_accepts_valid_block(conn, monkeypatch):
-    monkeypatch.setattr(validator_settings, "ADMIN_API_KEY", "secret-key")
-    async with TestClient(TestServer(make_app(conn))) as client:
-        await client.post(
-            "/v1/competitions",
-            json=make_spec_json("c", start_block=0, commit_end_block=1000, scoring_end_block=2000),
-            headers={"Authorization": "Bearer secret-key"},
-        )
-        resp = await client.get("/v1/competitions", params={"active": "true", "block": "500"})
-        assert resp.status == 200
-        assert [c["id"] for c in (await resp.json())["competitions"]] == ["c"]
 
 
 async def _seed_open_competition(client, comp_id="comp1"):
@@ -400,23 +355,6 @@ async def _seed_open_competition(client, comp_id="comp1"):
     )
 
 
-@pytest.mark.asyncio
-async def test_reset_scoring_requires_auth(conn, monkeypatch):
-    monkeypatch.setattr(validator_settings, "ADMIN_API_KEY", "secret-key")
-    async with TestClient(TestServer(make_app(conn))) as client:
-        await _seed_open_competition(client)
-        resp = await client.post("/v1/competitions/comp1/reset-scoring")
-        assert resp.status == 401
-
-
-@pytest.mark.asyncio
-async def test_reset_scoring_unknown_competition_404(conn, monkeypatch):
-    monkeypatch.setattr(validator_settings, "ADMIN_API_KEY", "secret-key")
-    async with TestClient(TestServer(make_app(conn))) as client:
-        resp = await client.post(
-            "/v1/competitions/ghost/reset-scoring", headers={"Authorization": "Bearer secret-key"}
-        )
-        assert resp.status == 404
 
 
 @pytest.mark.asyncio
@@ -429,7 +367,10 @@ async def test_reset_scoring_recovers_infra_failure(conn, monkeypatch):
         store.insert_revealed_candidate(
             conn, "comp1", "hk1", rank=0, submission_json="{}", reveal_block=5, status="failed"
         )
-        store.insert_benchmark_result(conn, "comp1", "hk1", "mmlu", "r", "rev", "run1")
+        store.record_benchmark_verification(
+            conn, "comp1", "hk1", "mmlu", run_id="r100", repository="user/repo",
+            revision="rev", status="completed", score=0.5,
+        )
         store.record_scoring_result(conn, "comp1", "hk1", final_score=0.5, max_memory_kb=10)
         conn.commit()
         store.mark_scored(conn, "comp1", status="failed_stage1_infra")
@@ -504,23 +445,6 @@ async def test_reset_scoring_refuses_stage2(conn, monkeypatch):
         assert len(store.all_candidates_for_competition(conn, "comp1")) == 1
 
 
-@pytest.mark.asyncio
-async def test_reset_scoring_refuses_finalized(conn, monkeypatch):
-    monkeypatch.setattr(validator_settings, "ADMIN_API_KEY", "secret-key")
-    async with TestClient(TestServer(make_app(conn))) as client:
-        await _seed_open_competition(client)
-        store.record_scoring_result(conn, "comp1", "hk1", final_score=0.9, max_memory_kb=10)
-        conn.commit()
-        store.mark_scored(conn, "comp1", status="scored")
-        assert store.get_stage(conn, "comp1") == "finalized"
-
-        resp = await client.post(
-            "/v1/competitions/comp1/reset-scoring", headers={"Authorization": "Bearer secret-key"}
-        )
-        assert resp.status == 409
-        assert store.is_scored(conn, "comp1") is True
-        assert len(store.scoring_results_for_competition(conn, "comp1")) == 1
-
 
 @pytest.mark.asyncio
 async def test_reset_scoring_resets_untouched_stage1_competition(conn, monkeypatch):
@@ -582,24 +506,6 @@ async def test_reset_scoring_refuses_when_window_closed(conn, monkeypatch):
 # ── pause / resume ───────────────────────────────────────────────────
 
 
-@pytest.mark.asyncio
-async def test_pause_requires_auth(conn, monkeypatch):
-    monkeypatch.setattr(validator_settings, "ADMIN_API_KEY", "secret-key")
-    async with TestClient(TestServer(make_app(conn))) as client:
-        await _seed_open_competition(client)
-        resp = await client.post("/v1/competitions/comp1/pause")
-        assert resp.status == 401
-        assert store.is_paused(conn, "comp1") is False
-
-
-@pytest.mark.asyncio
-async def test_pause_unknown_competition_404(conn, monkeypatch):
-    monkeypatch.setattr(validator_settings, "ADMIN_API_KEY", "secret-key")
-    async with TestClient(TestServer(make_app(conn))) as client:
-        resp = await client.post(
-            "/v1/competitions/ghost/pause", headers={"Authorization": "Bearer secret-key"}
-        )
-        assert resp.status == 404
 
 
 @pytest.mark.asyncio

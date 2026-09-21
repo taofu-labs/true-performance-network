@@ -1,19 +1,34 @@
 import json
+import re
 from typing import Dict, List, Optional
 from pydantic import BaseModel, field_validator
 
 
-"""Benchmark score claim"""
-class Claim(BaseModel):
-    b: str
-    s: float = 0.0
+# Coordinator run ids are either a short id ("r1234") or a full UUID. Both are
+# accepted by the coordinator's /status/:run_id route.
+_RUN_ID_RE = re.compile(r"^(r[1-9][0-9]{0,18}|[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})$")
+
+PAYLOAD_SPEC_VERSION = 2
+
+
+"""Coordinator benchmark run submitted by the miner"""
+class BenchmarkRun(BaseModel):
+    b: str  # benchmark name
+    r: str  # coordinator run id (short id or UUID)
+
+    @field_validator("r")
+    @classmethod
+    def run_id_must_be_well_formed(cls, v: str) -> str:
+        if not _RUN_ID_RE.match(v):
+            raise ValueError("run id must be a coordinator short id (r123) or a UUID")
+        return v
 
 
 class MinerSubmission(BaseModel):
     """Parsed from on-chain commitment string after auto-reveal."""
-    spec: int = 1
+    spec: int = PAYLOAD_SPEC_VERSION
     competition_id: str
-    claims: List[Claim]
+    runs: List[BenchmarkRun]
     repository: str  # bare HF repo ID: "user/repo"
     file: str
     file_sha256: str
@@ -49,9 +64,17 @@ class MinerSubmission(BaseModel):
             raise ValueError("max_memory must be positive")
         return v
 
+    @field_validator("spec")
+    @classmethod
+    def spec_must_be_current(cls, v: int) -> int:
+        if v != PAYLOAD_SPEC_VERSION:
+            raise ValueError(f"unsupported payload spec {v}, expected {PAYLOAD_SPEC_VERSION}")
+        return v
+
     @property
-    def self_reported_scores(self) -> Dict[str, float]:
-        return {c.b: c.s for c in self.claims}
+    def run_ids(self) -> Dict[str, str]:
+        """{benchmark_name: coordinator_run_id}. Later duplicates win."""
+        return {run.b: run.r for run in self.runs}
 
 
 
@@ -72,19 +95,19 @@ def build_reveal_payload(
     file: str,
     file_sha256: str,
     max_memory: int,
-    claims: List[Claim],
+    runs: List[BenchmarkRun],
     huggingface_revision: str,
 ) -> str:
     """Minified JSON string submitted to chain via TLE encryption."""
     data = {
-        "spec": 1,
+        "spec": PAYLOAD_SPEC_VERSION,
         "competition_id": competition_id,
         "repository": repository,
         "file": file,
         "file_sha256": file_sha256,
         "max_memory": max_memory,
         "huggingface_revision": huggingface_revision,
-        "claims": [{"b": c.b, "s": c.s} for c in claims],
+        "runs": [{"b": r.b, "r": r.r} for r in runs],
     }
     return json.dumps(data, separators=(",", ":"))
 

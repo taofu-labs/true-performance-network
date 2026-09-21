@@ -4,6 +4,7 @@ from common.urls import InvalidBaseUrl, validate_base_url
 from cli.commands.register import register
 from cli.commands.competitions import competitions
 from cli.commands.upload import upload
+from cli.commands.benchmark import benchmark
 from cli.commands.commit import commit
 from cli.commands.publish import publish
 from cli.commands.status import status
@@ -63,6 +64,7 @@ def main(
 app.command("register")(register)
 app.command("competitions")(competitions)
 app.command("upload")(upload)
+app.command("benchmark")(benchmark)
 app.command("commit")(commit)
 app.command("publish")(publish)
 app.command("status")(status)

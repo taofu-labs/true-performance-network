@@ -1,3 +1,5 @@
+import pytest
+
 from common.models.competition import BenchmarkTask, CompetitionPhase, CompetitionSpec
 
 
@@ -17,36 +19,19 @@ def make_spec(**overrides) -> CompetitionSpec:
     return CompetitionSpec(**fields)
 
 
-def test_phase_open_before_commit_end():
-    spec = make_spec()
-    assert spec.phase(99) == CompetitionPhase.OPEN
-
-
-def test_phase_revealing_at_commit_end():
-    spec = make_spec()
-    assert spec.phase(100) == CompetitionPhase.REVEALING
-
-
-def test_phase_revealing_until_grace_ends():
-    spec = make_spec()
-    assert spec.phase(109) == CompetitionPhase.REVEALING
-
-
-def test_phase_scoring_after_grace():
-    spec = make_spec()
-    assert spec.phase(110) == CompetitionPhase.SCORING
-
-
-def test_phase_distributing_after_scoring_end():
-    spec = make_spec(distribution_blocks=5)
-    assert spec.phase(200) == CompetitionPhase.DISTRIBUTING
-
-
-def test_phase_complete_after_distribution_end():
-    spec = make_spec(distribution_blocks=5)
-    assert spec.phase(205) == CompetitionPhase.COMPLETE
+@pytest.mark.parametrize("block,expected,overrides", [
+    (99,  CompetitionPhase.OPEN,         {}),                        # before commit_end_block
+    (100, CompetitionPhase.REVEALING,    {}),                        # commit_end_block itself
+    (109, CompetitionPhase.REVEALING,    {}),                        # last block of the grace window
+    (110, CompetitionPhase.SCORING,      {}),                        # grace elapsed
+    (200, CompetitionPhase.DISTRIBUTING, {"distribution_blocks": 5}),  # scoring_end_block
+    (205, CompetitionPhase.COMPLETE,     {"distribution_blocks": 5}),  # distribution window closed
+    (200, CompetitionPhase.COMPLETE,     {}),                        # no distribution window at all
+])
+def test_phase_boundaries(block, expected, overrides):
+    assert make_spec(**overrides).phase(block) == expected
 
 
 def test_blocks_until_next_phase_during_revealing():
     spec = make_spec()
-    assert spec.blocks_until_next_phase(105) == 5
+    assert spec.blocks_until_next_phase(105) == 5  # 110 - 105

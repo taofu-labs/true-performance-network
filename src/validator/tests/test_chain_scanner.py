@@ -1,7 +1,9 @@
 import sqlite3
 
+import pytest
+
 from common.models.competition import BenchmarkTask, CompetitionSpec
-from common.models.submission import build_reveal_payload, Claim
+from common.models.submission import BenchmarkRun, build_reveal_payload
 from validator import store
 from validator.chain_scanner import scan_reveals
 
@@ -30,7 +32,7 @@ def make_payload(competition_id="comp1") -> str:
         file="model.gguf",
         file_sha256="a" * 64,
         max_memory=1000,
-        claims=[Claim(b="mmlu", s=0.7)],
+        runs=[BenchmarkRun(b="mmlu", r="r100")],
         huggingface_revision="a" * 40,
     )
 
@@ -47,51 +49,20 @@ def make_db():
     return conn
 
 
-def test_scan_reveals_accepts_exact_block_match(monkeypatch):
+@pytest.mark.parametrize("reveal_block,accepted", [
+    (100,             True),   # exactly commit_end_block
+    (100 - GRACE,     True),   # window is symmetric — grace_blocks early still counts
+    (100 - GRACE - 1, False),  # one block before the window opens
+    (100 + GRACE - 1, True),   # last accepted block
+    (100 + GRACE,     False),  # window is exclusive at the top
+])
+def test_scan_reveals_block_window(monkeypatch, reveal_block, accepted):
     spec = make_spec(commit_end_block=100)
-    reveals = {"hk1": [(make_payload(), 100)]}
+    reveals = {"hk1": [(make_payload(), reveal_block)]}
     monkeypatch.setattr("validator.chain_scanner.read_revealed_commitments", lambda subtensor, netuid: reveals)
 
     result = scan_reveals(FakeSubtensor(reveals), spec, make_db())
-    assert set(result) == {"hk1"}
-
-
-def test_scan_reveals_accepts_grace_blocks_before_commit_end(monkeypatch):
-    """The window is symmetric around commit_end_block — a reveal landing up to
-    grace_blocks early still counts."""
-    spec = make_spec(commit_end_block=100)
-    reveals = {"hk1": [(make_payload(), 100 - GRACE)]}
-    monkeypatch.setattr("validator.chain_scanner.read_revealed_commitments", lambda subtensor, netuid: reveals)
-
-    result = scan_reveals(FakeSubtensor(reveals), spec, make_db())
-    assert set(result) == {"hk1"}
-
-
-def test_scan_reveals_rejects_block_before_window(monkeypatch):
-    spec = make_spec(commit_end_block=100)
-    reveals = {"hk1": [(make_payload(), 100 - GRACE - 1)]}
-    monkeypatch.setattr("validator.chain_scanner.read_revealed_commitments", lambda subtensor, netuid: reveals)
-
-    result = scan_reveals(FakeSubtensor(reveals), spec, make_db())
-    assert result == {}
-
-
-def test_scan_reveals_accepts_within_grace_window(monkeypatch):
-    spec = make_spec(commit_end_block=100)
-    reveals = {"hk1": [(make_payload(), 100 + GRACE - 1)]}
-    monkeypatch.setattr("validator.chain_scanner.read_revealed_commitments", lambda subtensor, netuid: reveals)
-
-    result = scan_reveals(FakeSubtensor(reveals), spec, make_db())
-    assert set(result) == {"hk1"}
-
-
-def test_scan_reveals_rejects_block_after_window(monkeypatch):
-    spec = make_spec(commit_end_block=100)
-    reveals = {"hk1": [(make_payload(), 100 + GRACE)]}
-    monkeypatch.setattr("validator.chain_scanner.read_revealed_commitments", lambda subtensor, netuid: reveals)
-
-    result = scan_reveals(FakeSubtensor(reveals), spec, make_db())
-    assert result == {}
+    assert set(result) == ({"hk1"} if accepted else set())
 
 
 def test_scan_reveals_skips_banned_hotkey(monkeypatch):

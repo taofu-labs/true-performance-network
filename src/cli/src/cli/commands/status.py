@@ -44,13 +44,13 @@ def status(
     if target_id:
         cfg = load_competition_config(coldkey, hotkey_name, target_id)
         if cfg:
-            claims_display = ", ".join(f"{c['b']}:{c['s']}" for c in (cfg.get("claims") or []))
+            runs_display = ", ".join(f"{r['b']}:{r['r']}" for r in (cfg.get("runs") or []))
             lines += [
                 f"[bold]Pending commit ({target_id}):[/bold]",
                 f"  Repo:         [cyan]{cfg.get('repository', '[none]')}[/cyan]",
                 f"  File:         [dim]{cfg.get('file', '[none]')}[/dim]",
                 f"  Size:         {cfg.get('file_size', 0):,} bytes",
-                f"  Claims:       {claims_display or '[none]'}",
+                f"  Runs:         {runs_display or '[none]'}",
             ]
             if cfg.get("commit_end_block"):
                 lines.append(f"  Reveals at:   block {cfg['commit_end_block']}")

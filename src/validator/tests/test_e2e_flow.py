@@ -84,7 +84,6 @@ class FakeWallet:
 class FakeNeuron:
     def __init__(self, hotkey):
         self.hotkey = hotkey
-        self.collateral_locked = None
 
 
 class FakeMetagraph:

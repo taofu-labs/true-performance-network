@@ -231,21 +231,6 @@ class Validator(HealthServerMixin, LeaderApiMixin):
             store.mark_scored(self._db, spec.id, status="failed_no_reveals")
             return
 
-        collateral_by_hotkey = {n.hotkey: n.collateral_locked for n in self.metagraph.neurons}
-        min_collateral = validator_settings.COLLATERAL_MIN_THRESHOLD
-        collateral_failed: dict[str, str] = {}
-        if min_collateral > 0:
-            def _has_collateral(hotkey: str) -> bool:
-                collateral = collateral_by_hotkey.get(hotkey)
-                if collateral is None:
-                    return True
-                return collateral.amount >= min_collateral
-
-            for hk in list(reveals):
-                if not _has_collateral(hk):
-                    collateral_failed[hk] = f"collateral below threshold ({collateral_by_hotkey[hk]} < {min_collateral})"
-                    logger.info(f"{hk[:12]} failed stage 1 — {collateral_failed[hk]}")
-
         seen_hashes: dict[str, tuple[str, int]] = {}
         dedup_losers: dict[str, tuple[str, int]] = {}
         for hotkey, (submission, block) in sorted(reveals.items(), key=lambda kv: kv[1][1]):
@@ -267,12 +252,9 @@ class Validator(HealthServerMixin, LeaderApiMixin):
             )
             logger.info(f"{hotkey[:12]} failed stage 1 — dedup loss")
 
-        eligible = {
-            hk: v for hk, v in reveals.items()
-            if hk not in collateral_failed and hk not in dedup_failed
-        }
+        eligible = {hk: v for hk, v in reveals.items() if hk not in dedup_failed}
         if not eligible:
-            logger.warning(f"{spec.id}: no reveals left after collateral/dedup filtering — terminal")
+            logger.warning(f"{spec.id}: no reveals left after dedup filtering — terminal")
             store.mark_scored(self._db, spec.id, status="failed_no_participants")
             return
 
@@ -325,7 +307,7 @@ class Validator(HealthServerMixin, LeaderApiMixin):
                 "status": "failed",
                 "failure_reason": reason,
             }
-            for hotkey, reason in {**collateral_failed, **dedup_failed}.items()
+            for hotkey, reason in dedup_failed.items()
         ]
 
         try:
@@ -336,7 +318,7 @@ class Validator(HealthServerMixin, LeaderApiMixin):
 
         store.set_stage(self._db, spec.id, "stage2_scoring")
         logger.info(f"{spec.id}: stage 1 done — {len(ranked_candidates)} ranked, "
-                    f"{len(collateral_failed) + len(dedup_failed)} failed stage-1 filters")
+                    f"{len(dedup_failed)} failed stage-1 filters")
 
     def _bump_stage1_or_fail(self, competition_id: str, reason: str) -> None:
         attempts = store.bump_stage1_attempts(self._db, competition_id)

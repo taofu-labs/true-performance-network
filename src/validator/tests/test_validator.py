@@ -185,7 +185,6 @@ def make_spec(**overrides):
 class FakeNeuron:
     def __init__(self, hotkey):
         self.hotkey = hotkey
-        self.collateral_locked = None
 
 
 def make_submission(**overrides):

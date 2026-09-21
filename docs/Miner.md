@@ -4,8 +4,6 @@
 
 - Bittensor wallet
 - HuggingFace account with write access
-- Miner collateral: currently at least `0.3 TAO` locked on the submitting hotkey
-  for each competition you enter
 
 ## Install CLI
 
@@ -26,28 +24,6 @@ tpn --help
 
 ```bash
 tpn register --coldkey <coldkey> --hotkey default
-```
-
-The registration flow can also lock miner collateral and set a collateral floor.
-For the current live requirement, use at least `0.3 TAO`:
-
-```bash
-tpn register \
-  --coldkey <coldkey> \
-  --hotkey default \
-  --collateral-amount 0.3 \
-  --floor-amount 0.3
-```
-
-If the hotkey is already registered, make sure it has at least `0.3 TAO` locked
-before the competition scoring phase starts. Validators check collateral at
-scoring time. A hotkey below the threshold is skipped for that competition; it is
-not banned for being under collateralized.
-
-Check the current collateral position:
-
-```bash
-tpn collateral-status --wallet <coldkey> --hotkey default
 ```
 
 ### 2. List competitions
@@ -165,7 +141,7 @@ Created on `register`. Each competition file holds the uploaded repo, filename, 
 
 ```
 tpn register           Register hotkey on subnet
-tpn collateral-status  Show locked miner collateral for a hotkey
+tpn collateral-status  Show locked miner collateral for a hotkey (optional)
 tpn competitions       List competitions (--refresh/-r to bypass the 10 min cache)
 tpn upload             Upload GGUF to HuggingFace
 tpn benchmark          Run the competition's benchmarks (needs BENCHMARK_API_KEY)

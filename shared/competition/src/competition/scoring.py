@@ -3,12 +3,15 @@ from common.models.competition import BenchmarkTask, CompetitionSpec, Competitio
 from common.models.submission import MinerSubmission
 
 
-def benchmark_composite(scores: Dict[str, float], tasks: List[BenchmarkTask]) -> float:
-    """Weighted average of benchmark scores. Tasks missing from scores count as 0."""
-    total_weight = sum(t.weight for t in tasks)
-    if total_weight == 0:
+def benchmark_min(scores: Dict[str, float], tasks: List[BenchmarkTask]) -> float:
+    """
+    Lowest score across the competition's benchmarks — a model is only as good
+    as its weakest one, so a strong result on one benchmark cannot buy rank for
+    a weak result on another. Tasks missing from scores count as 0.
+    """
+    if not tasks:
         return 0.0
-    return sum((t.weight / total_weight) * scores.get(t.name, 0.0) for t in tasks)
+    return min(scores.get(t.name, 0.0) for t in tasks)
 
 
 def final_score(
@@ -21,10 +24,11 @@ def final_score(
     (rank descending), so benchmark_floor scores are negated memory.
 
     - BENCHMARK_FLOOR: rank by lowest max_memory_kb (benchmarks are pass/fail floors).
-    - RAM_CEILING: rank by highest benchmark composite (max_memory_kb is a pass/fail cap).
+    - RAM_CEILING: rank by highest minimum benchmark score (max_memory_kb is a
+      pass/fail cap).
     """
     if spec.competition_type == CompetitionType.RAM_CEILING:
-        return benchmark_composite(scores, spec.benchmarks)
+        return benchmark_min(scores, spec.benchmarks)
     return -float(max_memory_kb)
 
 
@@ -52,8 +56,8 @@ def sort_by_verified_scores(
     """
     Sort {hotkey: submission} descending by final score computed from the
     miner's *verified* benchmark scores (lowest memory first for
-    benchmark_floor, highest benchmark composite for ram_ceiling). Ties broken
-    by benchmark composite.
+    benchmark_floor, highest minimum benchmark score for ram_ceiling). Ties
+    broken by that same minimum.
 
     `verified_scores` maps hotkey -> {benchmark_name: score}; a benchmark whose
     run failed verification is present with 0.0. `max_memory` is still the
@@ -66,7 +70,7 @@ def sort_by_verified_scores(
         submissions.items(),
         key=lambda item: (
             final_score(verified_scores.get(item[0], {}), item[1].max_memory, spec),
-            benchmark_composite(verified_scores.get(item[0], {}), spec.benchmarks),
+            benchmark_min(verified_scores.get(item[0], {}), spec.benchmarks),
         ),
         reverse=True,
     )

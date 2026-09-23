@@ -4,7 +4,7 @@ from common.models.competition import BenchmarkTask, CompetitionSpec, Competitio
 from common.models.submission import BenchmarkRun, MinerSubmission, ScoringResult
 from competition.scoring import (
     aggregate_competition_weights,
-    benchmark_composite,
+    benchmark_min,
     compute_emission_weights,
     final_score,
     passes_floors,
@@ -24,7 +24,7 @@ def make_spec(id: str, emission_weight: float, distribution_blocks: int = 100) -
         top_n=1,
         emission_weight=emission_weight,
         distribution_blocks=distribution_blocks,
-        benchmarks=[BenchmarkTask(name="mmlu", min_score=0.5, weight=1.0)],
+        benchmarks=[BenchmarkTask(name="mmlu", min_score=0.5)],
     )
 
 
@@ -95,8 +95,8 @@ def make_benchmark_floor_spec(**overrides) -> CompetitionSpec:
         top_n=2,
         emission_weight=1.0,
         benchmarks=[
-            BenchmarkTask(name="mmlu", min_score=0.5, weight=0.5),
-            BenchmarkTask(name="gsm8k", min_score=0.3, weight=0.5),
+            BenchmarkTask(name="mmlu", min_score=0.5),
+            BenchmarkTask(name="gsm8k", min_score=0.3),
         ],
     )
     defaults.update(overrides)
@@ -116,25 +116,33 @@ def make_ram_ceiling_spec(**overrides) -> CompetitionSpec:
         competition_type=CompetitionType.RAM_CEILING,
         max_memory_kb=1000,
         benchmarks=[
-            BenchmarkTask(name="mmlu", min_score=0.5, weight=0.5),
-            BenchmarkTask(name="gsm8k", min_score=0.3, weight=0.5),
+            BenchmarkTask(name="mmlu", min_score=0.5),
+            BenchmarkTask(name="gsm8k", min_score=0.3),
         ],
     )
     defaults.update(overrides)
     return CompetitionSpec(**defaults)
 
 
-def test_benchmark_composite_weighted_average_missing_counts_zero():
+def test_benchmark_min_takes_the_weakest_benchmark():
     tasks = [
-        BenchmarkTask(name="mmlu", min_score=0.0, weight=0.75),
-        BenchmarkTask(name="gsm8k", min_score=0.0, weight=0.25),
+        BenchmarkTask(name="mmlu", min_score=0.0),
+        BenchmarkTask(name="gsm8k", min_score=0.0),
     ]
-    assert benchmark_composite({"mmlu": 0.8}, tasks) == pytest.approx(0.6)  # gsm8k missing -> 0
+    # A strong mmlu cannot carry a weak gsm8k — the min is what ranks.
+    assert benchmark_min({"mmlu": 0.9, "gsm8k": 0.2}, tasks) == pytest.approx(0.2)
 
 
-def test_benchmark_composite_zero_total_weight_returns_zero():
-    tasks = [BenchmarkTask(name="mmlu", min_score=0.0, weight=0.0)]
-    assert benchmark_composite({"mmlu": 0.9}, tasks) == 0.0
+def test_benchmark_min_missing_task_counts_zero():
+    tasks = [
+        BenchmarkTask(name="mmlu", min_score=0.0),
+        BenchmarkTask(name="gsm8k", min_score=0.0),
+    ]
+    assert benchmark_min({"mmlu": 0.8}, tasks) == 0.0  # gsm8k missing -> 0
+
+
+def test_benchmark_min_no_tasks_returns_zero():
+    assert benchmark_min({"mmlu": 0.9}, []) == 0.0
 
 
 def test_final_score_benchmark_floor_is_negated_memory():
@@ -142,15 +150,15 @@ def test_final_score_benchmark_floor_is_negated_memory():
     assert final_score({}, 5000, spec) == -5000.0
 
 
-def test_final_score_ram_ceiling_is_composite():
+def test_final_score_ram_ceiling_is_min_benchmark():
     spec = make_ram_ceiling_spec()
-    assert final_score({"mmlu": 0.8, "gsm8k": 0.4}, 500, spec) == pytest.approx(0.6)
+    assert final_score({"mmlu": 0.8, "gsm8k": 0.4}, 500, spec) == pytest.approx(0.4)
 
 
 def test_passes_floors_all_pass_and_one_fail():
     tasks = [
-        BenchmarkTask(name="mmlu", min_score=0.5, weight=0.5),
-        BenchmarkTask(name="gsm8k", min_score=0.3, weight=0.5),
+        BenchmarkTask(name="mmlu", min_score=0.5),
+        BenchmarkTask(name="gsm8k", min_score=0.3),
     ]
     ok, failures = passes_floors({"mmlu": 0.6, "gsm8k": 0.4}, tasks)
     assert ok is True and failures == []
@@ -198,7 +206,7 @@ def test_sort_by_verified_scores_benchmark_floor_lowest_memory_first():
     assert [hk for hk, _ in ranked] == ["hk_small", "hk_big"]
 
 
-def test_sort_by_verified_scores_ram_ceiling_highest_composite_first():
+def test_sort_by_verified_scores_ram_ceiling_highest_min_first():
     spec = make_ram_ceiling_spec()
     submissions = {"hk_low": make_submission(500), "hk_high": make_submission(500)}
     verified = {

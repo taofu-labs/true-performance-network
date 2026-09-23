@@ -162,7 +162,7 @@ def make_spec(**overrides):
         start_block=0, commit_end_block=10, scoring_end_block=1000,
         reveal_grace_blocks=0,
         top_n=1, emission_distribution=[1.0],
-        benchmarks=[BenchmarkTask(name="mmlu", min_score=0.3, weight=1.0)],
+        benchmarks=[BenchmarkTask(name="mmlu", min_score=0.3)],
         competition_type="ram_ceiling", max_memory_kb=MEMORY_CAP_KB,
         ram_check_context_length=512,   # keep the real llama-cli run quick
         model_repo=None,                # no base model -> no provenance download

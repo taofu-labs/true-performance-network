@@ -10,7 +10,7 @@ def make_spec(**overrides) -> CompetitionSpec:
     fields = dict(
         id="comp1", name="comp1", start_block=0, commit_end_block=10, scoring_end_block=20,
         emission_distribution=[1.0], top_n=1,
-        benchmarks=[BenchmarkTask(name="mmlu", min_score=0.5, weight=1.0)],
+        benchmarks=[BenchmarkTask(name="mmlu", min_score=0.5)],
     )
     fields.update(overrides)
     return CompetitionSpec(**fields)
@@ -203,8 +203,8 @@ def test_verify_run_rejects_completed_run_missing_the_score():
 
 def test_verify_candidate_runs_covers_every_spec_benchmark():
     spec = make_spec(benchmarks=[
-        BenchmarkTask(name="mmlu", min_score=0.5, weight=0.5),
-        BenchmarkTask(name="gsm8k", min_score=0.5, weight=0.5),
+        BenchmarkTask(name="mmlu", min_score=0.5),
+        BenchmarkTask(name="gsm8k", min_score=0.5),
     ])
     submission = make_submission(runs=[
         BenchmarkRun(b="mmlu", r="r100"),
@@ -225,8 +225,8 @@ def test_verify_candidate_runs_scores_zero_for_missing_run_id():
     """A benchmark the miner submitted no run for scores 0.0 — floors decide
     whether that is survivable, per decision 6."""
     spec = make_spec(benchmarks=[
-        BenchmarkTask(name="mmlu", min_score=0.5, weight=0.5),
-        BenchmarkTask(name="gsm8k", min_score=0.5, weight=0.5),
+        BenchmarkTask(name="mmlu", min_score=0.5),
+        BenchmarkTask(name="gsm8k", min_score=0.5),
     ])
     submission = make_submission(runs=[BenchmarkRun(b="mmlu", r="r100")])
     coordinator = StubCoordinator({"r100": make_status()})

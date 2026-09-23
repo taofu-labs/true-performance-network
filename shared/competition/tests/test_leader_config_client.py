@@ -34,7 +34,7 @@ def make_spec(comp_id="comp-a", **overrides):
         "scoring_end_block": 20,
         "emission_distribution": [1.0],
         "top_n": 1,
-        "benchmarks": [{"name": "mmlu", "min_score": 0.5, "weight": 1.0}],
+        "benchmarks": [{"name": "mmlu", "min_score": 0.5}],
     }
     fields.update(overrides)
     return fields

@@ -54,7 +54,7 @@ def make_spec_json(comp_id="comp1", **overrides):
         "scoring_end_block": 200,
         "emission_distribution": [1.0],
         "top_n": 1,
-        "benchmarks": [{"name": "mmlu", "min_score": 0.5, "weight": 1.0}],
+        "benchmarks": [{"name": "mmlu", "min_score": 0.5}],
     }
     fields.update(overrides)
     return fields

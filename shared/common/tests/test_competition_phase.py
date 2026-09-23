@@ -13,7 +13,7 @@ def make_spec(**overrides) -> CompetitionSpec:
         "reveal_grace_blocks": 10,
         "emission_distribution": [1.0],
         "top_n": 1,
-        "benchmarks": [BenchmarkTask(name="mmlu", min_score=0.5, weight=1.0)],
+        "benchmarks": [BenchmarkTask(name="mmlu", min_score=0.5)],
     }
     fields.update(overrides)
     return CompetitionSpec(**fields)

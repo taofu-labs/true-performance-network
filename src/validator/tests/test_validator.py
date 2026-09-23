@@ -176,7 +176,7 @@ def make_spec(**overrides):
     fields = {
         "id": "comp1", "name": "comp1", "start_block": 0, "commit_end_block": 10,
         "scoring_end_block": 20, "emission_distribution": [1.0], "top_n": 1,
-        "benchmarks": [BenchmarkTask(name="mmlu", min_score=0.5, weight=1.0)],
+        "benchmarks": [BenchmarkTask(name="mmlu", min_score=0.5)],
     }
     fields.update(overrides)
     return CompetitionSpec.model_validate(fields)

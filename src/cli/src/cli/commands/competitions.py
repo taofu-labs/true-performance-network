@@ -45,7 +45,7 @@ def competitions(
             "[bold]Benchmarks:[/bold]",
         ]
         for task in spec.benchmarks:
-            lines.append(f"  {task.name:<14} min={task.min_score:.2f}  weight={task.weight}")
+            lines.append(f"  {task.name:<14} min={task.min_score:.2f}")
         if spec.max_memory_kb:
             lines.append(f"\n[dim]Max memory:[/dim]     {spec.max_memory_kb:,} KB")
 

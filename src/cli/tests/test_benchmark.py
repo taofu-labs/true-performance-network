@@ -34,7 +34,7 @@ def stub_leader(monkeypatch, benchmarks=("mmlu", "gsm8k")):
     comp = {
         "id": "comp-a", "name": "comp-a", "start_block": 0, "commit_end_block": 100,
         "scoring_end_block": 200, "emission_distribution": [1.0], "top_n": 1,
-        "benchmarks": [{"name": n, "min_score": 0.5, "weight": 1.0 / len(benchmarks)} for n in benchmarks],
+        "benchmarks": [{"name": n, "min_score": 0.5} for n in benchmarks],
     }
     leader_config_client._cache.clear()
     leader_config_client._cache_time.clear()

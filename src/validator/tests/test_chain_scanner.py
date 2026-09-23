@@ -20,7 +20,7 @@ def make_spec(commit_end_block=100) -> CompetitionSpec:
         scoring_end_block=200,
         emission_distribution=[1.0],
         top_n=1,
-        benchmarks=[BenchmarkTask(name="mmlu", min_score=0.5, weight=1.0)],
+        benchmarks=[BenchmarkTask(name="mmlu", min_score=0.5)],
         reveal_grace_blocks=GRACE,
     )
 

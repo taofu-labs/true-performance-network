@@ -303,12 +303,20 @@ def _run_checks_inner(gguf_path: str, context_length: int, run_provenance: bool)
 # llama.cpp RAM measurement
 # ---------------------------------------------------------------------------
 
-_RE_WEIGHTS = re.compile(r"load_tensors:.*CPU model buffer size\s*=\s*([\d.]+)\s*MiB", re.IGNORECASE)
-_RE_KV      = re.compile(r"llama_kv_cache:.*CPU KV buffer size\s*=\s*([\d.]+)\s*MiB", re.IGNORECASE)
+_RE_WEIGHTS = re.compile(r"load_tensors:\s*(\S+) model buffer size\s*=\s*([\d.]+)\s*MiB", re.IGNORECASE)
+_RE_KV      = re.compile(r"llama_kv_cache:\s*(\S+) KV buffer size\s*=\s*([\d.]+)\s*MiB", re.IGNORECASE)
 
 
 def _failed_ram() -> dict:
     return {"passed": False, "ram_bytes": 0, "weights_bytes": 0, "kv_cache_bytes": 0}
+
+
+def _sum_cpu_mib(matches: list[tuple[str, str]]) -> float:
+    """Sum host-RAM buffers. llama.cpp logs one line per buffer type, and a
+    quantized model splits its weights across CPU and CPU_REPACK — both are
+    real, disjoint allocations, so the total is their sum. Non-CPU buffer
+    names are device memory, not host RAM, and are excluded."""
+    return sum(float(v) for name, v in matches if name.upper().startswith("CPU"))
 
 
 def _run_llama_cli(gguf_path: str, context_length: int) -> tuple[dict, str | None]:
@@ -317,7 +325,9 @@ def _run_llama_cli(gguf_path: str, context_length: int) -> tuple[dict, str | Non
     # --no-warmup: skip warmup pass to avoid SIGABRT on encoder-only models
     # -n 1: buffer sizes are logged at load; generating a full reply just burns
     #       the timeout budget (a model with a broken chat template never stops)
-    # findall[-1]: model loads twice internally; last match has real values (not 0.00 MiB)
+    # -fit off: auto-sizing is a no-op here (-ngl and -c are both pinned) but it
+    #       pre-loads the model with no_alloc, logging a duplicate set of buffer
+    #       lines at 0.00 MiB. Off => one load pass, so summing is unambiguous.
     cmd = [
         "llama-cli",
         "-m", gguf_path,
@@ -334,6 +344,7 @@ def _run_llama_cli(gguf_path: str, context_length: int) -> tuple[dict, str | Non
         "--single-turn",
         "--no-warmup",
         "-n", "1",
+        "-fit", "off",
         "-p", "hi",
     ]
     _debug(f"llama-cli command: {' '.join(cmd)}")
@@ -370,9 +381,18 @@ def _run_llama_cli(gguf_path: str, context_length: int) -> tuple[dict, str | Non
         _log(f"{reason}. tail:\n{combined[-1000:]}", "ERROR")
         return _failed_ram(), reason
 
-    weights_bytes = int(float(w_matches[-1]) * 1024 * 1024)
-    kv_bytes      = int(float(kv_matches[-1]) * 1024 * 1024)
-    _debug(f"Parsed weights_bytes={weights_bytes:,} kv_cache_bytes={kv_bytes:,}")
+    weights_bytes = int(_sum_cpu_mib(w_matches) * 1024 * 1024)
+    kv_bytes      = int(_sum_cpu_mib(kv_matches) * 1024 * 1024)
+
+    # Lines matched but no CPU buffer among them: weights landed on a device,
+    # so this is not a host-RAM measurement. Fail closed rather than report 0.
+    if weights_bytes == 0:
+        reason = f"llama-cli reported no CPU weight buffer (names: {[n for n, _ in w_matches]})"
+        _log(f"{reason}. tail:\n{combined[-1000:]}", "ERROR")
+        return _failed_ram(), reason
+
+    _debug(f"Parsed weights_bytes={weights_bytes:,} kv_cache_bytes={kv_bytes:,} "
+           f"from buffers {[n for n, _ in w_matches]}")
     return {
         "passed": True,
         "ram_bytes": weights_bytes + kv_bytes,

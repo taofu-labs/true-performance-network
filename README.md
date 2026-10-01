@@ -4,6 +4,7 @@ TPN is a Bittensor subnet that incentivizes miners to build high-performance, qu
 
 ## Docs
 
+- [Subnet Overview (miner perspective)](docs/Overview.md)
 - [Running a Validator](docs/Validator.md)
 - [Miner Operations](docs/Miner.md)
 - [Contributor Guide](docs/Contributor.md)

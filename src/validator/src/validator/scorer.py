@@ -133,7 +133,7 @@ def precheck_one(
     reported_bytes = submission.max_memory * 1024
     measured_bytes = verdict.ram.ram_bytes
     tolerance = common_settings.RAM_CHECK_LYING_TOLERANCE
-    if reported_bytes > 0 and abs(measured_bytes - reported_bytes) / reported_bytes > tolerance:
+    if reported_bytes > 0 and measured_bytes > reported_bytes * (1 + tolerance):
         diff = abs(measured_bytes - reported_bytes) / reported_bytes
         reason = f"max_memory lie: reported {reported_bytes}B measured {measured_bytes}B ({diff:.1%})"
         logger.warning(f"{hotkey[:12]} {reason}")

@@ -412,6 +412,31 @@ def test_precheck_one_passes_with_measured_ram(monkeypatch):
     assert result.measured_memory_kb == 1000
 
 
+def test_precheck_one_allows_measured_ram_below_report(monkeypatch):
+    from competition.precheck_client import PrecheckVerdict, RamResult
+
+    monkeypatch.setattr(scorer, "check_repo_public", lambda repo: True)
+    monkeypatch.setattr(scorer._hf_api, "list_repo_files", lambda repo_id, revision: ["model.gguf"])
+
+    class ConservativeRamContainer:
+        def check(self, repository, revision, filename, context_length):
+            return PrecheckVerdict(
+                provenance=None,
+                sha256="a" * 64,
+                ram=RamResult(passed=True, ram_bytes=800 * 1024),
+            )
+
+    result = scorer.precheck_one(
+        "hk1",
+        make_submission(max_memory=1000),
+        make_spec(),
+        ConservativeRamContainer(),
+        make_db(),
+    )
+    assert result.passed is True
+    assert result.measured_memory_kb == 800
+
+
 def test_precheck_one_bans_on_sha256_mismatch(monkeypatch):
     """The only remaining ban path. Score-lying is no longer possible, since
     scores come from the coordinator rather than the miner."""
@@ -488,5 +513,3 @@ def test_precheck_one_fails_when_submitted_file_absent(monkeypatch):
     assert "not found at revision" in result.reason
     assert "something-else.gguf" in result.reason
     assert store.is_banned(conn, "hk1") is False
-
-

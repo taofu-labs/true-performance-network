@@ -113,6 +113,23 @@ validator. Running multiple leaders can produce conflicting scoring state.
 | `WALLET_PATH` | (bittensor default) | Override wallet directory |
 | `LAUNCH_HEALTH` | `False` | Set `True` to enable health endpoint on port 9100 |
 | `FOLLOWER_POLL_INTERVAL` | `60` | Seconds between polls of the leader's scoring results |
+| `BENCHMARK_BACKEND` | `mock` | `http` for real coordinator calls; `mock` for offline runs |
+| `COORDINATOR_BASE_URL` | `https://bench.trueperformancenetwork.com` | Benchmark coordinator API |
+| `COORDINATOR_API_KEY` | (unset) | Required when `BENCHMARK_BACKEND=http` |
+
+### Coordinator token scope (leader only)
+
+Miners run their own benchmarks and commit the resulting run ids on chain. The
+leader reads those runs back to check each one actually benchmarked the model
+the miner committed — same repo, same revision, same file.
+
+The coordinator only lets a run be read by the token that created it or by an
+**admin**-scoped token, so on the leader `COORDINATOR_API_KEY` must carry
+`admin` scope. Admin scope is service-wide — it can also cancel and retry any
+user's runs — so treat this key as a privileged credential.
+
+Followers never call the coordinator; they read finished results from the
+leader's API.
 
 Competition configs and scoring results come from the primary validator API.
 Followers read them over `GET /v1/competitions` and follower scoring endpoints.

@@ -61,6 +61,7 @@ CREATE TABLE IF NOT EXISTS revealed_candidates (
     failure_reason TEXT,
     gguf_file TEXT,
     measured_memory_kb INTEGER,
+    verified_scores_json TEXT,
     updated_at REAL NOT NULL,
     PRIMARY KEY (competition_id, hotkey)
 );
@@ -96,22 +97,6 @@ CREATE TABLE IF NOT EXISTS weights_history (
     competition_id TEXT NOT NULL,
     set_at REAL NOT NULL,
     weights_json TEXT NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS benchmark_runs (
-    competition_id TEXT NOT NULL,
-    hotkey TEXT NOT NULL,
-    benchmark_name TEXT NOT NULL,
-    repository TEXT NOT NULL,
-    revision TEXT NOT NULL,
-    coordinator_run_id TEXT NOT NULL,
-    status TEXT NOT NULL DEFAULT 'submitted',
-    submitted_at REAL NOT NULL,
-    updated_at REAL NOT NULL,
-    phase TEXT,
-    percent_complete REAL,
-    last_message TEXT,
-    PRIMARY KEY (competition_id, hotkey, benchmark_name)
 );
 
 CREATE TABLE IF NOT EXISTS banned_hotkeys (
@@ -195,7 +180,11 @@ def _migrate_scored_competitions_stage_columns(conn: sqlite3.Connection) -> None
         conn.execute("ALTER TABLE scored_competitions ADD COLUMN stage1_attempts INTEGER NOT NULL DEFAULT 0")
     if "paused_at" not in existing:
         conn.execute("ALTER TABLE scored_competitions ADD COLUMN paused_at REAL")
-    conn.execute("UPDATE benchmark_results SET status = 'submitted' WHERE status = 'pending-resume'")
+
+    candidate_columns = {row["name"] for row in conn.execute("PRAGMA table_info(revealed_candidates)")}
+    if "verified_scores_json" not in candidate_columns:
+        conn.execute("ALTER TABLE revealed_candidates ADD COLUMN verified_scores_json TEXT")
+
     conn.commit()
 
 
@@ -298,7 +287,7 @@ def reset_competition_scoring(conn: sqlite3.Connection, competition_id: str) -> 
     Callers must refuse anything past stage 1 that did not fail.
     """
     deleted = {}
-    for table in ("revealed_candidates", "benchmark_results", "benchmark_runs", "scoring_results"):
+    for table in ("revealed_candidates", "benchmark_results", "scoring_results"):
         cur = conn.execute(f"DELETE FROM {table} WHERE competition_id = ?", (competition_id,))
         deleted[table] = cur.rowcount
     cur = conn.execute("DELETE FROM scored_competitions WHERE competition_id = ?", (competition_id,))
@@ -336,11 +325,14 @@ def insert_revealed_candidates(
     with conn:
         conn.executemany(
             """INSERT INTO revealed_candidates
-               (competition_id, hotkey, rank, submission_json, reveal_block, status, failure_reason, updated_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+               (competition_id, hotkey, rank, submission_json, reveal_block, status,
+                failure_reason, verified_scores_json, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             [
                 (competition_id, c["hotkey"], c["rank"], c["submission_json"],
-                 c["reveal_block"], c["status"], c.get("failure_reason"), now)
+                 c["reveal_block"], c["status"], c.get("failure_reason"),
+                 json.dumps(c["verified_scores"]) if c.get("verified_scores") is not None else None,
+                 now)
                 for c in candidates
             ],
         )
@@ -384,9 +376,11 @@ def mark_precheck_passed(
     gguf_file: str,
     measured_memory_kb: int,
 ) -> None:
+    # Status is left at 'prechecking': the caller scores the candidate
+    # immediately afterwards, so there is no queue to move it into.
     conn.execute(
         """UPDATE revealed_candidates
-           SET status = 'queued', gguf_file = ?, measured_memory_kb = ?, updated_at = ?
+           SET gguf_file = ?, measured_memory_kb = ?, updated_at = ?
            WHERE competition_id = ? AND hotkey = ?""",
         (gguf_file, measured_memory_kb, time.time(), competition_id, hotkey),
     )
@@ -435,64 +429,49 @@ def all_candidates_for_competition(conn: sqlite3.Connection, competition_id: str
 
 
 @_locked
-def insert_benchmark_result(
+def record_benchmark_verification(
     conn: sqlite3.Connection,
     competition_id: str,
     hotkey: str,
     benchmark_name: str,
+    run_id: str,
     repository: str,
     revision: str,
-    coordinator_run_id: str,
-    status: str = "submitted",
+    status: str,
+    score: float,
+    message: str = "",
 ) -> None:
+    """
+    Record the outcome of verifying one miner-supplied coordinator run.
+
+    `status` stays the historical 'completed'/'failed' vocabulary so dashboard
+    queries span old and new competitions unchanged. `repository`/`revision` are
+    what the run *actually* used, so a mismatch is legible in the row that
+    rejected it. The lifecycle columns are retained for those historical rows:
+    `submitted_at` mirrors the verification time (the column is NOT NULL),
+    `phase` and `last_message` carry no progress text, and `percent_complete`
+    is 100 once a run verifies.
+    """
     now = time.time()
     with conn:
         conn.execute(
             """INSERT INTO benchmark_results
-               (competition_id, hotkey, benchmark_name, repository, revision,
-                coordinator_run_id, status, submitted_at, updated_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+               (competition_id, hotkey, benchmark_name, score, coordinator_run_id, status,
+                repository, revision, submitted_at, updated_at, phase, percent_complete, last_message)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '', ?, ?)
                ON CONFLICT(competition_id, hotkey, benchmark_name) DO UPDATE SET
-                 repository = excluded.repository,
-                 revision = excluded.revision,
+                 score = excluded.score,
                  coordinator_run_id = excluded.coordinator_run_id,
                  status = excluded.status,
-                 updated_at = excluded.updated_at""",
-            (competition_id, hotkey, benchmark_name, repository, revision, coordinator_run_id, status, now, now),
+                 repository = excluded.repository,
+                 revision = excluded.revision,
+                 updated_at = excluded.updated_at,
+                 percent_complete = excluded.percent_complete,
+                 last_message = excluded.last_message""",
+            (competition_id, hotkey, benchmark_name, score, run_id, status,
+             repository, revision, now, now,
+             100.0 if status == "completed" else 0.0, message),
         )
-
-
-@_locked
-def update_benchmark_result(
-    conn: sqlite3.Connection,
-    competition_id: str,
-    hotkey: str,
-    benchmark_name: str,
-    status: str,
-    score: Optional[float] = None,
-    phase: Optional[str] = None,
-    percent_complete: Optional[float] = None,
-    last_message: Optional[str] = None,
-) -> None:
-    with conn:
-        conn.execute(
-            """UPDATE benchmark_results
-               SET status = ?, score = COALESCE(?, score), phase = ?, percent_complete = ?,
-                   last_message = ?, updated_at = ?
-               WHERE competition_id = ? AND hotkey = ? AND benchmark_name = ?""",
-            (status, score, phase, percent_complete, last_message, time.time(),
-             competition_id, hotkey, benchmark_name),
-        )
-
-
-@_locked
-def open_benchmark_results(conn: sqlite3.Connection, competition_id: str) -> List[dict]:
-    rows = conn.execute(
-        """SELECT * FROM benchmark_results
-           WHERE competition_id = ? AND status = 'submitted'""",
-        (competition_id,),
-    ).fetchall()
-    return [dict(r) for r in rows]
 
 
 @_locked

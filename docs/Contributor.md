@@ -9,7 +9,16 @@
 
 ## Local blockchain setup
 
-Start a fast-runtime subtensor localnet, create dev wallets, register subnet and participants:
+Build the precheck image first — the validator launches it per competition
+during scoring, and `.env.localnet` points at the `tpn-precheck:test` tag:
+
+```bash
+# add --platform linux/arm64 on Apple silicon
+docker build -t tpn-precheck:test -f shared/validation/precheck.Dockerfile shared/validation
+```
+
+Then start a fast-runtime subtensor localnet, create dev wallets, register
+subnet and participants:
 
 ```bash
 ./scripts/dev.sh
@@ -34,6 +43,8 @@ Netuid: `2`
 
 ## Validator env for localnet
 
+`.env.localnet` is gitignored — create it locally:
+
 ```bash
 # .env.localnet
 BITTENSOR=True
@@ -43,7 +54,17 @@ WALLET_COLDKEY=bob
 WALLET_HOTKEY=default
 WALLET_PATH=./wallets
 VALIDATOR_MODE=leader
+
+# Throwaway value for the local chain only. On a real validator generate one:
+#   python -c "import secrets; print(secrets.token_urlsafe(32))"
 ADMIN_API_KEY=localnet-dev-key
+
+# Must match the tag built above — a bare name resolves to :latest and the
+# container fails to launch with "pull access denied".
+PRECHECK_IMAGE=tpn-precheck:test
+
+# BENCHMARK_BACKEND defaults to mock, which is what you want on localnet.
+# See docs/Testing.md for feeding it miner-supplied run ids.
 ```
 
 Start validator manually against localnet:

@@ -19,7 +19,6 @@ class CompetitionType(str, Enum):
 class BenchmarkTask(BaseModel):
     name: str
     min_score: float
-    weight: float
 
 
 class ModelRequirements(BaseModel):

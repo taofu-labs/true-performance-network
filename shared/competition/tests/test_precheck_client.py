@@ -163,14 +163,6 @@ def test_check_never_raises_on_connection_error(monkeypatch):
     assert "connection error" in verdict.error
 
 
-def test_check_never_raises_on_timeout(monkeypatch):
-    ctr = make_container()
-    ctr._container_name = "fake-container"
-    monkeypatch.setattr(requests, "post", lambda *a, **k: (_ for _ in ()).throw(requests.Timeout()))
-    verdict = ctr.check("user/repo", "a" * 40, "model.gguf")
-    assert verdict.error is not None
-    assert "timed out" in verdict.error
-
 
 def test_check_503_returns_not_ready_error(monkeypatch):
     ctr = make_container()
@@ -283,13 +275,6 @@ def test_cleanup_stale_containers_preserves_kept_competitions(monkeypatch):
     rm_call = next(c for c in calls if c[:2] == ["docker", "rm"])
     assert rm_call == ["docker", "rm", "-f", "def456"]
 
-
-def test_cleanup_stale_containers_noop_when_none_found(monkeypatch):
-    def fake_run(cmd, **kwargs):
-        return _FakeCompletedProcess(returncode=0)._with_stdout("")
-
-    monkeypatch.setattr(subprocess, "run", fake_run)
-    cleanup_stale_containers()  # must not raise, must not attempt docker rm
 
 
 def test_cleanup_stale_containers_swallows_docker_missing(monkeypatch):

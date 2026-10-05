@@ -24,7 +24,7 @@ def stub_leader(monkeypatch, extra_fields=None):
     comp = {
         "id": "comp-a", "name": "comp-a", "start_block": 0, "commit_end_block": 10,
         "scoring_end_block": 20, "emission_distribution": [1.0], "top_n": 1,
-        "benchmarks": [{"name": "mmlu", "min_score": 0.5, "weight": 1.0}],
+        "benchmarks": [{"name": "mmlu", "min_score": 0.5}],
     }
     comp.update(extra_fields or {})
     leader_config_client._cache.clear()

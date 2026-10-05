@@ -2,12 +2,21 @@
 import re
 import requests
 
-# username/repo-name — only alphanumeric, hyphens, underscores, dots; no path traversal
-_REPO_ID_RE = re.compile(r"^[A-Za-z0-9_-]+/[A-Za-z0-9_-]+$")
+# username/repo-name — alphanumeric, hyphens, underscores and dots. Dots are
+# common in real repo names (Qwen2.5, Llama-3.1, Phi-3.5), so excluding them
+# rejected most modern models as "not publicly accessible".
+_REPO_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*$")
 
 
 def _validate_repo_id(repo_id: str) -> bool:
-    """Reject repo IDs that don't look like 'owner/name'."""
+    """Reject repo IDs that don't look like 'owner/name'.
+
+    Allowing dots means path traversal has to be excluded explicitly: the
+    leading-character class stops a segment starting with '.', and this rules
+    out '..' anywhere in the id.
+    """
+    if ".." in repo_id:
+        return False
     return bool(_REPO_ID_RE.match(repo_id))
 
 

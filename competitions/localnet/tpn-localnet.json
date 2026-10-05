@@ -17,8 +17,8 @@
   "distribution_blocks": 10000,
 
   "benchmarks": [
-    { "name": "mmlu",      "min_score": 0.60, "weight": 0.5 },
-    { "name": "hellaswag", "min_score": 0.55, "weight": 0.5 }
+    { "name": "mmlu",      "min_score": 0.60 },
+    { "name": "hellaswag", "min_score": 0.55 }
   ],
 
   "model_requirements": {

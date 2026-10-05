@@ -14,6 +14,7 @@ Select backend via env:
     BENCHMARK_BACKEND=mock   (default) — deterministic fake runs, no network
     BENCHMARK_BACKEND=http   — real HTTP calls to COORDINATOR_BASE_URL
 """
+import json
 import os
 import time
 import uuid
@@ -107,6 +108,21 @@ class RunStatus:
     message: Optional[str] = None
     estimated_seconds_remaining: Optional[float] = None
 
+    # Model identity of the run, from the coordinator's `model_source`. Used to
+    # verify that a miner-submitted run actually benchmarked the model they
+    # committed on chain — without these a run id proves nothing.
+    repo: Optional[str] = None
+    revision: Optional[str] = None
+    model_files: List[str] = field(default_factory=list)
+    # file path -> (hash algorithm, hash value). Only `sha256` entries are
+    # comparable to a miner's self-reported file_sha256; HF also serves
+    # `xet` and `git_blob` hashes for non-LFS files.
+    file_hashes: Dict[str, tuple] = field(default_factory=dict)
+    # Benchmarks this run covers, and each one's own terminal status — a suite
+    # run can be `partially_completed` with some children failed.
+    benchmarks: List[str] = field(default_factory=list)
+    item_status: Dict[str, str] = field(default_factory=dict)
+
 
 # ---------------------------------------------------------------------------
 # Protocol
@@ -146,13 +162,64 @@ _MOCK_POLLS_TO_COMPLETE = 3
 
 
 class MockCoordinator:
-    """Deterministic fake coordinator. No network. Scores derived from run_id hash."""
+    """
+    Deterministic fake coordinator. No network. Scores derived from run_id hash.
+
+    Miners own the run ids in the live flow — the validator only ever polls
+    them — so a mock that knows only its own `submit()` ids reports every real
+    miner run as unknown. `MOCK_RUNS_FILE` closes that gap for local/dev runs:
+    a JSON file of run ids to serve, letting a dev drive the whole pipeline
+    with a mocked coordinator and everything else real.
+
+        {"r1001": {"repo": "user/repo", "revision": "<sha>",
+                   "file": "model.gguf", "file_sha256": "<64 hex>",
+                   "benchmark": "mmlu", "score": 0.82}}
+
+    An id absent from the file still polls as FAILED, so verification is never
+    weakened — an unknown run is exactly what a bogus id should look like.
+    """
 
     def __init__(self):
         # run_id -> poll count
         self._polls: Dict[str, int] = {}
         # run_id -> benchmark name
         self._benchmarks: Dict[str, str] = {}
+        # run_id -> explicit score (seeded runs); None = derive from hash
+        self._scores: Dict[str, Optional[float]] = {}
+        # run_id -> model identity the run was submitted against
+        self._identity: Dict[str, dict] = {}
+        self._load_seeded_runs()
+
+    def _load_seeded_runs(self) -> None:
+        """Pre-register miner-supplied run ids from MOCK_RUNS_FILE, if set."""
+        path = os.getenv("MOCK_RUNS_FILE", "")
+        if not path:
+            return
+        try:
+            with open(path) as f:
+                seeded = json.load(f)
+        except Exception as e:
+            logger.warning(f"[mock] could not read MOCK_RUNS_FILE={path}: {e}")
+            return
+
+        for run_id, spec in seeded.items():
+            benchmark = spec.get("benchmark", "mmlu")
+            file = spec.get("file", "")
+            file_sha256 = spec.get("file_sha256", "")
+            # Completed on the first poll: these represent runs a miner
+            # finished before committing, which is the real-world case.
+            self._polls[run_id] = _MOCK_POLLS_TO_COMPLETE
+            self._benchmarks[run_id] = benchmark
+            self._scores[run_id] = spec.get("score")
+            self._identity[run_id] = dict(
+                repo=spec.get("repo", ""),
+                revision=spec.get("revision", ""),
+                model_files=[file] if file else [],
+                file_hashes={file: ("sha256", file_sha256)} if file and file_sha256 else {},
+                benchmarks=[benchmark],
+                item_status={benchmark: spec.get("item_status", "completed")},
+            )
+        logger.info(f"[mock] seeded {len(seeded)} run id(s) from {path}")
 
     def list_benchmarks(self) -> set:
         return set(_PUBLIC_BENCHMARKS)
@@ -170,6 +237,18 @@ class MockCoordinator:
         run_id = str(uuid.UUID(hashlib.md5(seed.encode()).hexdigest()))
         self._polls[run_id] = 0
         self._benchmarks[run_id] = benchmark
+        # Mirror the real coordinator's file hashing so verification can be
+        # exercised end to end offline: sha256 of the path stands in for the
+        # sha256 of the file's bytes.
+        files = list(model_files or [])
+        self._identity[run_id] = dict(
+            repo=repo,
+            revision=revision,
+            model_files=files,
+            file_hashes={f: ("sha256", hashlib.sha256(f.encode()).hexdigest()) for f in files},
+            benchmarks=[benchmark],
+            item_status={benchmark: "completed"},
+        )
         logger.debug(f"[mock] submitted {benchmark} for {repo}@{revision[:8]} -> {run_id}")
         return run_id
 
@@ -179,20 +258,24 @@ class MockCoordinator:
 
         self._polls[run_id] += 1
         count = self._polls[run_id]
+        identity = self._identity.get(run_id, {})
 
         if count < _MOCK_POLLS_TO_COMPLETE:
             logger.debug(f"[mock] {run_id[:8]} poll {count}/{_MOCK_POLLS_TO_COMPLETE} -> running")
-            return RunStatus(run_id=run_id, status=RunStatusCode.RUNNING)
+            return RunStatus(run_id=run_id, status=RunStatusCode.RUNNING, **identity)
 
-        # Deterministic score in [0.55, 0.85] from run_id hash
-        h = int(hashlib.sha256(run_id.encode()).hexdigest(), 16)
-        score = 0.55 + (h % 10000) / 10000 * 0.30
         benchmark = self._benchmarks[run_id]
+        score = self._scores.get(run_id)
+        if score is None:
+            # Deterministic score in [0.55, 0.85] from run_id hash
+            h = int(hashlib.sha256(run_id.encode()).hexdigest(), 16)
+            score = 0.55 + (h % 10000) / 10000 * 0.30
         logger.debug(f"[mock] {run_id[:8]} completed {benchmark}={score:.4f}")
         return RunStatus(
             run_id=run_id,
             status=RunStatusCode.COMPLETED,
             scores={benchmark: round(score, 4)},
+            **identity,
         )
 
 
@@ -262,10 +345,19 @@ class HttpCoordinator:
             last_log_at=progress.get("last_log_at"),
             message=progress.get("message"),
             estimated_seconds_remaining=progress.get("estimated_seconds_remaining"),
+            **_extract_model_identity(data),
         )
 
         if raw_status in ("completed", "cache_hit"):
             scores = _extract_scores(data.get("result"), benchmark) or _extract_scores(data.get("result_summary"), benchmark)
+            scores = scores or _extract_item_scores(data)
+            return RunStatus(run_id=run_id, status=RunStatusCode.COMPLETED, scores=scores, **progress_fields)
+
+        # A suite run where some children succeeded and others failed. The run
+        # is terminal, so it is reported COMPLETED with only the scores that
+        # exist — per-benchmark verification decides what each child is worth.
+        if raw_status == "partially_completed":
+            scores = _extract_scores(data.get("result"), benchmark) or _extract_item_scores(data)
             return RunStatus(run_id=run_id, status=RunStatusCode.COMPLETED, scores=scores, **progress_fields)
 
         if raw_status in ("failed", "cancelled", "cleanup_failed"):
@@ -282,6 +374,62 @@ class HttpCoordinator:
         # Unknown status — treat as still running
         logger.warning(f"[http] unknown status {raw_status!r} for {run_id}")
         return RunStatus(run_id=run_id, status=RunStatusCode.RUNNING, **progress_fields)
+
+
+def _extract_model_identity(data: dict) -> dict:
+    """
+    Pull the run's model identity out of a /status body.
+
+    `model_source.model` carries the repo, the resolved immutable revision and
+    every benchmark-affecting file with its content hash. This is what binds a
+    miner-supplied run id to the model they actually committed on chain.
+    """
+    model = ((data.get("model_source") or {}).get("model")) or {}
+    files = model.get("files") or []
+
+    model_files: List[str] = []
+    file_hashes: Dict[str, tuple] = {}
+    for entry in files:
+        path = entry.get("path")
+        if not path:
+            continue
+        model_files.append(path)
+        digest = entry.get("hash") or {}
+        algorithm, value = digest.get("algorithm"), digest.get("value")
+        if algorithm and value:
+            file_hashes[path] = (algorithm, value)
+
+    items = data.get("benchmark_items") or []
+    item_status = {
+        item["benchmark"]: item.get("status", "")
+        for item in items
+        if item.get("benchmark")
+    }
+
+    benchmarks = data.get("benchmarks") or ([data["benchmark"]] if data.get("benchmark") else [])
+
+    return dict(
+        repo=model.get("repo"),
+        # `sha` is the resolved immutable commit; `revision` may be a ref like "main".
+        revision=model.get("sha") or model.get("revision"),
+        model_files=model_files,
+        file_hashes=file_hashes,
+        benchmarks=list(benchmarks),
+        item_status=item_status,
+    )
+
+
+def _extract_item_scores(data: dict) -> Dict[str, float]:
+    """Per-benchmark scores from a suite run's `benchmark_items[]`."""
+    scores: Dict[str, float] = {}
+    for item in data.get("benchmark_items") or []:
+        name = item.get("benchmark")
+        if not name or item.get("status") != "completed":
+            continue
+        extracted = _extract_scores(item.get("result"), name)
+        if name in extracted:
+            scores[name] = extracted[name]
+    return scores
 
 
 def _extract_scores(result: Optional[dict], benchmark: Optional[str]) -> Dict[str, float]:

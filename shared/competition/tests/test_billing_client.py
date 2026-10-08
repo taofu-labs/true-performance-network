@@ -244,3 +244,9 @@ def test_build_request_pins_the_exact_committed_artifact():
     assert request["model_files"] == ["model-Q4.gguf"]
     assert request["model_format"] == "gguf"
     assert request["benchmark"] == "mmlu"
+
+
+def test_build_request_selects_pinned_fluid_epoch():
+    request = build_request("user/repo", "a" * 40, "m.gguf", "fluid_knowledge", fluid_epoch_id="epoch-000001-r7")
+    assert request["benchmark"] == "fluid_knowledge:epoch-000001-r7"
+    assert build_request("user/repo", "a" * 40, "m.gguf", "fluid_knowledge")["benchmark"] == "fluid_knowledge"

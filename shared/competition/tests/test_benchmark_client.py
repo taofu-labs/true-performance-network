@@ -329,3 +329,10 @@ def test_mock_coordinator_serves_identity_matching_what_was_submitted():
     assert status.file_hashes["model.gguf"][0] == "sha256"
     assert status.benchmarks == ["mmlu"]
     assert status.item_status == {"mmlu": "completed"}
+
+
+def test_extract_model_identity_reads_fluid_epoch():
+    from competition.benchmark_client import _extract_model_identity
+    data = {"benchmark": "fluid_knowledge", "result": {"fluid_epoch": {"epoch_id": "epoch-000001-r7", "manifest_digest": "f" * 64}}}
+    assert _extract_model_identity(data)["fluid_epoch_id"] == "epoch-000001-r7"
+    assert _extract_model_identity({"benchmark": "mmlu", "result": {"mmlu": 0.7}})["fluid_epoch_id"] is None

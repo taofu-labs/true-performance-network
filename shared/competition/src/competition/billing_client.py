@@ -227,14 +227,19 @@ def build_request(
     file: str,
     benchmark: str,
     benchmark_engine: str = "lm_eval",
+    fluid_epoch_id: Optional[str] = None,
 ) -> dict:
     """
     Build a benchmark request pinned to exactly the artifact a miner commits.
 
     Validators verify the run's repo, revision and file against the on-chain
     commit, so all three must be the committed ones — a run against `main`, or
-    against a different .gguf in the same repo, scores 0.0.
+    against a different .gguf in the same repo, scores 0.0. Same for the Fluid
+    epoch a competition pins: the coordinator's `fluid_knowledge:<epoch_id>`
+    selector runs exactly that epoch instead of whatever is latest.
     """
+    if fluid_epoch_id:
+        benchmark = f"{benchmark}:{fluid_epoch_id}"
     return {
         "huggingface_repo": repository,
         "huggingface_revision": revision,

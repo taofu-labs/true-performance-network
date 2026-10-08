@@ -172,6 +172,7 @@ def verify_run(
     benchmark_name: str,
     run_id: str,
     status: RunStatus,
+    fluid_epoch_id: Optional[str] = None,
 ) -> RunVerification:
     """
     Check a coordinator run really benchmarked the model this submission commits.
@@ -227,6 +228,9 @@ def verify_run(
     if item and item != "completed":
         return fail(f"benchmark '{benchmark_name}' did not complete in run (status={item})")
 
+    if fluid_epoch_id and status.fluid_epoch_id != fluid_epoch_id:
+        return fail(f"run used Fluid epoch {status.fluid_epoch_id or 'none'}, competition requires {fluid_epoch_id}")
+
     if benchmark_name not in status.scores:
         return fail(f"run returned no score for '{benchmark_name}'")
 
@@ -265,7 +269,7 @@ def verify_candidate_runs(
                 reason=f"coordinator poll failed: {e}",
             ))
             continue
-        results.append(verify_run(submission, task.name, run_id, status))
+        results.append(verify_run(submission, task.name, run_id, status, task.fluid_epoch_id))
 
     return results
 

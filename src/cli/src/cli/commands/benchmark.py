@@ -77,6 +77,7 @@ def benchmark(
         raise typer.Exit(1)
 
     wanted = [t.name for t in spec.benchmarks]
+    epochs = {t.name: t.fluid_epoch_id for t in spec.benchmarks}
     if only:
         requested = [n.strip() for n in only.split(",") if n.strip()]
         unknown = [n for n in requested if n not in wanted]
@@ -115,7 +116,7 @@ def benchmark(
     if not force_price:
         total_cents = 0
         for name in todo:
-            request = build_request(cfg["repository"], cfg["huggingface_revision"], cfg["file"], name)
+            request = build_request(cfg["repository"], cfg["huggingface_revision"], cfg["file"], name, fluid_epoch_id=epochs[name])
             try:
                 quotes[name] = client.quote(request)
             except BillingError as e:
@@ -157,7 +158,7 @@ def benchmark(
     runs = dict(existing)
     failures = []
     for name in todo:
-        request = build_request(cfg["repository"], cfg["huggingface_revision"], cfg["file"], name)
+        request = build_request(cfg["repository"], cfg["huggingface_revision"], cfg["file"], name, fluid_epoch_id=epochs[name])
         try:
             order = client.submit(request, quotes.get(name))
             console.print(f"[dim]{name}: order {order.id} ({order.status}) — waiting for run id[/dim]")

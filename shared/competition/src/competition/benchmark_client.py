@@ -122,6 +122,8 @@ class RunStatus:
     # run can be `partially_completed` with some children failed.
     benchmarks: List[str] = field(default_factory=list)
     item_status: Dict[str, str] = field(default_factory=dict)
+    # Fluid epoch the run was scored on, from the coordinator's verified result.
+    fluid_epoch_id: Optional[str] = None
 
 
 # ---------------------------------------------------------------------------
@@ -407,6 +409,8 @@ def _extract_model_identity(data: dict) -> dict:
     }
 
     benchmarks = data.get("benchmarks") or ([data["benchmark"]] if data.get("benchmark") else [])
+    # ponytail: single-benchmark runs only; a suite nests this under result.benchmarks[], so it reads None and fails a pinned epoch.
+    fluid_epoch = (data.get("result") or {}).get("fluid_epoch") or {}
 
     return dict(
         repo=model.get("repo"),
@@ -416,6 +420,7 @@ def _extract_model_identity(data: dict) -> dict:
         file_hashes=file_hashes,
         benchmarks=list(benchmarks),
         item_status=item_status,
+        fluid_epoch_id=fluid_epoch.get("epoch_id"),
     )
 
 

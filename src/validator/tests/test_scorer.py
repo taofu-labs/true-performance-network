@@ -165,6 +165,26 @@ def test_verify_run_rejects_failed_benchmark_item_in_suite():
     assert "did not complete in run" in result.reason
 
 
+def test_verify_run_accepts_pinned_fluid_epoch():
+    status = make_status(fluid_epoch_id="epoch-000001-r7")
+    assert scorer.verify_run(make_submission(), "mmlu", "r100", status, "epoch-000001-r7").ok is True
+
+
+def test_verify_run_rejects_other_or_missing_fluid_epoch():
+    for epoch in ["epoch-000001-r5", None]:
+        status = make_status(fluid_epoch_id=epoch)
+        result = scorer.verify_run(make_submission(), "mmlu", "r100", status, "epoch-000001-r7")
+        assert result.ok is False and result.score == 0.0, epoch
+        assert "competition requires epoch-000001-r7" in result.reason
+
+
+def test_verify_candidate_runs_applies_spec_fluid_epoch():
+    spec = make_spec(benchmarks=[BenchmarkTask(name="mmlu", min_score=0.5, fluid_epoch_id="epoch-000001-r7")])
+    old = StubCoordinator({"r100": make_status(fluid_epoch_id="epoch-000001-r5")})
+    [result] = scorer.verify_candidate_runs(make_submission(), spec, old)
+    assert result.ok is False
+
+
 def test_verify_run_rejects_failed_run():
     status = make_status(status=RunStatusCode.FAILED, failure_reason="out of memory")
     result = scorer.verify_run(make_submission(), "mmlu", "r100", status)

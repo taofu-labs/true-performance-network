@@ -19,6 +19,10 @@ class CompetitionType(str, Enum):
 class BenchmarkTask(BaseModel):
     name: str
     min_score: float
+    # Fluid epoch a run must have used to count (e.g. "epoch-000001-r7"). The
+    # coordinator accepts runs on several epochs at once; scores across epochs
+    # aren't comparable. None = any epoch.
+    fluid_epoch_id: Optional[str] = None
 
 
 class ModelRequirements(BaseModel):

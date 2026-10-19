@@ -600,6 +600,19 @@ def upsert_competition(conn: sqlite3.Connection, spec: "CompetitionSpec") -> Non
 
 
 @_locked
+def insert_competition(conn: sqlite3.Connection, spec: "CompetitionSpec") -> bool:
+    """Insert a new competition spec. Returns False, changing nothing, if the id exists."""
+    now = time.time()
+    cur = conn.execute(
+        """INSERT INTO competitions (id, spec_json, created_at, updated_at)
+           VALUES (?, ?, ?, ?) ON CONFLICT(id) DO NOTHING""",
+        (spec.id, spec.model_dump_json(), now, now),
+    )
+    conn.commit()
+    return cur.rowcount > 0
+
+
+@_locked
 def get_competition(conn: sqlite3.Connection, competition_id: str) -> Optional[dict]:
     row = conn.execute(
         "SELECT spec_json FROM competitions WHERE id = ?", (competition_id,)

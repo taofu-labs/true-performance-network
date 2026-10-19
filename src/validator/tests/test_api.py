@@ -1,10 +1,26 @@
+import json
+import time
+
 import pytest
+from bittensor import http_auth, sp_core
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
+from common.models.competition import CompetitionSpec
 from validator import store
 from validator import settings as validator_settings
-from validator.api import MAX_REQUEST_BODY_BYTES, LeaderApiMixin, _require_admin_auth
+from validator import api as api_module
+from validator.api import (
+    MAX_REQUEST_BODY_BYTES, LeaderApiMixin, _require_admin_auth, _require_admin_signer,
+)
+
+
+def _keypair(mnemonic):
+    return sp_core.Keypair.create_from_mnemonic(mnemonic, sp_core.CRYPTO_SR25519)
+
+
+LEADER = _keypair(sp_core.Keypair.generate_mnemonic(12))
+ADMIN = _keypair(sp_core.Keypair.generate_mnemonic(12))
 
 
 class FakeSubtensor:
@@ -16,6 +32,7 @@ class FakeValidator(LeaderApiMixin):
     def __init__(self, conn):
         self._db = conn
         self.subtensor = FakeSubtensor()
+        self.hotkey = LEADER.ss58_address
 
     async def get_validator_status(self):
         return {"available": True}
@@ -41,6 +58,11 @@ def make_app(conn):
     )
     app.router.add_post(
         "/v1/competitions/{competition_id}/resume", _require_admin_auth(v._h_resume_competition)
+    )
+    app.router.add_get("/admin", v._h_admin_page)
+    app.router.add_get("/v1/admin/head", v._h_admin_head)
+    app.router.add_post(
+        "/v1/admin/competitions", _require_admin_signer(v._h_create_competition, v.hotkey)
     )
     return app
 
@@ -612,3 +634,176 @@ async def test_pause_surfaces_in_full_state(conn, monkeypatch):
         resp = await client.get("/v1/state/competitions/comp1")
         assert resp.status == 200
         assert (await resp.json())["paused_at"] is not None
+
+
+# ── /admin, /v1/admin/* (wallet-signed create) ───────────────────────
+
+def future_spec(comp_id="new1", **overrides):
+    # FakeSubtensor is at block 500, so the schedule must start after it.
+    return make_spec_json(comp_id, start_block=600, commit_end_block=700,
+                          scoring_end_block=1000, **overrides)
+
+
+def signed(spec, keypair=ADMIN, receiver=None, path="/v1/admin/competitions"):
+    body = json.dumps(spec).encode()
+    headers = http_auth.sign(keypair, method="POST", path=path, body=body,
+                             receiver_ss58=receiver or LEADER.ss58_address)
+    return body, {**headers, "Content-Type": "application/json"}
+
+
+def browser_signed(spec, keypair=ADMIN):
+    """Sign like a wallet extension's signRaw does: over <Bytes>payload</Bytes>."""
+    body = json.dumps(spec).encode()
+    nonce = time.time_ns()
+    payload = http_auth.build_payload(
+        scheme="sr25519", method="POST", path="/v1/admin/competitions", body=body,
+        nonce_ns=nonce, sender_ss58=keypair.ss58_address, receiver_ss58=LEADER.ss58_address,
+    )
+    signature = bytes(keypair.sign(b"<Bytes>" + payload + b"</Bytes>"))
+    return body, {
+        "Content-Type": "application/json",
+        http_auth.HEADER_VERSION: "1",
+        http_auth.HEADER_HOTKEY: keypair.ss58_address,
+        http_auth.HEADER_RECEIVER: LEADER.ss58_address,
+        http_auth.HEADER_NONCE: str(nonce),
+        http_auth.HEADER_SIGNATURE: "0x" + signature.hex(),
+    }
+
+
+@pytest.fixture
+def admin_signers(monkeypatch):
+    monkeypatch.setattr(validator_settings, "ADMIN_SIGNERS", {ADMIN.ss58_address})
+
+
+@pytest.mark.asyncio
+async def test_admin_page_hidden_without_signers(conn, monkeypatch):
+    monkeypatch.setattr(validator_settings, "ADMIN_SIGNERS", set())
+    async with TestClient(TestServer(make_app(conn))) as client:
+        assert (await client.get("/admin")).status == 404
+        body, headers = signed(future_spec())
+        assert (await client.post("/v1/admin/competitions", data=body, headers=headers)).status == 503
+
+
+@pytest.mark.asyncio
+async def test_admin_page_served_with_signers(conn, admin_signers):
+    async with TestClient(TestServer(make_app(conn))) as client:
+        resp = await client.get("/admin")
+        assert resp.status == 200
+        assert resp.headers["X-Frame-Options"] == "DENY"
+        assert "Sign &amp; create" in await resp.text()
+
+
+@pytest.mark.asyncio
+async def test_admin_head(conn, admin_signers):
+    async with TestClient(TestServer(make_app(conn))) as client:
+        body = await (await client.get("/v1/admin/head")).json()
+        assert body["block"] == 500 and body["receiver"] == LEADER.ss58_address
+
+
+@pytest.mark.asyncio
+async def test_signed_create_succeeds_then_listed(conn, admin_signers):
+    async with TestClient(TestServer(make_app(conn))) as client:
+        body, headers = signed(future_spec())
+        resp = await client.post("/v1/admin/competitions", data=body, headers=headers)
+        assert resp.status == 201, await resp.text()
+        assert (await client.get("/v1/competitions/new1")).status == 200
+
+
+@pytest.mark.asyncio
+async def test_browser_wrapped_signature_accepted(conn, admin_signers):
+    async with TestClient(TestServer(make_app(conn))) as client:
+        body, headers = browser_signed(future_spec())
+        resp = await client.post("/v1/admin/competitions", data=body, headers=headers)
+        assert resp.status == 201, await resp.text()
+
+
+@pytest.mark.asyncio
+async def test_signed_create_never_overwrites(conn, admin_signers):
+    store.upsert_competition(conn, CompetitionSpec.model_validate(future_spec(name="Original")))
+    async with TestClient(TestServer(make_app(conn))) as client:
+        body, headers = signed(future_spec(name="Replacement"))
+        resp = await client.post("/v1/admin/competitions", data=body, headers=headers)
+        assert resp.status == 409
+    assert store.get_competition(conn, "new1")["name"] == "Original"
+
+
+@pytest.mark.asyncio
+async def test_signed_create_rejects_unsigned(conn, admin_signers):
+    async with TestClient(TestServer(make_app(conn))) as client:
+        resp = await client.post("/v1/admin/competitions", json=future_spec())
+        assert resp.status == 401
+
+
+@pytest.mark.asyncio
+async def test_signed_create_rejects_unlisted_signer(conn, admin_signers):
+    stranger = _keypair(sp_core.Keypair.generate_mnemonic(12))
+    async with TestClient(TestServer(make_app(conn))) as client:
+        body, headers = signed(future_spec(), keypair=stranger)
+        resp = await client.post("/v1/admin/competitions", data=body, headers=headers)
+        assert resp.status == 403
+    assert store.get_competition(conn, "new1") is None
+    # Rejected before verification, so the stranger's nonce was never stored.
+    assert (stranger.ss58_address, int(headers[http_auth.HEADER_NONCE])) not in api_module._signed_nonces._seen
+
+
+@pytest.mark.asyncio
+async def test_signed_create_accepts_signer_under_other_ss58_prefix(conn, monkeypatch):
+    other_prefix = sp_core.ss58_encode(sp_core.ss58_decode(ADMIN.ss58_address), 0)
+    monkeypatch.setattr(validator_settings, "ADMIN_SIGNERS", {other_prefix})
+    async with TestClient(TestServer(make_app(conn))) as client:
+        body, headers = signed(future_spec())
+        resp = await client.post("/v1/admin/competitions", data=body, headers=headers)
+        assert resp.status == 201, await resp.text()
+
+
+@pytest.mark.asyncio
+async def test_signed_create_rejects_tampered_body(conn, admin_signers):
+    async with TestClient(TestServer(make_app(conn))) as client:
+        _, headers = signed(future_spec())
+        tampered = json.dumps(future_spec(emission_weight=1.0)).encode()
+        resp = await client.post("/v1/admin/competitions", data=tampered, headers=headers)
+        assert resp.status == 401
+
+
+@pytest.mark.asyncio
+async def test_signed_create_rejects_other_receiver(conn, admin_signers):
+    other_leader = _keypair(sp_core.Keypair.generate_mnemonic(12))
+    async with TestClient(TestServer(make_app(conn))) as client:
+        body, headers = signed(future_spec(), receiver=other_leader.ss58_address)
+        resp = await client.post("/v1/admin/competitions", data=body, headers=headers)
+        assert resp.status == 401
+
+
+@pytest.mark.asyncio
+async def test_signed_create_rejects_replay(conn, admin_signers):
+    async with TestClient(TestServer(make_app(conn))) as client:
+        body, headers = signed(future_spec())
+        assert (await client.post("/v1/admin/competitions", data=body, headers=headers)).status == 201
+        resp = await client.post("/v1/admin/competitions", data=body, headers=headers)
+        assert resp.status == 401
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("overrides", [
+    {"start_block": 400},                                    # already started
+    {"commit_end_block": 550},                               # commit end before start
+    {"scoring_end_block": 800},                              # inside reveal grace
+    {"id": "../bad"},
+    {"benchmarks": [{"name": "mmlu", "min_score": 0.1}, {"name": "mmlu", "min_score": 0.2}]},
+    {"benchmarks": [{"name": "mmlu", "min_score": 2}]},
+    {"benchmarks": [{"name": "fluid_knowledge", "min_score": 0}]},
+    {"top_n": 2, "emission_distribution": [1.5, -0.5]},
+    {"emission_distribution": [float("nan")]},
+    {"reveal_grace_blocks": -500},
+    {"competition_type": "ram_ceiling", "max_memory_kb": -1},
+])
+async def test_signed_create_rejects_bad_specs(conn, admin_signers, overrides):
+    spec = {**future_spec(), **overrides}
+    async with TestClient(TestServer(make_app(conn))) as client:
+        body = json.dumps(spec).encode()  # allow_nan: NaN must be rejected server-side
+        headers = {**http_auth.sign(ADMIN, method="POST", path="/v1/admin/competitions", body=body,
+                                    receiver_ss58=LEADER.ss58_address), "Content-Type": "application/json"}
+        resp = await client.post("/v1/admin/competitions", data=body, headers=headers)
+        assert resp.status == 422, await resp.text()
+    assert store.list_competitions(conn) == []
+

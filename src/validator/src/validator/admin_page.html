@@ -1,0 +1,479 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TPN · New competition</title>
+<style>
+  :root { --bg:#f6f7f9; --card:#fff; --text:#16181d; --muted:#666c78; --line:#dde0e6; --accent:#2f5bea; --bad:#c62828; --good:#1b7f3b; }
+  @media (prefers-color-scheme: dark) { :root { --bg:#111317; --card:#1a1d23; --text:#e8eaee; --muted:#9aa1ad; --line:#2c3039; --accent:#6d8dff; --bad:#ef6b6b; --good:#4cc47a; } }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--text); font:15px/1.45 system-ui, sans-serif; }
+  main { max-width:820px; margin:0 auto; padding:24px 16px 80px; }
+  h1 { font-size:22px; margin:0 0 4px; }
+  h2 { font-size:15px; margin:0 0 12px; text-transform:uppercase; letter-spacing:.04em; color:var(--muted); }
+  section { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:16px; margin:16px 0; }
+  label { display:block; font-size:13px; color:var(--muted); margin-bottom:4px; }
+  input, select, textarea { width:100%; padding:8px 10px; border:1px solid var(--line); border-radius:6px; background:var(--bg); color:var(--text); font:inherit; }
+  textarea { min-height:60px; }
+  button { padding:8px 14px; border-radius:6px; border:1px solid var(--line); background:var(--card); color:var(--text); font:inherit; cursor:pointer; }
+  button.primary { background:var(--accent); border-color:var(--accent); color:#fff; font-weight:600; }
+  button:disabled { opacity:.5; cursor:default; }
+  .grid { display:grid; grid-template-columns:repeat(auto-fit, minmax(200px, 1fr)); gap:12px; }
+  .row { display:grid; grid-template-columns:1fr 1fr auto; gap:8px; align-items:end; margin-bottom:8px; }
+  .bench { grid-template-columns:2fr 1fr 2fr auto; }
+  .sched { grid-template-columns:2fr 1fr; }
+  .hint { font-size:12px; color:var(--muted); margin-top:4px; }
+  .muted { color:var(--muted); }
+  .bad { color:var(--bad); }
+  .good { color:var(--good); }
+  .actions { display:flex; gap:8px; flex-wrap:wrap; }
+  pre { background:var(--bg); border:1px solid var(--line); border-radius:6px; padding:12px; overflow:auto; font-size:12px; max-height:360px; }
+  ul.problems { margin:8px 0 0; padding-left:20px; }
+  #status { white-space:pre-wrap; margin-top:12px; }
+  button[aria-pressed="true"] { border-color:var(--accent); color:var(--accent); font-weight:600; }
+  .dt { position:relative; }
+  .dt-btn { width:100%; text-align:left; background:var(--bg); padding:8px 10px; }
+  .dt-btn.empty { color:var(--muted); }
+  .dt-pop { position:absolute; z-index:10; top:calc(100% + 4px); left:0; width:300px; max-width:calc(100vw - 32px); background:var(--card); border:1px solid var(--line); border-radius:10px; padding:12px; box-shadow:0 8px 24px rgba(0,0,0,.18); }
+  .dt-head { display:flex; justify-content:space-between; align-items:center; margin-bottom:8px; font-weight:600; }
+  .dt-head button { border:none; background:none; font-size:18px; padding:2px 10px; }
+  .dt-grid { display:grid; grid-template-columns:repeat(7, 1fr); gap:2px; text-align:center; }
+  .dt-grid .dow { font-size:11px; color:var(--muted); padding:4px 0; }
+  .dt-grid button { padding:7px 0; border:1px solid transparent; background:none; border-radius:6px; }
+  .dt-grid button:hover:not(:disabled) { border-color:var(--line); }
+  .dt-grid button.today { border-color:var(--line); }
+  .dt-grid button.sel { background:var(--accent); color:#fff; }
+  .dt-time { display:flex; gap:6px; align-items:center; margin-top:10px; }
+  .dt-time select { width:auto; }
+  .dt-time button { margin-left:auto; }
+  .link { border:none; background:none; color:var(--accent); padding:0; font-size:12px; text-decoration:underline; }
+  @media (max-width:560px) { .bench, .row, .sched { grid-template-columns:1fr; } }
+</style>
+</head>
+<body>
+<main>
+  <h1>New competition</h1>
+  <div id="head" class="muted">Loading chain head…</div>
+
+  <section>
+    <h2>1 · Wallet</h2>
+    <div class="actions">
+      <button id="connect">Connect wallet</button>
+      <select id="account" hidden></select>
+    </div>
+    <div class="hint">Bittensor Wallet. Only allow-listed accounts can create competitions.</div>
+  </section>
+
+  <section>
+    <h2>2 · Basics</h2>
+    <div class="actions" style="margin-bottom:12px">
+      <span class="muted">Start from preset:</span>
+      <button data-preset="fluid">Fluid</button>
+      <button data-preset="general">General</button>
+      <button data-preset="reasoning">Reasoning</button>
+    </div>
+    <div class="grid">
+      <div><label for="id">ID</label><input id="id" placeholder="tpn-fluid-007"><div class="hint">Permanent. Letters, numbers, . _ -</div></div>
+      <div><label for="name">Name</label><input id="name"></div>
+    </div>
+    <div style="margin-top:12px"><label for="description">Description (optional)</label><textarea id="description"></textarea></div>
+    <div style="margin-top:12px"><label for="model_repo">Base model HF repo (optional)</label><input id="model_repo" placeholder="org/model"></div>
+  </section>
+
+  <section>
+    <h2>3 · Schedule</h2>
+    <div class="hint" id="tz" style="margin-bottom:12px"></div>
+    <div id="schedule"></div>
+    <div class="grid">
+      <div><label for="distribution_days">Pay winners for (days after scoring ends)</label><input id="distribution_days" type="number" min="0" step="any"><div class="hint" id="distribution_hint"></div></div>
+    </div>
+  </section>
+
+  <section>
+    <h2>4 · Rules</h2>
+    <div class="grid">
+      <div><label for="competition_type">Type</label>
+        <select id="competition_type">
+          <option value="ram_ceiling">RAM ceiling: under memory cap, best score wins</option>
+          <option value="benchmark_floor">Benchmark floor: pass scores, lowest memory wins</option>
+        </select></div>
+      <div id="memory_box"><label for="max_memory_gib">Memory cap (GiB)</label><input id="max_memory_gib" type="number" min="0" step="any"></div>
+      <div><label for="emission_weight">Share of subnet emission (%)</label><input id="emission_weight" type="number" min="0" max="100" step="any"></div>
+    </div>
+  </section>
+
+  <section>
+    <h2>5 · Rewards</h2>
+    <div id="rewards"></div>
+    <div class="actions"><button id="add_reward">+ Winner</button><span id="reward_sum" class="hint"></span></div>
+  </section>
+
+  <section>
+    <h2>6 · Benchmarks</h2>
+    <div id="benchmarks"></div>
+    <button id="add_benchmark">+ Benchmark</button>
+    <div class="hint">fluid_knowledge needs a pinned, not-yet-revealed epoch, e.g. epoch-000002-r1.</div>
+  </section>
+
+  <section>
+    <details>
+      <summary>Advanced</summary>
+      <div class="grid" style="margin-top:12px">
+        <div><label for="reveal_grace_blocks">Reveal grace (blocks)</label><input id="reveal_grace_blocks" type="number" min="0"></div>
+        <div><label for="ram_check_context_length">RAM check context length</label><input id="ram_check_context_length" type="number" min="1"></div>
+      </div>
+    </details>
+  </section>
+
+  <section>
+    <h2>7 · Review &amp; create</h2>
+    <div id="problems"></div>
+    <pre id="preview"></pre>
+    <button id="submit" class="primary" disabled>Sign &amp; create</button>
+    <div id="status"></div>
+  </section>
+</main>
+
+<script>
+"use strict";
+const BLOCK_MS = 12000;
+const BLOCKS_PER_DAY = 86400000 / BLOCK_MS;
+const SIGNED_PATH = "/v1/admin/competitions";  // path the validator sees; signed as-is
+const $ = id => document.getElementById(id);
+
+const PRESETS = {
+  fluid:     { max_memory_gib: 11, ctx: 32768, rewards: [60, 25, 15], benchmarks: ["fluid_knowledge"] },
+  general:   { max_memory_gib: 4,  ctx: 4096,  rewards: [40, 25, 20, 10, 5], benchmarks: ["mmlu", "hellaswag", "arc_challenge", "truthfulqa", "gsm8k"] },
+  reasoning: { max_memory_gib: 16, ctx: 4096,  rewards: [40, 25, 20, 10, 5], benchmarks: ["ifeval", "arc_challenge", "gsm8k"] },
+};
+
+let head = null;       // {block, time_ms, receiver, local_ms}
+let accounts = [];
+
+// ── chain head & block/time conversion ─────────────────────────────
+async function loadHead() {
+  const resp = await fetch("v1/admin/head", { cache: "no-store" });
+  const data = await resp.json();
+  if (!resp.ok) throw new Error(data.error || resp.statusText);
+  head = { ...data, local_ms: Date.now() };
+  $("head").textContent = `Block ${head.block} · leader ${head.receiver.slice(0, 8)}… · block times are estimates (12 s/block)`;
+}
+const serverNow = () => Date.now() - head.local_ms + head.time_ms;
+const blockAt = ms => head.block + Math.round((ms - head.time_ms) / BLOCK_MS);
+const timeAt = block => head.time_ms + (block - head.block) * BLOCK_MS;
+const utc = ms => new Date(ms).toISOString().replace("T", " ").slice(0, 16) + " UTC";
+
+// ── date & time picker ─────────────────────────────────────────────
+const pad = n => String(n).padStart(2, "0");
+const MONTHS = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"];
+const fmtLocal = ms => new Date(ms).toLocaleString(undefined, { weekday: "short", day: "numeric", month: "short", year: "numeric", hour: "2-digit", minute: "2-digit" });
+const el = (tag, cls, text) => { const e = document.createElement(tag); if (cls) e.className = cls; if (text != null) e.textContent = text; return e; };
+
+function dateTimePicker(onPick) {
+  const wrap = el("div", "dt");
+  const btn = el("button", "dt-btn empty", "Pick date & time");
+  const pop = el("div", "dt-pop");
+  pop.hidden = true;
+  const title = el("span");
+  const prev = el("button", "", "‹"), next = el("button", "", "›");
+  const head = el("div", "dt-head"); head.append(prev, title, next);
+  const grid = el("div", "dt-grid");
+  const hour = el("select"), minute = el("select");
+  for (let h = 0; h < 24; h++) hour.append(new Option(pad(h), h));
+  for (let m = 0; m < 60; m++) minute.append(new Option(pad(m), m));
+  hour.value = 12; minute.value = 0;
+  const done = el("button", "primary", "Done");
+  const time = el("div", "dt-time"); time.append(el("span", "muted", "Time"), hour, el("span", "", ":"), minute, done);
+  pop.append(head, grid, time);
+  wrap.append(btn, pop);
+
+  let value = null;
+  const view = new Date(); view.setDate(1);
+
+  function render() {
+    title.textContent = `${MONTHS[view.getMonth()]} ${view.getFullYear()}`;
+    grid.replaceChildren(...["Mo", "Tu", "We", "Th", "Fr", "Sa", "Su"].map(d => el("div", "dow", d)));
+    const offset = (view.getDay() + 6) % 7;  // Monday first
+    for (let i = 0; i < offset; i++) grid.append(el("div"));
+    const today = new Date(); today.setHours(0, 0, 0, 0);
+    const sel = value == null ? null : new Date(value);
+    const days = new Date(view.getFullYear(), view.getMonth() + 1, 0).getDate();
+    for (let d = 1; d <= days; d++) {
+      const date = new Date(view.getFullYear(), view.getMonth(), d);
+      const b = el("button", "", d);
+      b.type = "button";
+      b.disabled = date < today;
+      if (+date === +today) b.classList.add("today");
+      if (sel && sel.getFullYear() === date.getFullYear() && sel.getMonth() === date.getMonth() && sel.getDate() === d) b.classList.add("sel");
+      b.onclick = () => { set(new Date(view.getFullYear(), view.getMonth(), d, +hour.value, +minute.value).getTime()); onPick(value); };
+      grid.append(b);
+    }
+  }
+  function set(ms) {
+    value = ms;
+    btn.textContent = ms == null ? "Pick date & time" : fmtLocal(ms);
+    btn.classList.toggle("empty", ms == null);
+    if (ms != null) {
+      const d = new Date(ms);
+      hour.value = d.getHours(); minute.value = d.getMinutes();
+      view.setFullYear(d.getFullYear(), d.getMonth(), 1);
+    }
+    if (!pop.hidden) render();
+  }
+  const retime = () => {
+    if (value == null) return;
+    const d = new Date(value); d.setHours(+hour.value, +minute.value, 0, 0);
+    set(d.getTime()); onPick(value);
+  };
+  hour.onchange = retime; minute.onchange = retime;
+  prev.onclick = () => { view.setMonth(view.getMonth() - 1); render(); };
+  next.onclick = () => { view.setMonth(view.getMonth() + 1); render(); };
+  btn.onclick = () => { pop.hidden = !pop.hidden; if (!pop.hidden) render(); };
+  done.onclick = () => { pop.hidden = true; };
+  // isConnected: a clicked day button is replaced by render(); that's not an outside click.
+  document.addEventListener("click", e => { if (e.target.isConnected && !wrap.contains(e.target)) pop.hidden = true; });
+  [prev, next, done, btn].forEach(b => { b.type = "button"; });
+  return { el: wrap, set };
+}
+
+// ── schedule: picker and block number stay in sync ─────────────────
+// Commits close and scoring end follow the opening time until edited by hand.
+const DAY_MS = 86400000;
+const SCHEDULE = [
+  { key: "start_block", text: "Opens (miners can start committing)" },
+  { key: "commit_end_block", text: "Commits close", follow: 5 },
+  { key: "scoring_end_block", text: "Scoring ends, payouts start", follow: 7 },
+];
+function buildSchedule() {
+  for (const field of SCHEDULE) {
+    const row = el("div", "row sched");
+    const left = el("div"), right = el("div");
+    const block = el("input"); block.type = "number"; block.min = 0; block.id = field.key;
+    const hint = el("div", "hint");
+    field.picker = dateTimePicker(ms => { setField(field, ms, true); update(); });
+    left.append(el("label", "", field.text), field.picker.el, hint);
+    right.append(el("label", "", "Block"), block);
+    row.append(left, right);
+    $("schedule").append(row);
+    field.hint = hint;
+    field.touched = false;
+    block.addEventListener("input", () => {
+      setField(field, block.value === "" || !head ? null : timeAt(+block.value), true, true);
+    });
+  }
+  $("tz").textContent = `Times are in your local time zone (${Intl.DateTimeFormat().resolvedOptions().timeZone}). The block number is what gets saved. Commits close and scoring end default to 5 and 7 days after opening.`;
+}
+
+function setField(field, ms, byHand, fromBlock = false) {
+  if (byHand && field.follow) field.touched = true;
+  if (!fromBlock) $(field.key).value = ms == null || !head ? "" : blockAt(ms);
+  field.picker.set(ms);
+  renderHint(field);
+  if (!field.follow) {
+    for (const f of SCHEDULE) if (f.follow && !f.touched) setField(f, ms == null ? null : ms + f.follow * DAY_MS, false);
+  }
+}
+
+function renderHint(field) {
+  const block = $(field.key).value;
+  field.hint.replaceChildren(el("span", "", block && head ? `≈ ${utc(timeAt(+block))}${field.follow ? " · " : ""}` : ""));
+  if (!field.follow) return;
+  if (!field.touched) field.hint.append(el("span", "", `auto: ${field.follow} days after opening`));
+  else {
+    const reset = el("button", "link", `reset to ${field.follow} days after opening`);
+    reset.type = "button";
+    reset.onclick = () => {
+      field.touched = false;
+      const start = $("start_block").value;
+      setField(field, start ? timeAt(+start) + field.follow * DAY_MS : null, false);
+      update();
+    };
+    field.hint.append(reset);
+  }
+}
+
+// ── repeating rows ─────────────────────────────────────────────────
+function addReward(value = "") {
+  const row = document.createElement("div");
+  row.className = "row";
+  row.innerHTML = `<div><label></label><input type="number" min="0" max="100" step="any" data-reward></div><div></div><button>Remove</button>`;
+  row.querySelector("input").value = value;
+  row.querySelector("button").onclick = () => { row.remove(); renumber(); update(); };
+  $("rewards").append(row);
+  renumber();
+}
+function renumber() {
+  [...$("rewards").children].forEach((row, i) => { row.querySelector("label").textContent = `Place ${i + 1} share (%)`; });
+}
+function addBenchmark(name = "", min = "0", epoch = "") {
+  const row = document.createElement("div");
+  row.className = "row bench";
+  row.innerHTML = `<div><label>Benchmark</label><input data-b="name"></div>
+    <div><label>Min score (0–1)</label><input type="number" min="0" max="1" step="any" data-b="min"></div>
+    <div><label>Fluid epoch</label><input data-b="epoch" placeholder="only for fluid_knowledge"></div>
+    <button>Remove</button>`;
+  row.querySelector('[data-b="name"]').value = name;
+  row.querySelector('[data-b="min"]').value = min;
+  row.querySelector('[data-b="epoch"]').value = epoch;
+  row.querySelector("button").onclick = () => { row.remove(); update(); };
+  $("benchmarks").append(row);
+}
+
+function applyPreset(name, announce = true) {
+  const p = PRESETS[name];
+  document.querySelectorAll("[data-preset]").forEach(b => b.setAttribute("aria-pressed", b.dataset.preset === name));
+  if (announce) setStatus(`Loaded ${capitalize(name)} preset: rules, rewards and benchmarks updated below.`, "good");
+  $("competition_type").value = "ram_ceiling";
+  $("max_memory_gib").value = p.max_memory_gib;
+  $("ram_check_context_length").value = p.ctx;
+  $("reveal_grace_blocks").value = 150;
+  $("emission_weight").value = 25;
+  $("distribution_days").value = 7;
+  $("rewards").replaceChildren(); p.rewards.forEach(addReward);
+  $("benchmarks").replaceChildren(); p.benchmarks.forEach(b => addBenchmark(b));
+  update();
+}
+
+// ── spec building (the validator re-checks everything) ─────────────
+const num = id => $(id).value.trim() === "" ? NaN : Number($(id).value);
+function buildSpec() {
+  const problems = [];
+  const rewards = [...document.querySelectorAll("[data-reward]")].map(i => Number(i.value));
+  const benchmarks = [...$("benchmarks").children].map(row => {
+    const name = row.querySelector('[data-b="name"]').value.trim();
+    const epoch = row.querySelector('[data-b="epoch"]').value.trim();
+    return { name, min_score: Number(row.querySelector('[data-b="min"]').value || 0), ...(epoch ? { fluid_epoch_id: epoch } : {}) };
+  });
+  const type = $("competition_type").value;
+  const spec = {
+    schema_version: 1,
+    id: $("id").value.trim(),
+    name: $("name").value.trim(),
+    description: $("description").value.trim() || null,
+    model_repo: $("model_repo").value.trim() || null,
+    start_block: num("start_block"),
+    commit_end_block: num("commit_end_block"),
+    scoring_end_block: num("scoring_end_block"),
+    top_n: rewards.length,
+    emission_distribution: rewards.map(r => Math.round(r * 1e4) / 1e6),
+    benchmarks,
+    model_requirements: { format: "gguf" },
+    reveal_grace_blocks: num("reveal_grace_blocks"),
+    ram_check_context_length: num("ram_check_context_length"),
+    emission_weight: num("emission_weight") / 100,
+    distribution_blocks: Math.round(num("distribution_days") * BLOCKS_PER_DAY),
+    competition_type: type,
+    max_memory_kb: type === "ram_ceiling" ? Math.round(num("max_memory_gib") * 1048576) : null,
+  };
+
+  if (!spec.id) problems.push("Enter an ID.");
+  if (!spec.name) problems.push("Enter a name.");
+  for (const { key, text } of SCHEDULE) if (!Number.isInteger(spec[key])) problems.push(`Pick "${text}".`);
+  if (head && spec.start_block <= head.block) problems.push("Opening time must be in the future.");
+  if (spec.commit_end_block <= spec.start_block) problems.push("Commits must close after opening.");
+  if (spec.scoring_end_block <= spec.commit_end_block + spec.reveal_grace_blocks) problems.push("Scoring must end after commits close (plus reveal grace).");
+  const sum = rewards.reduce((a, b) => a + b, 0);
+  $("reward_sum").textContent = `Total ${+sum.toFixed(4)}%`;
+  $("reward_sum").className = Math.abs(sum - 100) <= 0.1 ? "hint good" : "hint bad";
+  if (!rewards.length) problems.push("Add at least one winner.");
+  if (Math.abs(sum - 100) > 0.1) problems.push("Reward shares must total 100%.");
+  if (!benchmarks.length) problems.push("Add at least one benchmark.");
+  if (benchmarks.some(b => b.name === "fluid_knowledge" && !b.fluid_epoch_id)) problems.push("fluid_knowledge needs a Fluid epoch.");
+  if (!(spec.emission_weight > 0 && spec.emission_weight <= 1)) problems.push("Emission share must be above 0 and at most 100%.");
+  if (type === "ram_ceiling" && !(spec.max_memory_kb > 0)) problems.push("Enter a memory cap.");
+  if (!(spec.distribution_blocks >= 0)) problems.push("Enter how many days to pay winners.");
+  return { spec, problems };
+}
+
+function update() {
+  $("memory_box").hidden = $("competition_type").value !== "ram_ceiling";
+  const days = num("distribution_days");
+  $("distribution_hint").textContent = days >= 0 ? `${Math.round(days * BLOCKS_PER_DAY)} blocks` : "";
+  const { spec, problems } = buildSpec();
+  $("preview").textContent = JSON.stringify(spec, null, 2);
+  const list = document.createElement("ul");
+  list.className = "problems bad";
+  problems.forEach(p => { const li = document.createElement("li"); li.textContent = p; list.append(li); });
+  $("problems").replaceChildren(...(problems.length ? [list] : []));
+  $("submit").disabled = problems.length > 0 || !accounts.length;
+}
+
+// ── wallet ─────────────────────────────────────────────────────────
+async function connect() {
+  const wallets = Object.entries(window.injectedWeb3 || {});
+  if (!wallets.length) return setStatus("No wallet extension found. Install Polkadot.js, Talisman or SubWallet and reload.", "bad");
+  accounts = [];
+  for (const [wallet, injected] of wallets) {
+    try {
+      const ext = await injected.enable("TPN competition admin");
+      for (const a of await ext.accounts.get()) {
+        if (!a.type || a.type === "sr25519" || a.type === "ed25519") accounts.push({ ...a, wallet, signer: ext.signer });
+      }
+    } catch (e) { /* user declined this wallet */ }
+  }
+  if (!accounts.length) return setStatus("No usable accounts. Approve this site in your wallet, or add an sr25519 account.", "bad");
+  $("account").replaceChildren(...accounts.map((a, i) => new Option(`${a.name || "account"} · ${a.address.slice(0, 8)}… (${a.wallet})`, i)));
+  $("account").hidden = false;
+  $("connect").textContent = "Reconnect";
+  setStatus("");
+  update();
+}
+
+const hex = bytes => [...new Uint8Array(bytes)].map(b => b.toString(16).padStart(2, "0")).join("");
+async function submit() {
+  const { spec, problems } = buildSpec();
+  if (problems.length) return;
+  const account = accounts[$("account").value];
+  if (!confirm(`Create "${spec.name}" (${spec.id})?\nOpens at block ${spec.start_block} (≈ ${utc(timeAt(spec.start_block))}).\n\nThis cannot be edited from this page afterwards.`)) return;
+  $("submit").disabled = true;
+  try {
+    setStatus("Waiting for wallet signature…");
+    await loadHead();  // fresh clock offset for the nonce
+    const body = JSON.stringify(spec);
+    const bodyHash = hex(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(body)));
+    const nonce = (BigInt(Math.round(serverNow())) * 1000000n).toString();
+    const scheme = account.type === "ed25519" ? "ed25519" : "sr25519";
+    // btauth/1 payload, see bittensor.http_auth.build_payload
+    const payload = ["btauth/1", scheme, "POST", SIGNED_PATH, bodyHash, nonce, account.address, head.receiver].join("\n");
+    const { signature } = await account.signer.signRaw({
+      address: account.address, type: "bytes", data: "0x" + hex(new TextEncoder().encode(payload)),
+    });
+    setStatus("Submitting…");
+    const headers = {
+      "Content-Type": "application/json",
+      "X-Bittensor-Version": "1",
+      "X-Bittensor-Hotkey": account.address,
+      "X-Bittensor-Receiver": head.receiver,
+      "X-Bittensor-Nonce": nonce,
+      "X-Bittensor-Signature": signature,
+      ...(scheme === "ed25519" ? { "X-Bittensor-Crypto": "ed25519" } : {}),
+    };
+    const resp = await fetch(SIGNED_PATH.slice(1), { method: "POST", headers, body });
+    const data = await resp.json().catch(() => ({}));
+    if (!resp.ok) throw new Error(data.error || `HTTP ${resp.status}`);
+    setStatus(`Created ${data.id}. It now shows in /v1/competitions.`, "good");
+  } catch (e) {
+    setStatus(`Not created: ${e.message || e}`, "bad");
+  } finally {
+    update();
+  }
+}
+
+const capitalize = name => name[0].toUpperCase() + name.slice(1);
+function setStatus(text, cls = "") { $("status").textContent = text; $("status").className = cls; }
+
+// ── boot ───────────────────────────────────────────────────────────
+buildSchedule();
+addEventListener("input", update);
+document.querySelectorAll("[data-preset]").forEach(b => { b.onclick = () => applyPreset(b.dataset.preset); });
+$("add_reward").onclick = () => { addReward(); update(); };
+$("add_benchmark").onclick = () => { addBenchmark(); update(); };
+$("connect").onclick = connect;
+$("submit").onclick = submit;
+applyPreset("fluid", false);
+if (!window.isSecureContext) setStatus("Open this page over HTTPS. Signing is disabled on plain HTTP.", "bad");
+loadHead().then(update).catch(e => { $("head").textContent = `Cannot read chain head: ${e.message}`; $("head").className = "bad"; });
+</script>
+</body>
+</html>

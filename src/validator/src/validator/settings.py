@@ -31,3 +31,8 @@ FOLLOWER_POLL_INTERVAL = int(os.getenv("FOLLOWER_POLL_INTERVAL", 60))
 # Admin API (mode=leader only) — bearer token gating POST /v1/competitions.
 # Unset = write endpoint refuses all requests (503), not open (401 only on bad/missing token).
 ADMIN_API_KEY: str | None = os.getenv("ADMIN_API_KEY") or None
+
+# Admin page (mode=leader only) — ss58 addresses allowed to create competitions from
+# the browser page at /admin by signing with a wallet extension. Comma-separated.
+# Unset = page and signed create endpoint are disabled (404 / 503).
+ADMIN_SIGNERS: set[str] = {s.strip() for s in os.getenv("ADMIN_SIGNERS", "").split(",") if s.strip()}

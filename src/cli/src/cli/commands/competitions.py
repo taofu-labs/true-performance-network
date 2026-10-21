@@ -46,6 +46,14 @@ def competitions(
         ]
         for task in spec.benchmarks:
             lines.append(f"  {task.name:<14} min={task.min_score:.2f}")
+        if spec.kl_corpus_id:
+            lines += [
+                "",
+                "[bold]KL check:[/bold] required",
+                f"  corpus         {spec.kl_corpus_id}",
+                "  [dim]Divergence from the base model multiplies your lowest[/dim]",
+                "  [dim]benchmark score. No run means a score of 0.[/dim]",
+            ]
         if spec.max_memory_kb:
             lines.append(f"\n[dim]Max memory:[/dim]     {spec.max_memory_kb:,} KB")
 

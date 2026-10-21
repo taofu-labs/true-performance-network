@@ -30,12 +30,13 @@ class FakeResponse:
         return self._payload
 
 
-def stub_leader(monkeypatch, benchmarks=("mmlu", "gsm8k")):
+def stub_leader(monkeypatch, benchmarks=("mmlu", "gsm8k"), **extra):
     comp = {
         "id": "comp-a", "name": "comp-a", "start_block": 0, "commit_end_block": 100,
         "scoring_end_block": 200, "emission_distribution": [1.0], "top_n": 1,
         "benchmarks": [{"name": n, "min_score": 0.5} for n in benchmarks],
     }
+    comp.update(extra)
     leader_config_client._cache.clear()
     leader_config_client._cache_time.clear()
     monkeypatch.setattr(
@@ -65,6 +66,11 @@ def make_quote(**overrides) -> Quote:
     return Quote(**fields)
 
 
+def run_name(request):
+    """The run a request is for: a benchmark by name, or the KL comparison."""
+    return request["benchmark"] if "benchmark" in request else "kl"
+
+
 class FakeBillingClient:
     """Records the flow so tests can assert on ordering and payloads."""
 
@@ -74,19 +80,23 @@ class FakeBillingClient:
         self._quote_error = quote_error
         self._run_ids = run_ids or {}
         self.quoted = []
+        self.quote_paths = []
+        self.submit_paths = []
         self.submitted = []
 
-    def quote(self, request, huggingface_token_id=None):
+    def quote(self, request, huggingface_token_id=None, path="/benchmarks/quote"):
         self.quoted.append(request)
+        self.quote_paths.append(path)
         if self._quote_error:
             raise self._quote_error
         return self._quote
 
-    def submit(self, request, quote=None, huggingface_token_id=None):
+    def submit(self, request, quote=None, huggingface_token_id=None, path="/benchmarks"):
         self.submitted.append(request)
+        self.submit_paths.append(path)
         if self._submit_error:
             raise self._submit_error
-        return Order(id=f"order-{request['benchmark']}", status="queueing")
+        return Order(id=f"order-{run_name(request)}", status="queueing")
 
     def wait_for_run_id(self, order_id, timeout=600, poll_interval=10):
         benchmark = order_id.replace("order-", "")
@@ -274,10 +284,10 @@ def test_keeps_run_ids_already_paid_for_when_a_later_one_fails(monkeypatch, tmp_
     write_upload_config(monkeypatch, tmp_path)
 
     class FailsSecond(FakeBillingClient):
-        def submit(self, request, quote=None, huggingface_token_id=None):
-            if request["benchmark"] == "gsm8k":
+        def submit(self, request, quote=None, huggingface_token_id=None, path="/benchmarks"):
+            if request.get("benchmark") == "gsm8k":
                 raise BillingError("coordinator rejected the model", code="rejected")
-            return super().submit(request, quote)
+            return super().submit(request, quote, path=path)
 
     install_client(monkeypatch, FailsSecond(run_ids={"mmlu": "r1"}))
 
@@ -288,3 +298,100 @@ def test_keeps_run_ids_already_paid_for_when_a_later_one_fails(monkeypatch, tmp_
 
 
 
+
+
+# ── KL check ──────────────────────────────────────────────────────────────────
+# A competition with kl_corpus_id requires a comparison run alongside its
+# benchmarks. It is billed through /comparisons, not /benchmarks.
+
+KL_FIELDS = {"kl_corpus_id": "corpus-000002", "model_repo": "Qwen/Qwen2.5-0.5B-Instruct"}
+
+
+def test_runs_the_kl_check_by_default(monkeypatch, tmp_path):
+    stub_leader(monkeypatch, **KL_FIELDS)
+    write_upload_config(monkeypatch, tmp_path)
+    client = FakeBillingClient(run_ids={"mmlu": "r1", "gsm8k": "r2", "kl": "r3"})
+    install_client(monkeypatch, client)
+
+    result = invoke("--api-key", "bapi_x", "--yes")
+    assert result.exit_code == 0, result.stdout
+    saved = {r["b"]: r["r"] for r in saved_runs(tmp_path)}
+    assert saved == {"mmlu": "r1", "gsm8k": "r2", "kl": "r3"}
+
+
+def test_kl_check_is_billed_through_the_comparison_endpoints(monkeypatch, tmp_path):
+    stub_leader(monkeypatch, **KL_FIELDS)
+    write_upload_config(monkeypatch, tmp_path)
+    client = FakeBillingClient()
+    install_client(monkeypatch, client)
+
+    invoke("--api-key", "bapi_x", "--yes")
+    assert client.quote_paths.count("/comparisons/quote") == 1
+    assert client.submit_paths.count("/comparisons") == 1
+    assert client.quote_paths.count("/benchmarks/quote") == 2
+
+
+def test_kl_request_pins_the_base_the_corpus_and_the_committed_file(monkeypatch, tmp_path):
+    stub_leader(monkeypatch, **KL_FIELDS)
+    write_upload_config(monkeypatch, tmp_path, file="model-Q4_K_M.gguf")
+    client = FakeBillingClient()
+    install_client(monkeypatch, client)
+
+    invoke("--api-key", "bapi_x", "--yes")
+    kl = next(r for r in client.submitted if "benchmark" not in r)
+    assert kl["protocol"] == "fidelity-v1"
+    # A gguf reference has no base-side pairing, so the base could not be checked.
+    assert kl["reference"] == "transformers"
+    assert kl["base"]["huggingface_repo"] == "Qwen/Qwen2.5-0.5B-Instruct"
+    assert kl["dataset"] == {"kind": "platform", "corpus_id": "corpus-000002"}
+    assert kl["candidate"]["huggingface_repo"] == "user/repo"
+    assert kl["candidate"]["huggingface_revision"] == "a" * 40
+    assert kl["candidate"]["model_files"] == ["model-Q4_K_M.gguf"]
+    assert kl["candidate"]["quantization"] == "Q4_K_M"
+
+
+def test_kl_price_is_in_the_bill_the_miner_confirms(monkeypatch, tmp_path):
+    stub_leader(monkeypatch, **KL_FIELDS)
+    write_upload_config(monkeypatch, tmp_path)
+    install_client(monkeypatch, FakeBillingClient())
+
+    result = runner.invoke(app, ["--leader-url", LEADER_URL, "benchmark",
+                                 "--wallet", "alice", "--competition", "comp-a",
+                                 "--api-key", "bapi_x"], input="n\n")
+    assert result.exit_code == 0
+    assert "kl" in result.stdout and "KL check" in result.stdout
+    # Three runs at $6.50; nothing is spent when the miner declines.
+    assert "$19.50" in result.stdout
+
+
+def test_only_kl_runs_the_comparison_alone(monkeypatch, tmp_path):
+    stub_leader(monkeypatch, **KL_FIELDS)
+    write_upload_config(monkeypatch, tmp_path)
+    client = FakeBillingClient(run_ids={"kl": "r9"})
+    install_client(monkeypatch, client)
+
+    result = invoke("--api-key", "bapi_x", "--only", "kl", "--yes")
+    assert result.exit_code == 0, result.stdout
+    assert client.quote_paths == ["/comparisons/quote"]
+    assert {r["b"]: r["r"] for r in saved_runs(tmp_path)} == {"kl": "r9"}
+
+
+def test_no_kl_check_when_the_competition_has_no_corpus(monkeypatch, tmp_path):
+    stub_leader(monkeypatch)
+    write_upload_config(monkeypatch, tmp_path)
+    client = FakeBillingClient()
+    install_client(monkeypatch, client)
+
+    invoke("--api-key", "bapi_x", "--yes")
+    assert "/comparisons/quote" not in client.quote_paths
+    assert "kl" not in {r["b"] for r in saved_runs(tmp_path)}
+
+
+def test_refuses_a_kl_competition_that_pins_no_base(monkeypatch, tmp_path):
+    stub_leader(monkeypatch, kl_corpus_id="corpus-000002")
+    write_upload_config(monkeypatch, tmp_path)
+    install_client(monkeypatch, FakeBillingClient())
+
+    result = invoke("--api-key", "bapi_x", "--yes")
+    assert result.exit_code == 1
+    assert "pins no base model" in result.stdout

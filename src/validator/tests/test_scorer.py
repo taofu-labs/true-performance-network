@@ -1,10 +1,12 @@
+import json
+import pathlib
 import sqlite3
 
 import pytest
 
 from common.models.competition import BenchmarkTask, CompetitionSpec
 from common.models.submission import BenchmarkRun, MinerSubmission
-from competition.benchmark_client import RunStatus, RunStatusCode
+from competition.benchmark_client import RunStatus, RunStatusCode, _extract_model_identity
 from validator import scorer, store
 
 
@@ -667,3 +669,49 @@ class _StubCoordinator:
 
     def poll(self, run_id):
         return RunStatus(run_id=run_id, status=RunStatusCode.COMPLETED, scores={"mmlu": 0.8})
+
+
+# ── Live coordinator payload ──────────────────────────────────────────────────
+
+def _live_status() -> dict:
+    path = pathlib.Path(__file__).parent / "fixtures" / "comparison_status.json"
+    return json.loads(path.read_text())
+
+
+def test_parses_a_real_comparison_status_payload():
+    """Guards the nesting against coordinator drift: a comparison run carries no
+    model_source.model, so the candidate must be read from .candidate.model."""
+    identity = _extract_model_identity(_live_status())
+    assert identity["repo"] == "bartowski/Qwen2.5-0.5B-Instruct-GGUF"
+    assert identity["revision"] == "41ba88dbac95fed2528c92514c131d73eb5a174b"
+    assert identity["model_files"] == ["Qwen2.5-0.5B-Instruct-Q4_K_M.gguf"]
+    assert identity["file_hashes"]["Qwen2.5-0.5B-Instruct-Q4_K_M.gguf"][0] == "sha256"
+    assert identity["base_repo"] == "Qwen/Qwen2.5-0.5B-Instruct"
+    assert identity["dataset"]["corpus_id"] == "corpus-000002"
+    assert identity["comparison"]["protocol"] == "fidelity-v1"
+
+
+def test_verifies_a_real_comparison_run_end_to_end():
+    data = _live_status()
+    status = RunStatus(
+        run_id=data["run_id"], status=RunStatusCode.COMPLETED, **_extract_model_identity(data),
+    )
+    candidate = data["model_source"]["candidate"]["model"]
+    submission = make_submission(
+        repository=candidate["repo"], file=candidate["files"][0]["path"],
+        file_sha256=candidate["files"][0]["hash"]["value"],
+        huggingface_revision=candidate["sha"],
+        runs=[BenchmarkRun(b="kl", r=data["short_id"])],
+    )
+    spec = make_spec(
+        model_repo=data["model_source"]["base"]["model"]["repo"],
+        kl_corpus_id=data["model_source"]["dataset"]["corpus_id"],
+    )
+
+    result = scorer.verify_kl_run(submission, spec, data["short_id"], status)
+    assert result.ok, result.reason
+    assert result.score == pytest.approx(0.864555, abs=1e-6)
+
+    # The same run against a competition on a different base earns nothing.
+    other_base = spec.model_copy(update={"model_repo": "meta-llama/Llama-3.1-8B"})
+    assert scorer.verify_kl_run(submission, other_base, data["short_id"], status).score == 0.0

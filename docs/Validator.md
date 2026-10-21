@@ -114,8 +114,8 @@ validator. Running multiple leaders can produce conflicting scoring state.
 | `LAUNCH_HEALTH` | `False` | Set `True` to enable health endpoint on port 9100 |
 | `FOLLOWER_POLL_INTERVAL` | `60` | Seconds between polls of the leader's scoring results |
 | `BENCHMARK_BACKEND` | `mock` | `http` for real coordinator calls; `mock` for offline runs |
-| `COORDINATOR_BASE_URL` | `https://bench.trueperformancenetwork.com` | Benchmark coordinator API |
-| `COORDINATOR_API_KEY` | (unset) | Required when `BENCHMARK_BACKEND=http` |
+| `COORDINATOR_BASE_URL` | `https://bench.trueperformancenetwork.com/api/coordinator` | Benchmark coordinator API. The `/api/coordinator` suffix is required — the bare host serves the Workbench frontend, whose SPA catch-all answers every API path with HTML and a 404 |
+| `COORDINATOR_API_KEY` | (unset) | Required when `BENCHMARK_BACKEND=http`. Needs ADMIN scope; a billing token (`bapi_…`) is rejected by design |
 
 ### Coordinator token scope (leader only)
 

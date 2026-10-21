@@ -252,8 +252,8 @@ def test_compute_emission_weights_more_qualifiers_than_distribution_slots():
 
 
 # ── KL score ──────────────────────────────────────────────────────────────────
-# Anchors are measured P99 KL on the control_to_candidate pairing (nats):
-# Q8_0 ~0.011, Q4_K_M ~0.11, Q2_K 1.30.
+# KL anchors are measured P99 on control_to_candidate (nats): Q4_K_M 0.1455,
+# Q2_K 1.30.
 
 def make_kl_spec(competition_type=CompetitionType.RAM_CEILING) -> CompetitionSpec:
     return CompetitionSpec(
@@ -276,12 +276,13 @@ def test_kl_norm_rejects_impossible_values(bad):
 
 
 def test_kl_norm_is_monotonic_over_the_measured_ladder():
-    ladder = [0.0, 0.011, 0.11, 0.59, 1.30]
+    ladder = [0.0, 0.011, 0.14554, 0.59, 1.30]
     assert all(kl_norm(a) > kl_norm(b) for a, b in zip(ladder, ladder[1:]))
 
 
 def test_kl_norm_barely_penalizes_q8_and_heavily_penalizes_q2k():
     assert kl_norm(0.011) > 0.98
+    assert kl_norm(0.14554) == pytest.approx(0.8646, abs=1e-4)
     assert kl_norm(1.30) < 0.30
 
 
@@ -326,7 +327,6 @@ def test_kl_reorders_ranking_against_a_damaged_model():
             file="g.gguf", file_sha256="c" * 64, max_memory=500, huggingface_revision="d" * 40,
         ),
     }
-    # The damaged model has strictly better benchmarks but a Q2_K-grade KL.
     verified = {
         "honest": {"mmlu": 0.70, "gsm8k": 0.70, KL_RUN_NAME: kl_norm(0.011)},
         "damaged": {"mmlu": 0.85, "gsm8k": 0.85, KL_RUN_NAME: kl_norm(1.30)},

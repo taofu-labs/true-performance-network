@@ -23,7 +23,7 @@ from loguru import logger
 
 from common.urls import validate_base_url
 
-DEFAULT_BILLING_URL = os.getenv("BENCHMARK_BILLING_URL", "https://benchmarks.trueperformancenetwork.com/api/v1")
+DEFAULT_BILLING_URL = os.getenv("BENCHMARK_BILLING_URL", "https://bench.trueperformancenetwork.com/api/v1")
 
 # Order statuses that will never progress further.
 _TERMINAL_ORDER_STATUSES = {"completed", "failed", "cancelled", "refunded"}

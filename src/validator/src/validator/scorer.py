@@ -244,13 +244,11 @@ def verify_run(
     )
 
 
-# The pairing and quantile the KL multiplier reads. `control_to_candidate`
-# compares the candidate against an F16 control converted from the same base on
-# the same pod, so both sides run llama.cpp and engine noise cancels — what is
-# left is quantization damage alone. (`original_to_candidate` conflates the two:
-# measured F16-control noise is 0.0012 nats, about the size of a Q8_0's whole
-# divergence.) P99 prices tail damage a mean would hide: Q2_K means 0.19 nats
-# but its P99 is 1.30.
+# `control_to_candidate` compares against an F16 control converted from the same
+# base on the same pod, so both sides run llama.cpp and engine noise cancels,
+# leaving quantization damage alone. `original_to_candidate` conflates the two:
+# measured control noise is 0.004 nats at P99. P99 rather than the mean prices
+# tail damage: a Q4_K_M means 0.025 nats but reaches 0.146 at P99.
 KL_PAIRING = "control_to_candidate"
 KL_QUANTILE = "0.99"
 
@@ -267,9 +265,8 @@ def verify_kl_run(
     fidelity multiplier as `score`.
 
     Rejection is never fatal and never bans: the multiplier is 0.0, which zeroes
-    the candidate's final score through the multiplication without removing them
-    from the competition. An unverifiable run must never read as perfect
-    fidelity — that is the one way a lenient curve could be gamed.
+    the final score through the multiplication without removing the candidate.
+    An unverifiable run must never read as perfect fidelity.
     """
     fail = lambda reason: RunVerification(
         benchmark=KL_RUN_NAME, run_id=run_id, ok=False, reason=reason,
@@ -286,21 +283,19 @@ def verify_kl_run(
     if not isinstance(comparison, dict):
         return fail("run carries no comparison result — not a comparison run")
 
-    # A verifier-protocol run reports a single 0-100 score and no pairings; it
-    # samples a private sharded suite, not the competition's corpus.
+    # A verifier run reports one 0-100 score over a private sharded suite, not
+    # pairings over the competition's corpus.
     if comparison.get("protocol") != "fidelity-v1":
         return fail(f"wrong comparison protocol {comparison.get('protocol')!r}, need fidelity-v1")
 
-    # candidate_invalid is a measured diagnostic (nonfinite logits), not a crash.
     if comparison.get("outcome") != "complete":
         return fail(f"comparison outcome {comparison.get('outcome')!r}, need complete")
 
-    # A gguf reference never loads the HF base, so there is no base-side pairing
-    # and no base to pin the competition's model_repo against.
+    # A gguf reference never loads the HF base: no base-side pairing, nothing to
+    # pin model_repo against.
     if comparison.get("reference") != "transformers":
         return fail(f"comparison reference {comparison.get('reference')!r}, need transformers")
 
-    # The base the run actually compared against, as the coordinator resolved it.
     if spec.model_repo:
         if not status.base_repo:
             return fail("coordinator returned no base model identity for KL run")
@@ -310,8 +305,7 @@ def verify_kl_run(
                 f"competition requires {spec.model_repo}"
             )
 
-    # A miner-uploaded dataset is text they chose; only the platform corpus the
-    # competition pins is a fair measurement.
+    # A miner-uploaded dataset is text they chose.
     dataset = status.dataset or {}
     if dataset.get("kind") != "platform":
         return fail(f"KL run used a {dataset.get('kind')!r} dataset, need the platform corpus")
@@ -321,8 +315,8 @@ def verify_kl_run(
             f"competition requires {spec.kl_corpus_id!r}"
         )
 
-    # Same candidate-identity binding as a benchmark run: without it a miner
-    # submits a comparison of some other, better-behaved model.
+    # Same binding as a benchmark run: without it a miner submits a comparison
+    # of some other, better-behaved model.
     if not status.repo:
         return fail("coordinator returned no candidate model identity for KL run")
     if status.repo.lower() != submission.repository.lower():
@@ -344,8 +338,8 @@ def verify_kl_run(
     if not isinstance(pairing, dict):
         return fail(f"comparison has no '{KL_PAIRING}' pairing")
 
-    # The DTO builds `quantiles` by filtering on presence, so a key can be
-    # legitimately absent — treat that as unverifiable, not as zero divergence.
+    # The DTO filters `quantiles` on presence, so the key can be absent — that is
+    # unverifiable, not zero divergence.
     quantile = ((pairing.get("kl") or {}).get("quantiles") or {}).get(KL_QUANTILE)
     if not isinstance(quantile, (int, float)) or isinstance(quantile, bool):
         return fail(f"comparison has no P{KL_QUANTILE} KL for '{KL_PAIRING}'")

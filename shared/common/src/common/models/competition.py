@@ -16,6 +16,13 @@ class CompetitionType(str, Enum):
     RAM_CEILING = "ram_ceiling"  # max_memory is a pass/fail cap; rank by highest benchmark composite
 
 
+# Reserved submission run name for the KL comparison run. Miners commit it the
+# same way as a benchmark — {"b": "kl", "r": "r1234"} — so it arrives through
+# MinerSubmission.run_ids without a payload spec bump. It is not a benchmark:
+# benchmark_min never sees it, and it carries a fidelity multiplier, not a score.
+KL_RUN_NAME = "kl"
+
+
 class BenchmarkTask(BaseModel):
     name: str
     min_score: float
@@ -35,6 +42,11 @@ class CompetitionSpec(BaseModel):
     name: str
     description: Optional[str] = None
     model_repo: Optional[str] = None  # HF repo ID of the base model miners should optimize
+    # Platform corpus on the benchmark server the KL comparison run must use
+    # (`dataset: { corpus_id }`). Its text is never exposed — the catalog only
+    # publishes rounded counts — so miners cannot tune against it. None disables
+    # KL scoring entirely and the competition scores exactly as before.
+    kl_corpus_id: Optional[str] = None
 
     start_block: int
     commit_end_block: int
@@ -63,6 +75,14 @@ class CompetitionSpec(BaseModel):
         total = sum(self.emission_distribution)
         if abs(total - 1.0) > 0.001:
             raise ValueError(f"emission_distribution sums to {total}, must be 1.0")
+        return self
+
+    @model_validator(mode="after")
+    def validate_kl_run_name_not_a_benchmark(self):
+        """`kl` is reserved: a benchmark by that name would collide with the
+        KL multiplier in verified_scores and be read as a fidelity score."""
+        if any(t.name == KL_RUN_NAME for t in self.benchmarks):
+            raise ValueError(f"'{KL_RUN_NAME}' is reserved for the KL comparison run and cannot name a benchmark")
         return self
 
     @model_validator(mode="after")

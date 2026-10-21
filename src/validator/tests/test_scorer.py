@@ -1,5 +1,7 @@
 import sqlite3
 
+import pytest
+
 from common.models.competition import BenchmarkTask, CompetitionSpec
 from common.models.submission import BenchmarkRun, MinerSubmission
 from competition.benchmark_client import RunStatus, RunStatusCode
@@ -535,9 +537,8 @@ def test_precheck_one_fails_when_submitted_file_absent(monkeypatch):
     assert store.is_banned(conn, "hk1") is False
 
 # ── KL comparison run verification ────────────────────────────────────────────
-# Payload shapes are taken from a real fidelity-v1 run on the live coordinator
-# (run 01f61c34, corpus-000002): a comparison run has no `model_source.model`,
-# the candidate is nested under `.candidate.model`, and the base under `.base.model`.
+# Payload shapes come from a real fidelity-v1 run on the live coordinator
+# (run 01f61c34, corpus-000002, Q4_K_M: P99 0.1455 nats -> x0.8646).
 
 KL_SPEC_FIELDS = dict(model_repo="Qwen/Qwen2.5-0.5B-Instruct", kl_corpus_id="corpus-000002")
 
@@ -551,7 +552,7 @@ def make_kl_status(**overrides) -> RunStatus:
         dataset={"kind": "platform", "corpus_id": "corpus-000002"},
         comparison={
             "protocol": "fidelity-v1", "outcome": "complete", "reference": "transformers",
-            "pairings": {scorer.KL_PAIRING: {"kl": {"mean": 0.0163, "quantiles": {"0.99": 0.11}}}},
+            "pairings": {scorer.KL_PAIRING: {"kl": {"mean": 0.0247, "quantiles": {"0.99": 0.1455}}}},
         },
     )
     fields.update(overrides)
@@ -567,7 +568,7 @@ def verify_kl(**overrides) -> scorer.RunVerification:
 def test_kl_run_verifies_and_returns_the_multiplier():
     result = verify_kl()
     assert result.ok and result.benchmark == "kl"
-    assert 0.85 < result.score < 0.95
+    assert result.score == pytest.approx(0.8646, abs=1e-4)
 
 
 def test_kl_rejects_a_verifier_protocol_run():
@@ -608,14 +609,13 @@ def test_kl_rejects_a_comparison_of_a_different_model():
 
 
 def test_kl_skips_the_hash_check_for_non_sha256_algorithms():
-    # HF serves xet/git_blob hashes for non-LFS files; they are not comparable.
     assert verify_kl(file_hashes={"model.gguf": ("xet", "zz")}).ok
 
 
 def test_kl_rejects_a_missing_p99_rather_than_reading_it_as_zero():
     comparison = dict(
         make_kl_status().comparison,
-        pairings={scorer.KL_PAIRING: {"kl": {"mean": 0.0163, "quantiles": {"0.9": 0.05}}}},
+        pairings={scorer.KL_PAIRING: {"kl": {"mean": 0.0247, "quantiles": {"0.9": 0.05}}}},
     )
     result = verify_kl(comparison=comparison)
     assert not result.ok and result.score == 0.0
@@ -624,7 +624,7 @@ def test_kl_rejects_a_missing_p99_rather_than_reading_it_as_zero():
 def test_kl_rejects_the_wrong_pairing():
     comparison = dict(
         make_kl_status().comparison,
-        pairings={"original_to_candidate": {"kl": {"quantiles": {"0.99": 0.11}}}},
+        pairings={"original_to_candidate": {"kl": {"quantiles": {"0.99": 0.1455}}}},
     )
     assert not verify_kl(comparison=comparison).ok
 

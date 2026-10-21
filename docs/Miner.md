@@ -164,7 +164,7 @@ For local development or non-standard setups, all commands accept these global f
 | `--block-time` | `12.0` | Seconds per block (use `0.300` for localnet) |
 
 `tpn benchmark` additionally takes `--billing-url`
-(default `https://benchmarks.trueperformancenetwork.com/api/v1`) and
+(default `https://bench.trueperformancenetwork.com/api/v1`) and
 `--api-key` (`$BENCHMARK_API_KEY`) after the subcommand.
 
 Example:

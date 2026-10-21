@@ -6,12 +6,13 @@ from bittensor import http_auth, sp_core
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
-from common.models.competition import CompetitionSpec
+from common.models.competition import BenchmarkTask, CompetitionSpec, CompetitionType
 from validator import store
 from validator import settings as validator_settings
 from validator import api as api_module
 from validator.api import (
-    MAX_REQUEST_BODY_BYTES, LeaderApiMixin, _require_admin_auth, _require_admin_signer,
+    MAX_REQUEST_BODY_BYTES, LeaderApiMixin, creation_errors, _require_admin_auth,
+    _require_admin_signer,
 )
 
 
@@ -807,3 +808,41 @@ async def test_signed_create_rejects_bad_specs(conn, admin_signers, overrides):
         assert resp.status == 422, await resp.text()
     assert store.list_competitions(conn) == []
 
+
+
+# ── KL check creation rules ───────────────────────────────────────────────────
+
+def _kl_spec(**overrides) -> CompetitionSpec:
+    fields = dict(
+        id="kl1", name="kl1", start_block=1000, commit_end_block=2000, scoring_end_block=3000,
+        top_n=1, emission_distribution=[1.0],
+        benchmarks=[BenchmarkTask(name="mmlu", min_score=0.5)],
+        competition_type=CompetitionType.RAM_CEILING, max_memory_kb=4194304,
+    )
+    fields.update(overrides)
+    return CompetitionSpec(**fields)
+
+
+def test_competition_without_a_kl_corpus_is_unaffected():
+    assert creation_errors(_kl_spec(), 500) == []
+
+
+def test_kl_corpus_with_a_base_pin_is_accepted():
+    spec = _kl_spec(kl_corpus_id="corpus-000002", model_repo="Qwen/Qwen2.5-0.5B-Instruct")
+    assert creation_errors(spec, 500) == []
+
+
+def test_kl_corpus_without_a_base_pin_is_refused():
+    """Without model_repo the KL run names its own base, so the multiplier is free."""
+    errors = creation_errors(_kl_spec(kl_corpus_id="corpus-000002"), 500)
+    assert any("model_repo" in e for e in errors), errors
+
+
+def test_kl_corpus_on_benchmark_floor_is_refused():
+    """benchmark_floor ranks on negated memory and never reads benchmark_min."""
+    spec = _kl_spec(
+        kl_corpus_id="corpus-000002", model_repo="a/b",
+        competition_type=CompetitionType.BENCHMARK_FLOOR, max_memory_kb=None,
+    )
+    errors = creation_errors(spec, 500)
+    assert any("benchmark_floor" in e for e in errors), errors

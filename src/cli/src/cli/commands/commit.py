@@ -12,6 +12,7 @@ from rich.panel import Panel
 from cli.utils.config import load_competition_config, save_competition_config
 from cli.utils.context import get as get_ctx, resolve_competition_or_exit
 from common.chain import current_block as get_current_block, timelocked_commit, is_hotkey_registered, get_subtensor, get_wallet
+from common.models.competition import KL_RUN_NAME
 from common.models.submission import BenchmarkRun, build_reveal_payload
 
 console = Console()
@@ -162,9 +163,15 @@ def _resolve_runs(
       2. --runs CLI flag
       3. Interactive prompt per benchmark
 
+    A competition with a KL check requires its comparison run too: without one
+    the KL multiplier is 0.0, which zeroes the final score, and the payload is
+    sealed at commit so it cannot be added later.
+
     Returns list[BenchmarkRun] or None on validation error.
     """
     benchmark_names = [t.name for t in spec.benchmarks]
+    if spec.kl_corpus_id:
+        benchmark_names.append(KL_RUN_NAME)
 
     # Try config file first, then CLI flag
     raw_runs = cfg.get("runs") or None
@@ -197,10 +204,20 @@ def _resolve_runs(
     # Catch a mistyped run id here rather than letting it silently score 0.0
     # at reveal time, when it can no longer be corrected.
     try:
-        return [BenchmarkRun(b=r["b"], r=str(r["r"]).strip()) for r in raw_runs]
+        parsed = [BenchmarkRun(b=r["b"], r=str(r["r"]).strip()) for r in raw_runs]
     except ValidationError as e:
         console.print(f"[red]Invalid run id: {e.errors()[0]['msg']}[/red]")
         return None
+
+    if spec.kl_corpus_id and not any(r.b == KL_RUN_NAME for r in parsed):
+        console.print(
+            f"[red]{spec.id} requires a KL check and no '{KL_RUN_NAME}' run was given.[/red]\n"
+            "[dim]Committing without it scores 0, and the payload is sealed now — "
+            f"run `tpn benchmark --only {KL_RUN_NAME}` first.[/dim]"
+        )
+        return None
+
+    return parsed
 
 
 def _prompt_runs(benchmark_names: list) -> list:

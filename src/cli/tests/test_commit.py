@@ -5,6 +5,7 @@ from typer.testing import CliRunner
 import cli.commands.commit as commit_mod
 import cli.utils.config as config_mod
 from cli.app import app
+from common.models.competition import BenchmarkTask, CompetitionSpec
 from competition import leader_config_client
 
 runner = CliRunner()
@@ -179,3 +180,46 @@ def test_commit_saves_runs_to_config(monkeypatch, tmp_path):
 
     saved = cfg_mod.load_competition_config("alice", "default", "comp-a")
     assert saved["runs"] == [{"b": "mmlu", "r": "r1234"}]
+
+
+# ── KL check ──────────────────────────────────────────────────────────────────
+# A competition with kl_corpus_id requires its comparison run in the payload.
+# The payload is sealed at commit, so a missing run cannot be added later — it
+# would reveal, score 0 through the KL multiplier, and be uncorrectable.
+
+def _kl_spec(**overrides) -> CompetitionSpec:
+    fields = dict(
+        id="comp-a", name="comp-a", start_block=0, commit_end_block=100,
+        scoring_end_block=200, emission_distribution=[1.0], top_n=1,
+        benchmarks=[BenchmarkTask(name="mmlu", min_score=0.5)],
+        kl_corpus_id="corpus-000002", model_repo="Qwen/Qwen2.5-0.5B-Instruct",
+    )
+    fields.update(overrides)
+    return CompetitionSpec(**fields)
+
+
+def test_commit_accepts_a_payload_carrying_the_kl_run():
+    cfg = {"runs": [{"b": "mmlu", "r": "r1"}, {"b": "kl", "r": "r2"}]}
+    runs = commit_mod._resolve_runs(None, cfg, _kl_spec())
+    assert {r.b: r.r for r in runs} == {"mmlu": "r1", "kl": "r2"}
+
+
+def test_commit_prompts_for_a_missing_kl_run(monkeypatch):
+    """A missing KL run is prompted for, like any other missing run."""
+    monkeypatch.setattr(commit_mod.typer, "prompt", lambda text: "r2")
+    cfg = {"runs": [{"b": "mmlu", "r": "r1"}]}
+    runs = commit_mod._resolve_runs(None, cfg, _kl_spec())
+    assert {r.b: r.r for r in runs} == {"mmlu": "r1", "kl": "r2"}
+
+
+def test_commit_refuses_when_the_kl_run_is_still_missing(monkeypatch):
+    """Declining the prompt must not seal a payload that scores 0."""
+    monkeypatch.setattr(commit_mod.typer, "prompt", lambda text: "")
+    cfg = {"runs": [{"b": "mmlu", "r": "r1"}]}
+    assert commit_mod._resolve_runs(None, cfg, _kl_spec()) is None
+
+
+def test_commit_without_a_kl_check_is_unaffected():
+    cfg = {"runs": [{"b": "mmlu", "r": "r1"}]}
+    runs = commit_mod._resolve_runs(None, cfg, _kl_spec(kl_corpus_id=None))
+    assert {r.b: r.r for r in runs} == {"mmlu": "r1"}

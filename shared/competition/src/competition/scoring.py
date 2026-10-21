@@ -1,6 +1,24 @@
+import math
 from typing import Dict, List, Tuple
-from common.models.competition import BenchmarkTask, CompetitionSpec, CompetitionType
+from common.models.competition import KL_RUN_NAME, BenchmarkTask, CompetitionSpec, CompetitionType
 from common.models.submission import MinerSubmission
+
+
+def kl_norm(kl: float) -> float:
+    """
+    Turn a KL divergence in nats into a fidelity multiplier in (0, 1].
+
+    exp(-kl): 0 nats (candidate indistinguishable from the base) gives 1.0, and
+    the multiplier decays as the candidate diverges. Measured P99 on the
+    control_to_candidate pairing, where both sides run the same engine so only
+    quantization damage is left: Q8_0 ~0.01 nats, Q4_K_M ~0.1, Q2_K 1.30.
+
+    ponytail: no scale constant — exp(-kl) is the curve until real P99 data from
+    a production corpus justifies a tunable tau on the spec.
+    """
+    if not math.isfinite(kl) or kl < 0.0:
+        return 0.0
+    return math.exp(-kl)
 
 
 def benchmark_min(scores: Dict[str, float], tasks: List[BenchmarkTask]) -> float:
@@ -24,11 +42,20 @@ def final_score(
     (rank descending), so benchmark_floor scores are negated memory.
 
     - BENCHMARK_FLOOR: rank by lowest max_memory_kb (benchmarks are pass/fail floors).
-    - RAM_CEILING: rank by highest minimum benchmark score (max_memory_kb is a
-      pass/fail cap).
+    - RAM_CEILING: rank by highest minimum benchmark score, discounted by the KL
+      fidelity multiplier (max_memory_kb is a pass/fail cap).
+
+    The KL multiplier rides in `scores` under the reserved KL_RUN_NAME key, not
+    as a benchmark: benchmark_min only iterates spec.benchmarks, so it is never
+    mistaken for one. Absent (no KL run configured) it defaults to 1.0, leaving
+    the score identical to a competition without KL scoring.
+
+    ponytail: BENCHMARK_FLOOR ignores the multiplier — it ranks on negated
+    memory, which a (0,1] factor would *improve*. Charge it as effective memory
+    (`-max_memory_kb / kl_norm`) if KL should count there too.
     """
     if spec.competition_type == CompetitionType.RAM_CEILING:
-        return benchmark_min(scores, spec.benchmarks)
+        return benchmark_min(scores, spec.benchmarks) * scores.get(KL_RUN_NAME, 1.0)
     return -float(max_memory_kb)
 
 
@@ -119,3 +146,43 @@ def aggregate_competition_weights(
     if grand_total > 1.0:
         totals = {hk: w / grand_total for hk, w in totals.items()}
     return totals
+
+
+if __name__ == "__main__":
+    # ponytail: one runnable check over the KL multiplier and how it lands in
+    # final_score. Anchors are the measured P99 ladder on control_to_candidate.
+    from common.models.competition import BenchmarkTask
+
+    assert kl_norm(0.0) == 1.0                      # identical to base
+    assert kl_norm(-1.0) == 0.0                     # negative KL is a reduction bug
+    assert kl_norm(float("nan")) == 0.0
+    assert kl_norm(float("inf")) == 0.0
+    assert 0.98 < kl_norm(0.011) < 1.0              # Q8_0
+    assert 0.85 < kl_norm(0.11) < 0.95              # Q4_K_M
+    assert 0.25 < kl_norm(1.30) < 0.30              # Q2_K, measured
+    # Monotonic: more divergence never scores better.
+    ladder = [0.0, 0.011, 0.11, 0.59, 1.30]
+    assert all(kl_norm(a) > kl_norm(b) for a, b in zip(ladder, ladder[1:]))
+
+    tasks = [BenchmarkTask(name="mmlu", min_score=0.0), BenchmarkTask(name="gsm8k", min_score=0.0)]
+    ceiling = CompetitionSpec(
+        id="c", name="c", start_block=0, commit_end_block=1, scoring_end_block=2,
+        top_n=1, emission_distribution=[1.0], benchmarks=tasks,
+        competition_type=CompetitionType.RAM_CEILING, max_memory_kb=1000,
+    )
+    floor = ceiling.model_copy(update={"competition_type": CompetitionType.BENCHMARK_FLOOR})
+
+    # The multiplier discounts the weakest benchmark, and is never read as one.
+    scores = {"mmlu": 0.9, "gsm8k": 0.6, KL_RUN_NAME: 0.5}
+    assert benchmark_min(scores, tasks) == 0.6
+    assert abs(final_score(scores, 500, ceiling) - 0.30) < 1e-9
+    # Absent KL (no corpus configured) scores exactly as before.
+    assert final_score({"mmlu": 0.9, "gsm8k": 0.6}, 500, ceiling) == 0.6
+    # An unverifiable KL run zeroes the candidate without removing them.
+    assert final_score({"mmlu": 0.9, "gsm8k": 0.6, KL_RUN_NAME: 0.0}, 500, ceiling) == 0.0
+    # BENCHMARK_FLOOR still ranks on negated memory; the multiplier is ignored.
+    assert final_score(scores, 500, floor) == -500.0
+    # Floors never see the reserved key.
+    assert passes_floors(scores, tasks) == (True, [])
+
+    print("scoring self-check OK")

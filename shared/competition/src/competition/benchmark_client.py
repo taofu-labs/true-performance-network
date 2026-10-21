@@ -125,6 +125,17 @@ class RunStatus:
     # Fluid epoch the run was scored on, from the coordinator's verified result.
     fluid_epoch_id: Optional[str] = None
 
+    # Comparison (KL) runs only. `comparison` is the coordinator's public
+    # fidelity DTO; `dataset` is model_source.dataset, naming the platform
+    # corpus the run measured on. Both are None for benchmark runs.
+    comparison: Optional[dict] = None
+    dataset: Optional[dict] = None
+    # Repo of the base the candidate was compared *to*. The fidelity DTO's
+    # `models` block holds runtime descriptors only (backend, dtype), never
+    # repo identity, so this comes from model_source.base.model — which is what
+    # the coordinator resolved and pinned, not anything the worker reported.
+    base_repo: Optional[str] = None
+
 
 # ---------------------------------------------------------------------------
 # Protocol
@@ -385,8 +396,14 @@ def _extract_model_identity(data: dict) -> dict:
     `model_source.model` carries the repo, the resolved immutable revision and
     every benchmark-affecting file with its content hash. This is what binds a
     miner-supplied run id to the model they actually committed on chain.
+
+    A comparison run has no `model` slot: it pins a pair, so the miner's own
+    model is `model_source.candidate.model` and the base it was compared to is
+    `model_source.base.model`. The identity reported here is always the
+    candidate's — the side the submission commits.
     """
-    model = ((data.get("model_source") or {}).get("model")) or {}
+    model_source = data.get("model_source") or {}
+    model = model_source.get("model") or (model_source.get("candidate") or {}).get("model") or {}
     files = model.get("files") or []
 
     model_files: List[str] = []
@@ -421,6 +438,11 @@ def _extract_model_identity(data: dict) -> dict:
         benchmarks=list(benchmarks),
         item_status=item_status,
         fluid_epoch_id=fluid_epoch.get("epoch_id"),
+        # Only terminal comparison runs carry `comparison`; the coordinator
+        # omits the key entirely for benchmark runs.
+        comparison=data.get("comparison"),
+        dataset=model_source.get("dataset"),
+        base_repo=((model_source.get("base") or {}).get("model") or {}).get("repo"),
     )
 
 

@@ -533,3 +533,137 @@ def test_precheck_one_fails_when_submitted_file_absent(monkeypatch):
     assert "not found at revision" in result.reason
     assert "something-else.gguf" in result.reason
     assert store.is_banned(conn, "hk1") is False
+
+# ── KL comparison run verification ────────────────────────────────────────────
+# Payload shapes are taken from a real fidelity-v1 run on the live coordinator
+# (run 01f61c34, corpus-000002): a comparison run has no `model_source.model`,
+# the candidate is nested under `.candidate.model`, and the base under `.base.model`.
+
+KL_SPEC_FIELDS = dict(model_repo="Qwen/Qwen2.5-0.5B-Instruct", kl_corpus_id="corpus-000002")
+
+
+def make_kl_status(**overrides) -> RunStatus:
+    fields = dict(
+        run_id="r1351", status=RunStatusCode.COMPLETED,
+        repo="user/repo", revision="b" * 40,
+        model_files=["model.gguf"], file_hashes={"model.gguf": ("sha256", "a" * 64)},
+        base_repo="Qwen/Qwen2.5-0.5B-Instruct",
+        dataset={"kind": "platform", "corpus_id": "corpus-000002"},
+        comparison={
+            "protocol": "fidelity-v1", "outcome": "complete", "reference": "transformers",
+            "pairings": {scorer.KL_PAIRING: {"kl": {"mean": 0.0163, "quantiles": {"0.99": 0.11}}}},
+        },
+    )
+    fields.update(overrides)
+    return RunStatus(**fields)
+
+
+def verify_kl(**overrides) -> scorer.RunVerification:
+    return scorer.verify_kl_run(
+        make_submission(), make_spec(**KL_SPEC_FIELDS), "r1351", make_kl_status(**overrides),
+    )
+
+
+def test_kl_run_verifies_and_returns_the_multiplier():
+    result = verify_kl()
+    assert result.ok and result.benchmark == "kl"
+    assert 0.85 < result.score < 0.95
+
+
+def test_kl_rejects_a_verifier_protocol_run():
+    assert not verify_kl(comparison={"protocol": "verifier-v1", "score": 99}).ok
+
+
+def test_kl_rejects_a_benchmark_run_with_no_comparison():
+    assert not verify_kl(comparison=None).ok
+
+
+def test_kl_rejects_an_invalid_candidate():
+    comparison = dict(make_kl_status().comparison, outcome="candidate_invalid")
+    assert not verify_kl(comparison=comparison).ok
+
+
+def test_kl_rejects_a_gguf_reference_with_no_base_to_pin():
+    comparison = dict(make_kl_status().comparison, reference="gguf")
+    assert not verify_kl(comparison=comparison).ok
+
+
+def test_kl_rejects_a_run_against_the_wrong_base():
+    assert not verify_kl(base_repo="attacker/deliberately-weak").ok
+
+
+def test_kl_rejects_a_miner_uploaded_dataset():
+    assert not verify_kl(dataset={"kind": "upload", "dataset_id": "ds_1"}).ok
+
+
+def test_kl_rejects_the_wrong_platform_corpus():
+    assert not verify_kl(dataset={"kind": "platform", "corpus_id": "corpus-000099"}).ok
+
+
+def test_kl_rejects_a_comparison_of_a_different_model():
+    assert not verify_kl(repo="someone/else").ok
+    assert not verify_kl(revision="f" * 40).ok
+    assert not verify_kl(model_files=["other.gguf"]).ok
+    assert not verify_kl(file_hashes={"model.gguf": ("sha256", "f" * 64)}).ok
+
+
+def test_kl_skips_the_hash_check_for_non_sha256_algorithms():
+    # HF serves xet/git_blob hashes for non-LFS files; they are not comparable.
+    assert verify_kl(file_hashes={"model.gguf": ("xet", "zz")}).ok
+
+
+def test_kl_rejects_a_missing_p99_rather_than_reading_it_as_zero():
+    comparison = dict(
+        make_kl_status().comparison,
+        pairings={scorer.KL_PAIRING: {"kl": {"mean": 0.0163, "quantiles": {"0.9": 0.05}}}},
+    )
+    result = verify_kl(comparison=comparison)
+    assert not result.ok and result.score == 0.0
+
+
+def test_kl_rejects_the_wrong_pairing():
+    comparison = dict(
+        make_kl_status().comparison,
+        pairings={"original_to_candidate": {"kl": {"quantiles": {"0.99": 0.11}}}},
+    )
+    assert not verify_kl(comparison=comparison).ok
+
+
+def test_kl_rejects_a_run_that_is_not_finished():
+    assert not verify_kl(status=RunStatusCode.RUNNING).ok
+    assert not verify_kl(status=RunStatusCode.FAILED, failure_reason="pod died").ok
+
+
+def test_every_kl_rejection_scores_zero_and_never_bans():
+    for overrides in (
+        {"comparison": None}, {"base_repo": "x/y"}, {"repo": "x/y"},
+        {"dataset": {"kind": "upload", "dataset_id": "d"}}, {"status": RunStatusCode.RUNNING},
+    ):
+        result = verify_kl(**overrides)
+        assert not result.ok and result.score == 0.0 and result.reason
+
+
+def test_kl_run_is_skipped_when_the_competition_configures_no_corpus():
+    results = scorer.verify_candidate_runs(
+        make_submission(), make_spec(), _StubCoordinator(),
+    )
+    assert [r.benchmark for r in results] == ["mmlu"]
+
+
+def test_missing_kl_run_id_is_reported_when_a_corpus_is_configured():
+    results = scorer.verify_candidate_runs(
+        make_submission(), make_spec(**KL_SPEC_FIELDS), _StubCoordinator(),
+    )
+    kl = [r for r in results if r.benchmark == "kl"]
+    assert len(kl) == 1 and not kl[0].ok and kl[0].score == 0.0
+
+
+class _StubCoordinator:
+    def list_benchmarks(self):
+        return {"mmlu"}
+
+    def submit(self, *a, **k):
+        raise NotImplementedError
+
+    def poll(self, run_id):
+        return RunStatus(run_id=run_id, status=RunStatusCode.COMPLETED, scores={"mmlu": 0.8})

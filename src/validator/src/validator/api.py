@@ -31,7 +31,7 @@ from bittensor import http_auth, sp_core
 from loguru import logger
 
 from common.chain import current_block as get_current_block
-from common.models.competition import CompetitionSpec
+from common.models.competition import CompetitionSpec, CompetitionType
 from validator import store
 from validator import settings as validator_settings
 
@@ -143,6 +143,13 @@ def creation_errors(spec: CompetitionSpec, current_block: int) -> list[str]:
             errors.append(f"{b.name}: min_score must be between 0 and 1")
         if b.name == "fluid_knowledge" and not b.fluid_epoch_id:
             errors.append("fluid_knowledge needs a pinned fluid_epoch_id")
+    if spec.kl_corpus_id:
+        # Without a base pin the KL run can name any base, including a weak one
+        # it scores well against, and the multiplier becomes free.
+        if not spec.model_repo:
+            errors.append("kl_corpus_id needs model_repo: it is the base the KL run must compare against")
+        if spec.competition_type != CompetitionType.RAM_CEILING:
+            errors.append("kl_corpus_id only affects ram_ceiling ranking; benchmark_floor ranks on memory alone")
     return errors
 
 

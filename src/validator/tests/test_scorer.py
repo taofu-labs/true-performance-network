@@ -535,6 +535,19 @@ def test_kl_rejects_a_gguf_reference_with_no_base_to_pin():
     assert not verify_kl(comparison=comparison).ok
 
 
+def test_kl_fails_closed_when_the_spec_pins_no_base():
+    """CompetitionSpec refuses this combination now, but a row stored before
+    that rule existed must not score a free multiplier — model_construct stands
+    in for such a row, which bypasses validation exactly as loading one does."""
+    unpinned = CompetitionSpec.model_construct(
+        **{**make_spec(**KL_SPEC_FIELDS).model_dump(), "model_repo": None}
+    )
+    result = scorer.verify_kl_run(make_submission(), unpinned, "r1351", make_kl_status())
+    assert result.ok is False
+    assert result.score == 0.0
+    assert "pins no model_repo" in result.reason
+
+
 def test_kl_rejects_a_run_against_the_wrong_base():
     assert not verify_kl(base_repo="attacker/deliberately-weak").ok
 

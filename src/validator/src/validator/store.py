@@ -15,6 +15,8 @@ import time
 from pathlib import Path
 from typing import Dict, List, Optional
 
+from loguru import logger
+
 
 def tpn_home() -> Path:
     """Platform-aware base dir: ~/.tpn on POSIX, %APPDATA%/tpn on Windows."""
@@ -223,6 +225,19 @@ def _migrate_stored_competition_specs(conn: sqlite3.Connection) -> None:
         # Dropped from the spec: nothing measures locally any more.
         if spec.pop("ram_check_context_length", None) is not None:
             changed = True
+
+        # A KL check with no base pin was storable through the bearer-auth
+        # upsert, which never ran creation_errors. CompetitionSpec now refuses
+        # it, and an unloadable spec stalls the whole leader loop — so drop the
+        # corpus and let the competition score without a KL check rather than
+        # leave the validator unable to start.
+        if spec.get("kl_corpus_id") and not spec.get("model_repo"):
+            spec.pop("kl_corpus_id")
+            changed = True
+            logger.warning(
+                f"{row['id']}: dropped kl_corpus_id — it pinned no model_repo, so the KL "
+                "multiplier was unverifiable. Re-add it with a model_repo to restore the check."
+            )
 
         if changed:
             conn.execute(

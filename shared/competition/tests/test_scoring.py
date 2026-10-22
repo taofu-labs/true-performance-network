@@ -269,6 +269,8 @@ def test_compute_emission_weights_more_qualifiers_than_distribution_slots():
 def make_kl_spec(competition_type=CompetitionType.GPU_MEMORY_CEILING) -> CompetitionSpec:
     return CompetitionSpec(
         id="kl", name="kl", kl_corpus_id="corpus-000002",
+        # A KL corpus needs a base to compare against; the spec refuses one without.
+        model_repo="Qwen/Qwen2.5-0.5B-Instruct",
         start_block=0, commit_end_block=10, scoring_end_block=20,
         top_n=1, emission_distribution=[1.0],
         benchmarks=[BenchmarkTask(name="mmlu", min_score=0.0), BenchmarkTask(name="gsm8k", min_score=0.0)],

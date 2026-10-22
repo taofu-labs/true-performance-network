@@ -209,14 +209,18 @@ def verify_kl_run(
     if comparison.get("reference") != "transformers":
         return fail(f"comparison reference {comparison.get('reference')!r}, need transformers")
 
-    if spec.model_repo:
-        if not status.base_repo:
-            return fail("coordinator returned no base model identity for KL run")
-        if status.base_repo.lower() != spec.model_repo.lower():
-            return fail(
-                f"base mismatch: KL run compared against {status.base_repo}, "
-                f"competition requires {spec.model_repo}"
-            )
+    # Never optional: an unpinned base lets the miner choose what they are
+    # measured against. A spec stored before that rule reached CompetitionSpec
+    # fails here rather than scoring a free multiplier.
+    if not spec.model_repo:
+        return fail("competition sets kl_corpus_id but pins no model_repo — cannot verify the base")
+    if not status.base_repo:
+        return fail("coordinator returned no base model identity for KL run")
+    if status.base_repo.lower() != spec.model_repo.lower():
+        return fail(
+            f"base mismatch: KL run compared against {status.base_repo}, "
+            f"competition requires {spec.model_repo}"
+        )
 
     # A miner-uploaded dataset is text they chose.
     dataset = status.dataset or {}

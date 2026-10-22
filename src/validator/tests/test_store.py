@@ -192,6 +192,71 @@ def test_migration_rewrites_stored_competition_specs(tmp_path):
     assert CompetitionSpec.model_validate(migrated).max_gpu_memory_kb == 4096
 
 
+def test_migration_drops_an_unpinned_kl_corpus(tmp_path):
+    """CompetitionSpec now refuses kl_corpus_id without model_repo, and stored
+    specs are validated on every leader tick — so one such row would stall the
+    whole loop. The corpus is dropped so the competition still loads and scores
+    on its benchmarks, which is what it effectively did anyway: an unpinned base
+    made the multiplier free for everyone."""
+    import json as _json
+    import sqlite3
+
+    from common.models.competition import CompetitionSpec
+
+    path = tmp_path / "unpinned.db"
+    old_db = sqlite3.connect(path)
+    old_db.executescript("""
+        CREATE TABLE competitions (id TEXT PRIMARY KEY, spec_json TEXT NOT NULL,
+                                   created_at REAL NOT NULL, updated_at REAL NOT NULL);
+    """)
+    stored = {
+        "id": "unpinned", "name": "unpinned", "start_block": 0, "commit_end_block": 10,
+        "scoring_end_block": 20, "top_n": 1, "emission_distribution": [1.0],
+        "benchmarks": [{"name": "mmlu", "min_score": 0.5}],
+        "competition_type": "gpu_memory_ceiling", "max_gpu_memory_kb": 1000,
+        "kl_corpus_id": "corpus-000002",   # no model_repo
+    }
+    old_db.execute("INSERT INTO competitions VALUES ('unpinned', ?, 1.0, 1.0)", (_json.dumps(stored),))
+    old_db.commit()
+    old_db.close()
+
+    conn = store.init_db(path)
+    migrated = _json.loads(
+        conn.execute("SELECT spec_json FROM competitions WHERE id = 'unpinned'").fetchone()[0]
+    )
+    assert "kl_corpus_id" not in migrated
+    # The whole point: the leader can load it again instead of raising every tick.
+    assert CompetitionSpec.model_validate(migrated).kl_corpus_id is None
+
+
+def test_migration_keeps_a_properly_pinned_kl_corpus(tmp_path):
+    import json as _json
+    import sqlite3
+
+    path = tmp_path / "pinned.db"
+    old_db = sqlite3.connect(path)
+    old_db.executescript("""
+        CREATE TABLE competitions (id TEXT PRIMARY KEY, spec_json TEXT NOT NULL,
+                                   created_at REAL NOT NULL, updated_at REAL NOT NULL);
+    """)
+    stored = {
+        "id": "pinned", "name": "pinned", "start_block": 0, "commit_end_block": 10,
+        "scoring_end_block": 20, "top_n": 1, "emission_distribution": [1.0],
+        "benchmarks": [{"name": "mmlu", "min_score": 0.5}],
+        "competition_type": "gpu_memory_ceiling", "max_gpu_memory_kb": 1000,
+        "kl_corpus_id": "corpus-000002", "model_repo": "Qwen/Qwen2.5-0.5B-Instruct",
+    }
+    old_db.execute("INSERT INTO competitions VALUES ('pinned', ?, 1.0, 1.0)", (_json.dumps(stored),))
+    old_db.commit()
+    old_db.close()
+
+    conn = store.init_db(path)
+    migrated = _json.loads(
+        conn.execute("SELECT spec_json FROM competitions WHERE id = 'pinned'").fetchone()[0]
+    )
+    assert migrated["kl_corpus_id"] == "corpus-000002"
+
+
 def test_migration_drops_banned_hotkeys_and_renames_memory_column(tmp_path):
     """An existing DB carrying the pre-removal schema must come forward without
     manual surgery: banning is gone and the memory column is a measurement."""

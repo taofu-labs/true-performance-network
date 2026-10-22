@@ -2,6 +2,7 @@ import json
 import time
 
 import pytest
+from pydantic import ValidationError
 from bittensor import http_auth, sp_core
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
@@ -831,9 +832,12 @@ def test_kl_corpus_with_a_base_pin_is_accepted():
 
 
 def test_kl_corpus_without_a_base_pin_is_refused():
-    """Without model_repo the KL run names its own base, so the multiplier is free."""
-    errors = creation_errors(_kl_spec(kl_corpus_id="corpus-000002"), 500)
-    assert any("model_repo" in e for e in errors), errors
+    """Without model_repo the KL run names its own base, so the multiplier is
+    free. Refused on the model itself, which covers every write path — not just
+    the admin route that calls creation_errors. POST /v1/competitions validates
+    and stores without ever reaching creation_errors."""
+    with pytest.raises(ValidationError, match="model_repo"):
+        _kl_spec(kl_corpus_id="corpus-000002")
 
 
 def test_kl_corpus_on_benchmark_floor_is_refused():

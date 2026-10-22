@@ -136,6 +136,62 @@ def test_insert_revealed_candidates_persists_measured_memory(tmp_path):
     assert store.get_candidate(conn, "comp1", "hk1")["measured_memory_kb"] == 1234
 
 
+def test_insert_revealed_candidates_is_idempotent(tmp_path):
+    """A scoring pass that dies partway leaves rows behind and the next tick
+    re-runs the whole pass. A plain INSERT would raise on the primary key and
+    burn the competition's stage-1 attempts."""
+    conn = make_conn(tmp_path)
+    row = dict(hotkey="hk1", rank=0, submission_json="{}", reveal_block=5,
+               status="standby", verified_scores={"mmlu": 0.8}, measured_memory_kb=900)
+    store.insert_revealed_candidates(conn, "comp1", [row])
+    store.insert_revealed_candidates(
+        conn, "comp1", [{**row, "status": "done", "measured_memory_kb": 950, "rank": 1}],
+    )
+
+    candidate = store.get_candidate(conn, "comp1", "hk1")
+    assert candidate["status"] == "done"       # the re-run's values win
+    assert candidate["measured_memory_kb"] == 950
+    assert candidate["rank"] == 1
+    assert len(store.all_candidates_for_competition(conn, "comp1")) == 1
+
+
+def test_migration_rewrites_stored_competition_specs(tmp_path):
+    """Stored specs are JSON and are validated on every leader tick, so one
+    row still saying `ram_ceiling` would take down the whole loop, not just
+    its own competition."""
+    import json as _json
+    import sqlite3
+
+    from common.models.competition import CompetitionSpec
+
+    path = tmp_path / "specs.db"
+    old_db = sqlite3.connect(path)
+    old_db.executescript("""
+        CREATE TABLE competitions (id TEXT PRIMARY KEY, spec_json TEXT NOT NULL,
+                                   created_at REAL NOT NULL, updated_at REAL NOT NULL);
+    """)
+    stored = {
+        "id": "old", "name": "old", "start_block": 0, "commit_end_block": 10,
+        "scoring_end_block": 20, "top_n": 1, "emission_distribution": [1.0],
+        "benchmarks": [{"name": "mmlu", "min_score": 0.5}],
+        "competition_type": "ram_ceiling", "max_memory_kb": 4096,
+        "ram_check_context_length": 4096,
+    }
+    old_db.execute("INSERT INTO competitions VALUES ('old', ?, 1.0, 1.0)", (_json.dumps(stored),))
+    old_db.commit()
+    old_db.close()
+
+    conn = store.init_db(path)
+    spec_json = conn.execute("SELECT spec_json FROM competitions WHERE id = 'old'").fetchone()[0]
+    migrated = _json.loads(spec_json)
+    assert migrated["competition_type"] == "gpu_memory_ceiling"
+    assert migrated["max_gpu_memory_kb"] == 4096
+    assert "max_memory_kb" not in migrated
+    assert "ram_check_context_length" not in migrated
+    # The whole point: it loads again.
+    assert CompetitionSpec.model_validate(migrated).max_gpu_memory_kb == 4096
+
+
 def test_migration_drops_banned_hotkeys_and_renames_memory_column(tmp_path):
     """An existing DB carrying the pre-removal schema must come forward without
     manual surgery: banning is gone and the memory column is a measurement."""

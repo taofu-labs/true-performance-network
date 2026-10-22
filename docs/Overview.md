@@ -41,7 +41,7 @@ start_block ──OPEN──▶ commit_end_block ──REVEALING──▶ +revea
     "runs":[{"b":"mmlu","r":"r1234"}, …]}
    ```
    Nobody can read it until the chain auto-decrypts it around `commit_end_block`, so submissions cannot be copied.
-5. **Publish** the HF repo (`tpn publish`) so the benchmark service can read it. Your runs must have completed against it.
+5. **Publish** the HF repo (`tpn publish`) so the benchmark service can read it, and **leave it public**. The coordinator records whether the repo was private or gated when it read it, and a run against a non-public repo scores 0.0.
 6. **Monitor** with `tpn status`, or the leader's `GET /v1/state/competitions/{id}` (per-candidate status and failure reasons).
 
 ## Validator side: leader and followers
@@ -116,7 +116,8 @@ cancels and only quantization damage is left. Measured anchors: a Q4_K_M reaches
 That multiplier scales your benchmark composite, so fidelity and accuracy both
 count. **A missing, failed or unverifiable KL run gives `kl_norm = 0.0`**, which
 zeroes the final score — an unverifiable run must never read as perfect fidelity.
-Nothing about a failed KL check bans a hotkey.
+A candidate scoring 0 is not scored at all, so it cannot occupy a payable rank
+even when the field is thin. Nothing about a failed KL check bans a hotkey.
 
 `benchmark_floor` competitions ignore the multiplier: that mode ranks on negated
 memory, which a (0,1] factor would *improve*.
@@ -129,7 +130,8 @@ memory, which a (0,1] factor would *improve*.
 | Same sha256 as an earlier reveal | Dedup loss |
 | Run not completed, or benchmarked a different repo/revision/file | That benchmark = 0.0 |
 | Committed sha256 contradicts the hash the coordinator reports | That run = 0.0 |
-| KL run missing, failed, or measured against the wrong base or corpus | `kl_norm = 0.0` → final score 0 |
+| Repo private or gated when the run read it | That run = 0.0 |
+| KL run missing, failed, or measured against the wrong base or corpus | `kl_norm = 0.0` → **not scored**, no emission |
 | No verified run reported a memory figure | Not scored (backfilled) |
 | Below a benchmark floor / above the memory cap | Not scored (backfilled) |
 | Ranked below `top_n` | 0 weight |
@@ -138,7 +140,7 @@ memory, which a (0,1] factor would *improve*.
 
 - Commit exactly the revision and file you benchmarked; don't push to the repo after benchmarking.
 - Make sure every run has completed before the scoring phase starts, including the KL run.
-- Publish the repo so the benchmark service can read it.
+- Publish the repo before you benchmark, and leave it public — a run that read a private or gated repo scores 0.0.
 - You no longer report a memory figure — it is measured during your runs. Memory is **GPU memory at full offload**, so it is not comparable to a CPU-side RAM number you may have measured before.
 - If the competition requires a KL check, commit its run id. Without it your final score is 0, and the payload is sealed at commit so it cannot be added later.
 - Emissions only start flowing at `scoring_end_block`, not when your candidate is scored.

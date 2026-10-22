@@ -52,7 +52,8 @@ def competitions(
                 "[bold]KL check:[/bold] required",
                 f"  corpus         {spec.kl_corpus_id}",
                 "  [dim]Divergence from the base model multiplies your lowest[/dim]",
-                "  [dim]benchmark score. No run means a score of 0.[/dim]",
+                "  [dim]benchmark score. Without a verifiable run the multiplier[/dim]",
+                "  [dim]is 0, and a candidate scoring 0 earns nothing.[/dim]",
             ]
         if spec.max_gpu_memory_kb:
             lines.append(f"\n[dim]GPU memory cap:[/dim] {spec.max_gpu_memory_kb:,} KB")

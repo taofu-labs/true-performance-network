@@ -41,6 +41,8 @@ start_block ──OPEN──▶ commit_end_block ──REVEALING──▶ +revea
     "runs":[{"b":"mmlu","r":"r1234"}, …]}
    ```
    Nobody can read it until the chain auto-decrypts it around `commit_end_block`, so submissions cannot be copied.
+
+   A payload committed under spec 2 (which also carried a `max_memory` field) is still accepted, so a commit made just before a validator upgrade is not lost. Spec 1 predates run ids and is rejected.
 5. **Publish** the HF repo (`tpn publish`) so the benchmark service can read it, and **leave it public**. The coordinator records whether the repo was private or gated when it read it, and a run against a non-public repo scores 0.0.
 6. **Monitor** with `tpn status`, or the leader's `GET /v1/state/competitions/{id}` (per-candidate status and failure reasons).
 

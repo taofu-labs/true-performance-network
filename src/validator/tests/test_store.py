@@ -1,3 +1,8 @@
+import pathlib
+
+import pytest
+from pydantic import ValidationError
+
 from common.models.competition import CompetitionSpec
 from validator import store
 
@@ -190,6 +195,48 @@ def test_migration_rewrites_stored_competition_specs(tmp_path):
     assert "ram_check_context_length" not in migrated
     # The whole point: it loads again.
     assert CompetitionSpec.model_validate(migrated).max_gpu_memory_kb == 4096
+
+
+def test_migration_loads_a_real_production_spec(tmp_path):
+    """Pinned against a spec captured from the live validator
+    (val0.trueperformancenetwork.com, tpn-001). Every stored spec there is
+    `ram_ceiling` with max_memory_kb and ram_check_context_length, and none of
+    them load under the current model — so without this migration the leader
+    raises on every tick, for every competition, not just the stale one.
+
+    It also carries a `weight` key on each benchmark that BenchmarkTask does
+    not define, which must keep being ignored rather than becoming an error.
+    """
+    import json as _json
+    import sqlite3
+
+    from common.models.competition import CompetitionSpec, CompetitionType
+
+    raw = _json.loads(
+        (pathlib.Path(__file__).parent / "fixtures" / "legacy_competition_spec.json").read_text()
+    )
+    assert raw["competition_type"] == "ram_ceiling"          # the captured shape
+    with pytest.raises(ValidationError):
+        CompetitionSpec.model_validate(raw)                  # ... does not load today
+
+    path = tmp_path / "prod.db"
+    old_db = sqlite3.connect(path)
+    old_db.executescript("""
+        CREATE TABLE competitions (id TEXT PRIMARY KEY, spec_json TEXT NOT NULL,
+                                   created_at REAL NOT NULL, updated_at REAL NOT NULL);
+    """)
+    old_db.execute("INSERT INTO competitions VALUES (?, ?, 1.0, 1.0)", (raw["id"], _json.dumps(raw)))
+    old_db.commit()
+    old_db.close()
+
+    conn = store.init_db(path)
+    migrated = _json.loads(
+        conn.execute("SELECT spec_json FROM competitions WHERE id = ?", (raw["id"],)).fetchone()[0]
+    )
+    spec = CompetitionSpec.model_validate(migrated)
+    assert spec.competition_type == CompetitionType.GPU_MEMORY_CEILING
+    assert spec.max_gpu_memory_kb == raw["max_memory_kb"]    # the cap is carried over verbatim
+    assert [t.name for t in spec.benchmarks] == [b["name"] for b in raw["benchmarks"]]
 
 
 def test_migration_drops_an_unpinned_kl_corpus(tmp_path):

@@ -78,14 +78,6 @@ def commit(
     if parsed_runs is None:
         raise typer.Exit(1)
 
-    # ── Max memory — prompt if not already in config ──────────────────
-    max_memory = cfg.get("max_memory")
-    if not max_memory:
-        max_memory = typer.prompt("Max memory usage during inference (KB)", type=int)
-        while max_memory <= 0:
-            console.print("[red]max_memory must be > 0[/red]")
-            max_memory = typer.prompt("Max memory usage during inference (KB)", type=int)
-
     # ── Summary + confirmation ────────────────────────────────────────────────
     runs_display = ", ".join(f"{r.b}:{r.r}" for r in parsed_runs)
     console.print(Panel(
@@ -96,7 +88,6 @@ def commit(
         f"File:             [dim]{cfg['file']}[/dim]\n"
         f"Rev:              [dim]{cfg['huggingface_revision']}[/dim]\n"
         f"SHA256:           [dim]{cfg['file_sha256'][:24]}...[/dim]\n"
-        f"Max memory:       [dim]{max_memory:,} KB[/dim]\n"
         f"Benchmark runs:   [dim]{runs_display}[/dim]\n"
         f"Auto-reveal at:   block [cyan]{spec.commit_end_block}[/cyan]",
         title="TimeLocked Commit",
@@ -112,7 +103,6 @@ def commit(
         repository=cfg["repository"],
         file=cfg["file"],
         file_sha256=cfg["file_sha256"],
-        max_memory=max_memory,
         runs=parsed_runs,
         huggingface_revision=cfg["huggingface_revision"],
     )
@@ -125,7 +115,6 @@ def commit(
 
     # ── Persist state ─────────────────────────────────────────────────────────
     cfg["runs"] = [{"b": r.b, "r": r.r} for r in parsed_runs]
-    cfg["max_memory"] = max_memory
     cfg["commit_end_block"] = spec.commit_end_block
     save_competition_config(coldkey, hotkey_name, competition_id, cfg)
 

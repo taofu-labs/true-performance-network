@@ -1,5 +1,5 @@
 import math
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 from common.models.competition import KL_RUN_NAME, BenchmarkTask, CompetitionSpec, CompetitionType
 from common.models.submission import MinerSubmission
 
@@ -32,27 +32,30 @@ def benchmark_min(scores: Dict[str, float], tasks: List[BenchmarkTask]) -> float
 
 def final_score(
     scores: Dict[str, float],
-    max_memory_kb: int,
+    measured_memory_kb: int,
     spec: CompetitionSpec,
 ) -> float:
     """
     Score a submission per the competition's type. Higher is always better
     (rank descending), so benchmark_floor scores are negated memory.
 
-    - BENCHMARK_FLOOR: rank by lowest max_memory_kb (benchmarks are pass/fail floors).
-    - RAM_CEILING: rank by highest minimum benchmark score, discounted by the KL
-      fidelity multiplier (max_memory_kb is a pass/fail cap).
+    - BENCHMARK_FLOOR: rank by lowest measured memory (benchmarks are pass/fail floors).
+    - GPU_MEMORY_CEILING: rank by highest minimum benchmark score, discounted by
+      the KL fidelity multiplier (measured memory is a pass/fail cap).
+
+    `measured_memory_kb` is the GPU figure the coordinator reports for the run,
+    never a miner claim.
 
     The KL multiplier rides in `scores` under the reserved KL_RUN_NAME key;
     benchmark_min only iterates spec.benchmarks, so it is never read as one.
 
     ponytail: BENCHMARK_FLOOR ignores it — that branch ranks on negated memory,
     which a (0,1] factor would *improve*. Charge it as effective memory
-    (`-max_memory_kb / kl_norm`) if KL should count there too.
+    (`-measured_memory_kb / kl_norm`) if KL should count there too.
     """
-    if spec.competition_type == CompetitionType.RAM_CEILING:
+    if spec.competition_type == CompetitionType.GPU_MEMORY_CEILING:
         return benchmark_min(scores, spec.benchmarks) * scores.get(KL_RUN_NAME, 1.0)
-    return -float(max_memory_kb)
+    return -float(measured_memory_kb)
 
 
 def passes_floors(
@@ -64,35 +67,40 @@ def passes_floors(
     return len(failures) == 0, failures
 
 
-def passes_memory_cap(max_memory_kb: int, spec: CompetitionSpec) -> bool:
-    """RAM_CEILING only: max_memory_kb must not exceed spec.max_memory_kb."""
-    if spec.competition_type != CompetitionType.RAM_CEILING:
+def passes_memory_cap(measured_memory_kb: int, spec: CompetitionSpec) -> bool:
+    """GPU_MEMORY_CEILING only: measured memory must not exceed the spec's cap."""
+    if spec.competition_type != CompetitionType.GPU_MEMORY_CEILING:
         return True
-    return max_memory_kb <= spec.max_memory_kb
+    return measured_memory_kb <= spec.max_gpu_memory_kb
 
 
 def sort_by_verified_scores(
     submissions: Dict[str, MinerSubmission],
     verified_scores: Dict[str, Dict[str, float]],
     spec: CompetitionSpec,
+    measured_memory_kb: Optional[Dict[str, int]] = None,
 ) -> List[Tuple[str, MinerSubmission]]:
     """
     Sort {hotkey: submission} descending by final score computed from the
     miner's *verified* benchmark scores (lowest memory first for
-    benchmark_floor, highest minimum benchmark score for ram_ceiling). Ties
+    benchmark_floor, highest minimum benchmark score for gpu_memory_ceiling). Ties
     broken by that same minimum.
 
     `verified_scores` maps hotkey -> {benchmark_name: score}; a benchmark whose
-    run failed verification is present with 0.0. `max_memory` is still the
-    miner's self-reported value at this point — it is only measured during
-    precheck — so a benchmark_floor ranking remains claim-ordered until then.
+    run failed verification is present with 0.0.
+
+    `measured_memory_kb` maps hotkey -> the GPU figure from that candidate's
+    verified runs. A hotkey without one ranks as 0, which for BENCHMARK_FLOOR
+    is the *best* possible rank — so that branch must only be given hotkeys
+    whose memory is known.
 
     Returns a list of (hotkey, submission) tuples.
     """
+    measured = measured_memory_kb or {}
     return sorted(
         submissions.items(),
         key=lambda item: (
-            final_score(verified_scores.get(item[0], {}), item[1].max_memory, spec),
+            final_score(verified_scores.get(item[0], {}), measured.get(item[0], 0), spec),
             benchmark_min(verified_scores.get(item[0], {}), spec.benchmarks),
         ),
         reverse=True,
@@ -163,7 +171,7 @@ if __name__ == "__main__":
     ceiling = CompetitionSpec(
         id="c", name="c", start_block=0, commit_end_block=1, scoring_end_block=2,
         top_n=1, emission_distribution=[1.0], benchmarks=tasks,
-        competition_type=CompetitionType.RAM_CEILING, max_memory_kb=1000,
+        competition_type=CompetitionType.GPU_MEMORY_CEILING, max_gpu_memory_kb=1000,
     )
     floor = ceiling.model_copy(update={"competition_type": CompetitionType.BENCHMARK_FLOOR})
 
@@ -174,5 +182,10 @@ if __name__ == "__main__":
     assert final_score({"mmlu": 0.9, "gsm8k": 0.6, KL_RUN_NAME: 0.0}, 500, ceiling) == 0.0
     assert final_score(scores, 500, floor) == -500.0
     assert passes_floors(scores, tasks) == (True, [])
+
+    # The cap is enforced against the coordinator's measured figure only.
+    assert passes_memory_cap(1000, ceiling) is True
+    assert passes_memory_cap(1001, ceiling) is False
+    assert passes_memory_cap(10 ** 9, floor) is True
 
     print("scoring self-check OK")

@@ -114,8 +114,8 @@ def make_ram_ceiling_spec(**overrides) -> CompetitionSpec:
         emission_distribution=[1.0],
         top_n=1,
         emission_weight=1.0,
-        competition_type=CompetitionType.RAM_CEILING,
-        max_memory_kb=1000,
+        competition_type=CompetitionType.GPU_MEMORY_CEILING,
+        max_gpu_memory_kb=1000,
         benchmarks=[
             BenchmarkTask(name="mmlu", min_score=0.5),
             BenchmarkTask(name="gsm8k", min_score=0.3),
@@ -181,35 +181,46 @@ def test_passes_memory_cap_only_enforced_for_ram_ceiling():
     assert passes_memory_cap(1001, ceiling) is False
 
 
-def make_submission(max_memory: int) -> MinerSubmission:
+def make_submission() -> MinerSubmission:
     return MinerSubmission(
         competition_id="rf",
         runs=[BenchmarkRun(b="mmlu", r="r1"), BenchmarkRun(b="gsm8k", r="r2")],
         repository="user/repo",
         file="model.gguf",
         file_sha256="a" * 64,
-        max_memory=max_memory,
         huggingface_revision="a" * 40,
     )
 
 
 def test_sort_by_verified_scores_benchmark_floor_lowest_memory_first():
-    """max_memory is still the miner's claim at ranking time — it is only
-    measured during precheck — so a benchmark_floor ranking stays
-    claim-ordered, with the verified scores acting as the floor filter."""
+    """benchmark_floor ranks on the memory the coordinator measured, which the
+    caller passes in alongside the verified scores — a miner cannot win this
+    ranking by claiming a small number."""
     spec = make_benchmark_floor_spec()
-    submissions = {"hk_big": make_submission(2000), "hk_small": make_submission(1000)}
+    submissions = {"hk_big": make_submission(), "hk_small": make_submission()}
     verified = {
         "hk_big": {"mmlu": 0.9, "gsm8k": 0.9},
         "hk_small": {"mmlu": 0.5, "gsm8k": 0.5},
     }
-    ranked = sort_by_verified_scores(submissions, verified, spec)
+    measured = {"hk_big": 2000, "hk_small": 1000}
+    ranked = sort_by_verified_scores(submissions, verified, spec, measured)
     assert [hk for hk, _ in ranked] == ["hk_small", "hk_big"]
+
+
+def test_sort_by_verified_scores_without_measured_memory_ranks_as_zero():
+    """A hotkey with no measured figure ranks as 0 KB, which for benchmark_floor
+    is the best possible slot — so the caller must only rank candidates whose
+    memory is known. Pinned here so the hazard is not discovered in production."""
+    spec = make_benchmark_floor_spec()
+    submissions = {"hk_known": make_submission(), "hk_unknown": make_submission()}
+    verified = {"hk_known": {"mmlu": 0.9, "gsm8k": 0.9}, "hk_unknown": {"mmlu": 0.9, "gsm8k": 0.9}}
+    ranked = sort_by_verified_scores(submissions, verified, spec, {"hk_known": 1000})
+    assert [hk for hk, _ in ranked] == ["hk_unknown", "hk_known"]
 
 
 def test_sort_by_verified_scores_ram_ceiling_highest_min_first():
     spec = make_ram_ceiling_spec()
-    submissions = {"hk_low": make_submission(500), "hk_high": make_submission(500)}
+    submissions = {"hk_low": make_submission(), "hk_high": make_submission()}
     verified = {
         "hk_low": {"mmlu": 0.4, "gsm8k": 0.4},
         "hk_high": {"mmlu": 0.9, "gsm8k": 0.9},
@@ -223,7 +234,7 @@ def test_sort_by_verified_scores_candidate_with_no_verified_scores_ranks_last():
     """Every run rejected -> all zeros -> bottom of the ranking, but still
     present so the floors can reject it with a record."""
     spec = make_ram_ceiling_spec()
-    submissions = {"hk_ok": make_submission(500), "hk_rejected": make_submission(500)}
+    submissions = {"hk_ok": make_submission(), "hk_rejected": make_submission()}
     verified = {"hk_ok": {"mmlu": 0.7, "gsm8k": 0.7}, "hk_rejected": {"mmlu": 0.0, "gsm8k": 0.0}}
     ranked = sort_by_verified_scores(submissions, verified, spec)
     assert [hk for hk, _ in ranked] == ["hk_ok", "hk_rejected"]
@@ -235,7 +246,7 @@ def make_result(hotkey: str, final: float) -> ScoringResult:
         hotkey=hotkey,
         competition_id="rf",
         final_score=final,
-        max_memory_kb=1000,
+        measured_memory_kb=1000,
     )
 
 
@@ -255,14 +266,14 @@ def test_compute_emission_weights_more_qualifiers_than_distribution_slots():
 # KL anchors are measured P99 on control_to_candidate (nats): Q4_K_M 0.1455,
 # Q2_K 1.30.
 
-def make_kl_spec(competition_type=CompetitionType.RAM_CEILING) -> CompetitionSpec:
+def make_kl_spec(competition_type=CompetitionType.GPU_MEMORY_CEILING) -> CompetitionSpec:
     return CompetitionSpec(
         id="kl", name="kl", kl_corpus_id="corpus-000002",
         start_block=0, commit_end_block=10, scoring_end_block=20,
         top_n=1, emission_distribution=[1.0],
         benchmarks=[BenchmarkTask(name="mmlu", min_score=0.0), BenchmarkTask(name="gsm8k", min_score=0.0)],
         competition_type=competition_type,
-        max_memory_kb=1000 if competition_type == CompetitionType.RAM_CEILING else None,
+        max_gpu_memory_kb=1000 if competition_type == CompetitionType.GPU_MEMORY_CEILING else None,
     )
 
 

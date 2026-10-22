@@ -108,7 +108,7 @@ async def test_follower_scoring_results_empty_for_unknown_competition(conn):
 async def test_follower_scoring_results_hidden_until_finalized(conn):
     """A competition mid-stage2_scoring must not leak partial results to
     followers — only stage == 'finalized' exposes anything here."""
-    store.record_scoring_result(conn, "comp1", "hk1", final_score=0.7, max_memory_kb=1000)
+    store.record_scoring_result(conn, "comp1", "hk1", final_score=0.7, measured_memory_kb=1000)
     conn.commit()
     store.set_stage(conn, "comp1", "stage2_scoring")
 
@@ -122,7 +122,7 @@ async def test_follower_scoring_results_hidden_until_finalized(conn):
         resp = await client.get("/v1/follower/scoring-results", params={"competition_id": "comp1"})
         body = await resp.json()
         assert body["results"] == [{"competition_id": "comp1", "hotkey": "hk1", "final_score": 0.7,
-                                     "max_memory_kb": 1000, "finalized_at": body["results"][0]["finalized_at"]}]
+                                     "measured_memory_kb": 1000, "finalized_at": body["results"][0]["finalized_at"]}]
 
 
 @pytest.mark.asyncio
@@ -316,7 +316,7 @@ async def test_delete_competition_refuses_when_scoring_state_exists(conn, monkey
             "/v1/competitions", json=make_spec_json(),
             headers={"Authorization": "Bearer secret-key"},
         )
-        store.record_scoring_result(conn, "comp1", "hk1", final_score=0.9, max_memory_kb=100)
+        store.record_scoring_result(conn, "comp1", "hk1", final_score=0.9, measured_memory_kb=100)
         conn.commit()
 
         resp = await client.delete(
@@ -334,7 +334,7 @@ async def test_delete_competition_force_overrides_state_guard(conn, monkeypatch)
             "/v1/competitions", json=make_spec_json(),
             headers={"Authorization": "Bearer secret-key"},
         )
-        store.record_scoring_result(conn, "comp1", "hk1", final_score=0.9, max_memory_kb=100)
+        store.record_scoring_result(conn, "comp1", "hk1", final_score=0.9, measured_memory_kb=100)
         conn.commit()
 
         resp = await client.delete(
@@ -394,7 +394,7 @@ async def test_reset_scoring_recovers_infra_failure(conn, monkeypatch):
             conn, "comp1", "hk1", "mmlu", run_id="r100", repository="user/repo",
             revision="rev", status="completed", score=0.5,
         )
-        store.record_scoring_result(conn, "comp1", "hk1", final_score=0.5, max_memory_kb=10)
+        store.record_scoring_result(conn, "comp1", "hk1", final_score=0.5, measured_memory_kb=10)
         conn.commit()
         store.mark_scored(conn, "comp1", status="failed_stage1_infra")
         assert store.is_scored(conn, "comp1") is True
@@ -417,11 +417,10 @@ async def test_reset_scoring_recovers_infra_failure(conn, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_reset_scoring_preserves_bans_and_weights_history(conn, monkeypatch):
+async def test_reset_scoring_preserves_weights_history(conn, monkeypatch):
     monkeypatch.setattr(validator_settings, "ADMIN_API_KEY", "secret-key")
     async with TestClient(TestServer(make_app(conn))) as client:
         await _seed_open_competition(client)
-        store.ban(conn, "cheater", "sha256 mismatch")
         store.record_weights(conn, "comp1", {"hk1": 1.0})
         store.mark_scored(conn, "comp1", status="failed_stage1_infra")
 
@@ -430,7 +429,6 @@ async def test_reset_scoring_preserves_bans_and_weights_history(conn, monkeypatc
         )
         assert resp.status == 200
 
-        assert store.is_banned(conn, "cheater") is True
         assert len(store.weights_history_for_competition(conn, "comp1")) == 1
 
 
@@ -796,7 +794,7 @@ async def test_signed_create_rejects_replay(conn, admin_signers):
     {"top_n": 2, "emission_distribution": [1.5, -0.5]},
     {"emission_distribution": [float("nan")]},
     {"reveal_grace_blocks": -500},
-    {"competition_type": "ram_ceiling", "max_memory_kb": -1},
+    {"competition_type": "gpu_memory_ceiling", "max_gpu_memory_kb": -1},
 ])
 async def test_signed_create_rejects_bad_specs(conn, admin_signers, overrides):
     spec = {**future_spec(), **overrides}
@@ -817,7 +815,7 @@ def _kl_spec(**overrides) -> CompetitionSpec:
         id="kl1", name="kl1", start_block=1000, commit_end_block=2000, scoring_end_block=3000,
         top_n=1, emission_distribution=[1.0],
         benchmarks=[BenchmarkTask(name="mmlu", min_score=0.5)],
-        competition_type=CompetitionType.RAM_CEILING, max_memory_kb=4194304,
+        competition_type=CompetitionType.GPU_MEMORY_CEILING, max_gpu_memory_kb=4194304,
     )
     fields.update(overrides)
     return CompetitionSpec(**fields)
@@ -842,7 +840,7 @@ def test_kl_corpus_on_benchmark_floor_is_refused():
     """benchmark_floor ranks on negated memory and never reads benchmark_min."""
     spec = _kl_spec(
         kl_corpus_id="corpus-000002", model_repo="a/b",
-        competition_type=CompetitionType.BENCHMARK_FLOOR, max_memory_kb=None,
+        competition_type=CompetitionType.BENCHMARK_FLOOR, max_gpu_memory_kb=None,
     )
     errors = creation_errors(spec, 500)
     assert any("benchmark_floor" in e for e in errors), errors

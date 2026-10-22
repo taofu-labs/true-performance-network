@@ -18,33 +18,26 @@ no Docker. Bittensor is faked at the `common.chain` seam (`get_subtensor`,
 shipped `MockCoordinator` (`competition.benchmark_client`) instead of a real
 HTTP call.
 
-Integration tests are excluded by default via `addopts = "-m 'not integration'"`,
-so `pytest` runs only the fast suite. Opt in with `-m integration`.
+`addopts = "-m 'not integration'"` excludes tests tagged `integration`.
+Nothing carries that marker today — removing the precheck container left the
+whole suite runnable in-process — so `pytest` runs everything.
 
-## End-to-end competition flow (manual)
+## End-to-end competition flow
 
 `src/validator/tests/test_e2e_flow.py` drives a whole competition — reveal,
-run-id verification, ranking, precheck, weights — with the benchmark
-coordinator mocked but a **real precheck Docker container**. It downloads a
-real GGUF from HuggingFace and measures its RAM with an actual `llama-cli`
-run, which is the half the unit suite stubs out.
+run-id verification, ranking, scoring, weights — with only the benchmark
+coordinator mocked. The validator downloads nothing and runs no inference, so
+this needs no Docker, no network and no GPU, and runs in the default suite.
 
 ```bash
-# One-off: build the precheck image (add --platform linux/arm64 on Apple silicon)
-docker build -t tpn-precheck:test -f shared/validation/precheck.Dockerfile shared/validation
-
-uv run python -m pytest src/validator/tests/test_e2e_flow.py -m integration -v -s
+uv run python -m pytest src/validator/tests/test_e2e_flow.py -v
 ```
-
-Needs Docker and network access; ~70s and a ~400MB model download on first
-run (HuggingFace caches it inside the container, which is recreated per test).
-Set `PRECHECK_IMAGE` to use a different tag. Tests skip themselves if Docker
-or the image is unavailable.
 
 Covered: a verified run scoring and winning; an unverified run (benchmarked a
 different repo) scoring 0.0 and losing to an honest lower-scoring miner; a
-sha256 mismatch banning the hotkey; and a real RAM measurement above the
-competition cap rejecting the candidate.
+sha256 that contradicts the coordinator's hash scoring 0 without banning; a
+measured memory figure above the competition cap rejecting the candidate; and
+a run reporting no memory figure at all not being scored.
 
 ## Real chain integration (manual)
 
@@ -56,7 +49,7 @@ run it manually when you need to validate real chain interaction, not as
 part of routine test runs.
 
 `pyproject.toml` registers an `integration` pytest marker ("exercises real
-external deps (docker/localnet); run manually, not part of default suite")
+external deps (localnet); run manually, not part of default suite")
 for tests that need this kind of real dependency — use it to tag any test
 that shouldn't run in the fast unit suite.
 
@@ -111,13 +104,13 @@ logs the reason at DEBUG:
 
     reveal_block=1017 outside window for commit_end_block=1133
 
-## Precheck/validation Docker service
+## Coordinator payload shapes
 
-`shared/validation/precheck_api.py`'s pure logic (log-parsing regexes,
-sha256, the `/check-local` path-traversal guard) is unit-tested directly in
-`shared/validation/tests/`. Full end-to-end testing of the service — `docker
-build` + `docker run`, a real GGUF download, an actual `llama-cli` invocation
-— is deliberately not automated here: it needs no GPU, but a real run can
-involve multi-GB model downloads and (if `BASE_MODEL_REPO` is set) up to a
-2-hour base-model download before the container reports ready. Treat this as
-a manual or future nightly-job concern, not something to run on every push.
+The validator reads benchmark scores, the KL divergence and the measured GPU
+memory out of coordinator `/status` bodies, so the parser is pinned against a
+real captured payload in `src/validator/tests/fixtures/comparison_status.json`
+rather than a hand-written shape. That capture predates the server's `vram`
+block, so the memory parsing is covered by a clearly-labelled synthetic case
+(`test_parses_the_vram_block_a_comparison_reports`) built from the server's
+own projection code. Re-capture the fixture from a current run when
+convenient, and the synthetic case can go.

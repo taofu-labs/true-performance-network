@@ -54,8 +54,10 @@ def competitions(
                 "  [dim]Divergence from the base model multiplies your lowest[/dim]",
                 "  [dim]benchmark score. No run means a score of 0.[/dim]",
             ]
-        if spec.max_memory_kb:
-            lines.append(f"\n[dim]Max memory:[/dim]     {spec.max_memory_kb:,} KB")
+        if spec.max_gpu_memory_kb:
+            lines.append(f"\n[dim]GPU memory cap:[/dim] {spec.max_gpu_memory_kb:,} KB")
+            lines.append("  [dim]Measured by the benchmark service while loading your[/dim]")
+            lines.append("  [dim]model. Over the cap means no score.[/dim]")
 
         lines += [
             "",

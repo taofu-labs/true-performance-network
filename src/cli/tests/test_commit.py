@@ -83,7 +83,6 @@ def test_commit_dry_run_does_not_write_to_chain(monkeypatch, tmp_path):
         "file_sha256": "a" * 64,
         "huggingface_revision": "a" * 40,
         "runs": [{"b": "mmlu", "r": "r1234"}],
-        "max_memory": 1000,
     }))
 
     result = runner.invoke(app, [
@@ -121,7 +120,6 @@ def test_commit_accepts_runs_flag(monkeypatch, tmp_path):
         "file": "model.gguf",
         "file_sha256": "a" * 64,
         "huggingface_revision": "a" * 40,
-        "max_memory": 1000,
     }))
 
     result = runner.invoke(app, [
@@ -146,7 +144,6 @@ def test_commit_rejects_malformed_run_id_before_writing_to_chain(monkeypatch, tm
         "file": "model.gguf",
         "file_sha256": "a" * 64,
         "huggingface_revision": "a" * 40,
-        "max_memory": 1000,
     }))
 
     result = runner.invoke(app, [
@@ -168,7 +165,7 @@ def test_commit_saves_runs_to_config(monkeypatch, tmp_path):
     import cli.utils.config as cfg_mod
     cfg_mod.save_competition_config("alice", "default", "comp-a", {
         "repository": "user/repo", "file": "model.gguf", "file_sha256": "a" * 64,
-        "huggingface_revision": "a" * 40, "max_memory": 1000,
+        "huggingface_revision": "a" * 40,
     })
 
     result = runner.invoke(app, [

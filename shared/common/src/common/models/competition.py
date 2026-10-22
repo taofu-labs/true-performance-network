@@ -88,6 +88,22 @@ class CompetitionSpec(BaseModel):
         return self
 
     @model_validator(mode="after")
+    def validate_kl_corpus_has_a_base(self):
+        """A KL run is only meaningful against a pinned base: without one the
+        miner names the base themselves, and can pick a weak model their quant
+        barely diverges from, which makes the multiplier free.
+
+        Enforced on the model rather than in creation_errors because
+        POST /v1/competitions validates the spec and stores it without ever
+        calling creation_errors.
+        """
+        if self.kl_corpus_id and not self.model_repo:
+            raise ValueError(
+                "kl_corpus_id requires model_repo: it is the base the KL run compares against"
+            )
+        return self
+
+    @model_validator(mode="after")
     def validate_max_gpu_memory_kb(self):
         if self.competition_type == CompetitionType.GPU_MEMORY_CEILING and not self.max_gpu_memory_kb:
             raise ValueError("max_gpu_memory_kb is required when competition_type is gpu_memory_ceiling")

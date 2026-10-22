@@ -388,10 +388,29 @@ def test_no_kl_check_when_the_competition_has_no_corpus(monkeypatch, tmp_path):
 
 
 def test_refuses_a_kl_competition_that_pins_no_base(monkeypatch, tmp_path):
+    """CompetitionSpec now refuses kl_corpus_id without model_repo, so such a
+    competition never parses and the CLI cannot resolve it at all. The miner
+    gets a clear "not found" rather than paying for an unverifiable KL run.
+
+    The guard inside `benchmark` stays as defence in depth — it is what catches
+    a spec that reaches the CLI some other way.
+    """
     stub_leader(monkeypatch, kl_corpus_id="corpus-000002")
     write_upload_config(monkeypatch, tmp_path)
     install_client(monkeypatch, FakeBillingClient())
 
     result = invoke("--api-key", "bapi_x", "--yes")
     assert result.exit_code == 1
-    assert "pins no base model" in result.stdout
+    assert "comp-a" in result.stdout
+
+
+def test_runs_a_kl_competition_that_pins_a_base(monkeypatch, tmp_path):
+    """The same competition, correctly configured, reaches the KL run."""
+    stub_leader(monkeypatch, kl_corpus_id="corpus-000002", model_repo="Qwen/Qwen2.5-0.5B-Instruct")
+    write_upload_config(monkeypatch, tmp_path)
+    client = FakeBillingClient()
+    install_client(monkeypatch, client)
+
+    result = invoke("--api-key", "bapi_x", "--yes")
+    assert result.exit_code == 0, result.stdout
+    assert "kl" in result.stdout

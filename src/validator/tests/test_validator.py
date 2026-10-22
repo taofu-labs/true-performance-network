@@ -523,6 +523,55 @@ async def test_stage_1_stops_scoring_at_top_n(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_stage_1_can_run_twice_without_stranding_the_competition(monkeypatch):
+    """Scoring no longer advances a stage marker, so a tick that dies partway
+    is re-run from the chain on the next one. The second pass must not trip
+    over the rows the first one wrote."""
+    metagraph = FakeMetagraph(hotkeys=["hk1"], uids=[0], stake=[1.0], weights=[[1.0]], validator_permit=[True])
+    v = make_validator(monkeypatch, metagraph=metagraph)
+    _stage1_env(monkeypatch, {"hk1": (make_submission(), 5)})
+
+    await v.run_stage_1(make_spec(top_n=1))
+    assert store.get_candidate(v._db, "comp1", "hk1")["status"] == "done"
+
+    # Simulate a crash between persisting candidates and finalizing: the
+    # candidate rows survive, the scored marker does not.
+    v._db.execute("DELETE FROM scored_competitions WHERE competition_id = 'comp1'")
+    v._db.commit()
+    assert store.is_scored(v._db, "comp1") is False
+
+    await v.run_stage_1(make_spec(top_n=1))
+
+    assert store.get_candidate(v._db, "comp1", "hk1")["status"] == "done"
+    assert store.scored_status(v._db, "comp1") == "scored"
+    assert store.latest_weights_for_competition(v._db, "comp1") == {"hk1": 1.0}
+
+
+@pytest.mark.asyncio
+async def test_stage_1_scores_a_reveal_committed_under_the_previous_spec(monkeypatch):
+    """A reveal is sealed on chain before the validator upgrades. Spec 2 only
+    carried an extra `max_memory`, so it must still score."""
+    import json as _json
+
+    from common.models.submission import parse_reveal_payload
+
+    metagraph = FakeMetagraph(hotkeys=["hk1"], uids=[0], stake=[1.0], weights=[[1.0]], validator_permit=[True])
+    v = make_validator(monkeypatch, metagraph=metagraph)
+
+    payload = _json.loads(make_submission().model_dump_json())
+    payload["spec"] = 2
+    payload["max_memory"] = 1000          # the field spec 3 dropped
+    old_submission = parse_reveal_payload(_json.dumps(payload))
+    assert old_submission is not None, "a spec-2 reveal must still parse"
+
+    _stage1_env(monkeypatch, {"hk1": (old_submission, 5)})
+    await v.run_stage_1(make_spec(top_n=1))
+
+    assert store.get_candidate(v._db, "comp1", "hk1")["status"] == "done"
+    assert store.latest_weights_for_competition(v._db, "comp1") == {"hk1": 1.0}
+
+
+@pytest.mark.asyncio
 async def test_stage_1_terminal_when_no_candidate_can_be_scored(monkeypatch):
     metagraph = FakeMetagraph(hotkeys=["hk1"], uids=[0], stake=[1.0], weights=[[1.0]], validator_permit=[True])
     v = make_validator(monkeypatch, metagraph=metagraph)

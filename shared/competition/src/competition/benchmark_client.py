@@ -138,6 +138,12 @@ class RunStatus:
     # runtime reported a usable block.
     measured_memory_bytes: Optional[int] = None
 
+    # Repo visibility as the coordinator saw it. A winning model has to be
+    # downloadable by anyone, and the run itself is the only evidence the
+    # validator has, since it never contacts the Hub.
+    repo_private: bool = False
+    repo_gated: bool = False
+
 
 # ---------------------------------------------------------------------------
 # Protocol
@@ -442,6 +448,8 @@ def _extract_model_identity(data: dict) -> dict:
         dataset=model_source.get("dataset"),
         base_repo=((model_source.get("base") or {}).get("model") or {}).get("repo"),
         measured_memory_bytes=_measured_memory_bytes(data),
+        repo_private=bool(model.get("private")),
+        repo_gated=bool(model.get("gated")),
     )
 
 

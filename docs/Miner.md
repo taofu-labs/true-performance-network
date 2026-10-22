@@ -123,9 +123,14 @@ A Q4_K_M typically lands around 0.146 nats at P99 → ×0.865. A Q2_K around
 the base is priced down, and accuracy alone is not enough.
 
 **A missing or unverifiable KL run means a multiplier of 0.0, which zeroes your
-final score.** `tpn benchmark` includes it by default and `tpn commit` refuses a
-payload without it, because the commit payload is sealed — a missing run cannot
-be added after the fact.
+final score** — and a zero-scoring candidate is not scored at all, so it earns
+nothing even if nobody else entered. `tpn benchmark` includes the KL run by
+default and `tpn commit` refuses a payload without it, because the commit
+payload is sealed — a missing run cannot be added after the fact.
+
+Keep your HuggingFace repo **public** from the moment you benchmark. The
+coordinator records whether the repo was private or gated when it read it, and
+the validator fails any run that read a non-public repo.
 
 #### Memory
 

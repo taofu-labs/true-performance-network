@@ -189,7 +189,46 @@ def _migrate_schema(conn: sqlite3.Connection) -> None:
     if "max_memory_kb" in scoring_columns and "measured_memory_kb" not in scoring_columns:
         conn.execute("ALTER TABLE scoring_results RENAME COLUMN max_memory_kb TO measured_memory_kb")
 
+    _migrate_stored_competition_specs(conn)
+
     conn.commit()
+
+
+def _migrate_stored_competition_specs(conn: sqlite3.Connection) -> None:
+    """
+    Rewrite stored spec_json for the memory rename.
+
+    Specs are stored as JSON and validated on every leader tick, so a single
+    row still saying `ram_ceiling` fails CompetitionSpec and takes the whole
+    loop down with it — not just its own competition.
+    """
+    renames = {"ram_ceiling": "gpu_memory_ceiling"}
+    for row in conn.execute("SELECT id, spec_json FROM competitions").fetchall():
+        try:
+            spec = json.loads(row["spec_json"])
+        except (ValueError, TypeError):
+            continue
+        if not isinstance(spec, dict):
+            continue
+
+        changed = False
+        if spec.get("competition_type") in renames:
+            spec["competition_type"] = renames[spec["competition_type"]]
+            changed = True
+        if "max_memory_kb" in spec:
+            # Keep whichever value is already under the new name.
+            spec.setdefault("max_gpu_memory_kb", spec.pop("max_memory_kb"))
+            spec.pop("max_memory_kb", None)
+            changed = True
+        # Dropped from the spec: nothing measures locally any more.
+        if spec.pop("ram_check_context_length", None) is not None:
+            changed = True
+
+        if changed:
+            conn.execute(
+                "UPDATE competitions SET spec_json = ?, updated_at = ? WHERE id = ?",
+                (json.dumps(spec), time.time(), row["id"]),
+            )
 
 
 STAGE1_MAX_ATTEMPTS = 3
@@ -327,11 +366,24 @@ def insert_revealed_candidates(
 ) -> None:
     now = time.time()
     with conn:
+        # Upsert: a scoring pass that dies partway leaves rows behind, and the
+        # next tick re-runs the whole pass from the chain. A plain INSERT would
+        # hit the primary key and burn stage-1 attempts until the competition
+        # was written off as an infra failure.
         conn.executemany(
             """INSERT INTO revealed_candidates
                (competition_id, hotkey, rank, submission_json, reveal_block, status,
                 failure_reason, verified_scores_json, measured_memory_kb, updated_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(competition_id, hotkey) DO UPDATE SET
+                 rank = excluded.rank,
+                 submission_json = excluded.submission_json,
+                 reveal_block = excluded.reveal_block,
+                 status = excluded.status,
+                 failure_reason = excluded.failure_reason,
+                 verified_scores_json = excluded.verified_scores_json,
+                 measured_memory_kb = excluded.measured_memory_kb,
+                 updated_at = excluded.updated_at""",
             [
                 (competition_id, c["hotkey"], c["rank"], c["submission_json"],
                  c["reveal_block"], c["status"], c.get("failure_reason"),

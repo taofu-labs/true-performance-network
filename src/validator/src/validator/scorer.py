@@ -14,7 +14,7 @@ from typing import Dict, List, Optional
 
 from loguru import logger
 
-from common.models.competition import KL_RUN_NAME, CompetitionSpec
+from common.models.competition import KL_RUN_NAME, CompetitionSpec, CompetitionType
 from common.models.submission import MinerSubmission
 from competition.benchmark_client import Coordinator, RunStatus, RunStatusCode
 from competition.scoring import final_score, kl_norm, passes_floors, passes_memory_cap
@@ -120,6 +120,13 @@ def verify_run(
     algorithm, value = status.file_hashes.get(submission.file, (None, None))
     if algorithm == "sha256" and value and value.lower() != submission.file_sha256:
         return fail(f"file hash mismatch: run has {value[:12]}, submission commits {submission.file_sha256[:12]}")
+
+    # A winner's model has to be downloadable by anyone. The validator never
+    # contacts the Hub, so the run's own view of the repo is the evidence —
+    # a miner who publishes only long enough to benchmark is caught here.
+    if status.repo_private or status.repo_gated:
+        state = "private" if status.repo_private else "gated"
+        return fail(f"repo was {state} when the run read it — publish it before scoring")
 
     if benchmark_name not in status.benchmarks:
         covered = ", ".join(status.benchmarks) or "none"
@@ -239,6 +246,10 @@ def verify_kl_run(
     algorithm, value = status.file_hashes.get(submission.file, (None, None))
     if algorithm == "sha256" and value and value.lower() != submission.file_sha256:
         return fail(f"file hash mismatch: KL run has {value[:12]}, submission commits {submission.file_sha256[:12]}")
+
+    if status.repo_private or status.repo_gated:
+        state = "private" if status.repo_private else "gated"
+        return fail(f"repo was {state} when the KL run read it — publish it before scoring")
 
     pairing = (comparison.get("pairings") or {}).get(KL_PAIRING)
     if not isinstance(pairing, dict):
@@ -434,6 +445,20 @@ def finalize_candidate(
         return False
 
     score = final_score(scores, memory_kb, spec)
+
+    # A zeroed score means something required was missing or unverifiable — most
+    # often the KL run, whose multiplier is 0.0 when it cannot be verified. Such
+    # a candidate must not occupy a payable rank: emission shares go by position,
+    # so in a thin field a zero would still draw a share.
+    #
+    # Only the multiplicative branch can reach 0 this way; BENCHMARK_FLOOR scores
+    # negated memory, where 0 is unreachable (memory_kb > 0 is checked above).
+    if spec.competition_type == CompetitionType.GPU_MEMORY_CEILING and score <= 0.0:
+        reason = f"scored 0 — nothing payable (scores={scores})"
+        logger.info(f"{hotkey[:12]} {reason}")
+        store.set_candidate_status(conn, competition_id, hotkey, "failed", reason)
+        return False
+
     logger.info(f"{hotkey[:12]} SCORED final={score:.6f} scores={scores} memory={memory_kb:,}KB")
     store.finalize_candidate(conn, competition_id, hotkey, score, memory_kb)
     return True

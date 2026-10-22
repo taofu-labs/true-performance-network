@@ -387,6 +387,60 @@ def test_finalize_benchmark_floor_ranks_by_measured_memory():
     assert result["measured_memory_kb"] == 900
 
 
+def test_finalize_refuses_to_pay_a_zero_scoring_candidate():
+    """Emission shares go by rank position, so a candidate scoring 0 — most
+    often one whose KL run could not be verified — must not occupy a payable
+    slot. In a thin field it would otherwise draw a share."""
+    conn = make_db()
+    _insert_standby(conn)
+    spec = make_spec(competition_type="gpu_memory_ceiling", max_gpu_memory_kb=10_000,
+                     **KL_SPEC_FIELDS)
+
+    scored = scorer.finalize_candidate(
+        conn, "comp1", "hk1", spec, verification({"mmlu": 0.8, "kl": 0.0}),
+    )
+    assert scored is False
+    candidate = store.get_candidate(conn, "comp1", "hk1")
+    assert candidate["status"] == "failed"
+    assert "nothing payable" in candidate["failure_reason"]
+    assert store.scoring_results_for_competition(conn, "comp1") == []
+
+
+def test_finalize_still_pays_benchmark_floor_at_zero_benchmarks():
+    """BENCHMARK_FLOOR scores negated memory, so its score is never 0 and the
+    zero guard must not touch it — the floors already rejected weak models."""
+    conn = make_db()
+    _insert_standby(conn)
+
+    assert scorer.finalize_candidate(
+        conn, "comp1", "hk1", make_spec(), verification({"mmlu": 0.8}),
+    ) is True
+    assert store.scoring_results_for_competition(conn, "comp1")[0]["final_score"] == -900.0
+
+
+def test_verify_run_rejects_a_private_repo():
+    """A winner's model must be downloadable. The validator never contacts the
+    Hub, so the run's own view of the repo is the only evidence."""
+    result = scorer.verify_run(
+        make_submission(), "mmlu", "r100", make_status(repo_private=True),
+    )
+    assert result.ok is False
+    assert "private" in result.reason
+
+
+def test_verify_run_rejects_a_gated_repo():
+    result = scorer.verify_run(
+        make_submission(), "mmlu", "r100", make_status(repo_gated=True),
+    )
+    assert result.ok is False
+    assert "gated" in result.reason
+
+
+def test_kl_run_rejects_a_private_repo():
+    assert verify_kl(repo_private=True).ok is False
+    assert "private" in verify_kl(repo_private=True).reason
+
+
 def test_finalize_fails_candidate_whose_memory_is_unknown():
     """Scoring 0 KB would pass every cap and, under BENCHMARK_FLOOR, win
     outright. A candidate with no measurement is failed instead."""

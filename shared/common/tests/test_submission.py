@@ -77,12 +77,30 @@ def test_round_trips_through_parse():
     assert submission.run_ids == {"mmlu": "r1234"}
 
 
-@pytest.mark.parametrize("old_spec", [1, 2])
-def test_rejects_superseded_spec_payload(old_spec):
-    """An old-build miner committing against a new-build validator must fail
-    loudly at reveal, not silently score zero on an unrecognised field."""
-    payload = make_payload().replace('"spec":3', f'"spec":{old_spec}')
-    assert parse_reveal_payload(payload) is None
+def test_rejects_superseded_spec_payload():
+    """A spec-1 payload predates run ids entirely and cannot be scored."""
+    assert parse_reveal_payload(make_payload().replace('"spec":3', '"spec":1')) is None
+
+
+def test_accepts_a_spec_2_payload_committed_before_the_upgrade():
+    """Spec 2 differs only by the `max_memory` self-report, which is now an
+    ignored extra field. A reveal is sealed on chain before the validator
+    upgrades, so rejecting it would strand miners who did nothing wrong."""
+    payload = make_payload().replace('"spec":3', '"spec":2')
+    submission = parse_reveal_payload(payload)
+    assert submission is not None
+    assert submission.run_ids == {"mmlu": "r1234"}
+
+
+def test_accepts_a_spec_2_payload_still_carrying_max_memory():
+    import json as _json
+
+    data = _json.loads(make_payload())
+    data["spec"] = 2
+    data["max_memory"] = 1000
+    submission = parse_reveal_payload(_json.dumps(data))
+    assert submission is not None
+    assert not hasattr(submission, "max_memory")
 
 
 def test_rejects_payload_carrying_claims_instead_of_runs():

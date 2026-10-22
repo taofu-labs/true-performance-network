@@ -1,7 +1,7 @@
 import json
 import re
 from typing import Dict, List, Optional
-from pydantic import BaseModel, field_validator
+from pydantic import AliasChoices, BaseModel, Field, field_validator
 
 
 # Coordinator run ids are either a short id ("r1234") or a full UUID. Both are
@@ -9,6 +9,13 @@ from pydantic import BaseModel, field_validator
 _RUN_ID_RE = re.compile(r"^(r[1-9][0-9]{0,18}|[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})$")
 
 PAYLOAD_SPEC_VERSION = 3
+
+# Specs a reveal may still carry. Spec 3 dropped the `max_memory` self-report,
+# which pydantic ignores as an extra field, so a spec-2 payload is otherwise
+# identical and still scores correctly. Rejecting it would strand every miner
+# who committed before the validator upgraded — their reveal is already sealed
+# on chain and cannot be re-made.
+SUPPORTED_SPEC_VERSIONS = frozenset({2, PAYLOAD_SPEC_VERSION})
 
 
 """Coordinator benchmark run submitted by the miner"""
@@ -58,9 +65,11 @@ class MinerSubmission(BaseModel):
 
     @field_validator("spec")
     @classmethod
-    def spec_must_be_current(cls, v: int) -> int:
-        if v != PAYLOAD_SPEC_VERSION:
-            raise ValueError(f"unsupported payload spec {v}, expected {PAYLOAD_SPEC_VERSION}")
+    def spec_must_be_supported(cls, v: int) -> int:
+        if v not in SUPPORTED_SPEC_VERSIONS:
+            raise ValueError(
+                f"unsupported payload spec {v}, expected one of {sorted(SUPPORTED_SPEC_VERSIONS)}"
+            )
         return v
 
     @property
@@ -77,7 +86,13 @@ class ScoringResult(BaseModel):
     competition_id: str
     final_score: float
     # GPU bytes the coordinator measured, in KB. Not a miner claim.
-    measured_memory_kb: int
+    #
+    # Followers are run by other operators and upgrade at their own pace, so
+    # this is read over the wire from a leader that may be on either version.
+    # The old name is accepted so a mixed-version pair keeps setting weights.
+    measured_memory_kb: int = Field(
+        validation_alias=AliasChoices("measured_memory_kb", "max_memory_kb")
+    )
 
 
 # ── Commit/reveal helpers ─────────────────────────────────────────────────────

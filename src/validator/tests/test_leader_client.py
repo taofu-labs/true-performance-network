@@ -16,7 +16,7 @@ def test_get_scoring_results_returns_results_and_status(monkeypatch):
         def raise_for_status(self):
             pass
         def json(self):
-            return {"results": [{"hotkey": "hk1", "competition_id": "comp1", "final_score": 0.7, "max_memory_kb": 1000}], "scored_status": "scored"}
+            return {"results": [{"hotkey": "hk1", "competition_id": "comp1", "final_score": 0.7, "measured_memory_kb": 1000}], "scored_status": "scored"}
 
     captured = {}
     def fake_get(url, params, timeout):
@@ -26,7 +26,7 @@ def test_get_scoring_results_returns_results_and_status(monkeypatch):
     monkeypatch.setattr(requests, "get", fake_get)
 
     results, scored_status = client.get_scoring_results("comp1")
-    assert results == [{"hotkey": "hk1", "competition_id": "comp1", "final_score": 0.7, "max_memory_kb": 1000}]
+    assert results == [{"hotkey": "hk1", "competition_id": "comp1", "final_score": 0.7, "measured_memory_kb": 1000}]
     assert scored_status == "scored"
     assert captured["url"] == "http://leader.local:9200/v1/follower/scoring-results"
     assert captured["params"] == {"competition_id": "comp1"}

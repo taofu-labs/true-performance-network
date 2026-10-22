@@ -62,13 +62,6 @@ def test_bump_stage1_attempts_increments_and_caps(tmp_path):
     assert store.STAGE1_MAX_ATTEMPTS == 3
 
 
-def test_ban_and_is_banned(tmp_path):
-    conn = make_conn(tmp_path)
-    assert store.is_banned(conn, "hk1") is False
-    store.ban(conn, "hk1", "cheating")
-    assert store.is_banned(conn, "hk1") is True
-
-
 
 def test_record_and_get_latest_weights(tmp_path):
     conn = make_conn(tmp_path)
@@ -118,7 +111,6 @@ def test_insert_and_get_candidate(tmp_path):
     candidate = store.get_candidate(conn, "comp1", "hk1")
     assert candidate["status"] == "standby"
     assert candidate["rank"] == 0
-    assert candidate["gguf_file"] is None
     assert candidate["measured_memory_kb"] is None
 
 
@@ -133,18 +125,40 @@ def test_set_candidate_status(tmp_path):
     assert candidate["failure_reason"] == "provenance fail"
 
 
-def test_mark_precheck_passed_records_fields_without_changing_status(tmp_path):
-    """There is no benchmark queue any more: the caller scores the candidate
-    immediately after this, so the status is left for that step to set."""
+def test_insert_revealed_candidates_persists_measured_memory(tmp_path):
+    """The memory figure comes out of stage-1 verification, so it is written
+    with the candidate rather than filled in by a later step."""
     conn = make_conn(tmp_path)
-    store.insert_revealed_candidate(conn, "comp1", "hk1", rank=0, submission_json="{}", reveal_block=10, status="prechecking")
-    conn.commit()
+    store.insert_revealed_candidates(conn, "comp1", [{
+        "hotkey": "hk1", "rank": 0, "submission_json": "{}", "reveal_block": 10,
+        "status": "standby", "verified_scores": {"mmlu": 0.8}, "measured_memory_kb": 1234,
+    }])
+    assert store.get_candidate(conn, "comp1", "hk1")["measured_memory_kb"] == 1234
 
-    store.mark_precheck_passed(conn, "comp1", "hk1", gguf_file="model.gguf", measured_memory_kb=1234)
-    candidate = store.get_candidate(conn, "comp1", "hk1")
-    assert candidate["status"] == "prechecking"
-    assert candidate["gguf_file"] == "model.gguf"
-    assert candidate["measured_memory_kb"] == 1234
+
+def test_migration_drops_banned_hotkeys_and_renames_memory_column(tmp_path):
+    """An existing DB carrying the pre-removal schema must come forward without
+    manual surgery: banning is gone and the memory column is a measurement."""
+    import sqlite3
+
+    path = tmp_path / "old.db"
+    old = sqlite3.connect(path)
+    old.executescript("""
+        CREATE TABLE banned_hotkeys (hotkey TEXT PRIMARY KEY, reason TEXT NOT NULL, banned_at REAL NOT NULL);
+        CREATE TABLE scoring_results (
+            competition_id TEXT NOT NULL, hotkey TEXT NOT NULL, final_score REAL NOT NULL,
+            max_memory_kb INTEGER NOT NULL, finalized_at REAL NOT NULL,
+            PRIMARY KEY (competition_id, hotkey));
+    """)
+    old.execute("INSERT INTO scoring_results VALUES ('comp1', 'hk1', 0.9, 4096, 1.0)")
+    old.commit()
+    old.close()
+
+    conn = store.init_db(path)
+    tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    assert "banned_hotkeys" not in tables
+    row = conn.execute("SELECT * FROM scoring_results WHERE hotkey = 'hk1'").fetchone()
+    assert row["measured_memory_kb"] == 4096  # the row survives the rename
 
 
 def test_candidates_by_status_filters_and_orders_by_rank(tmp_path):
@@ -314,8 +328,8 @@ def test_migration_preserves_rows_in_superseded_benchmark_runs(tmp_path):
 
 def test_record_and_read_scoring_results(tmp_path):
     conn = make_conn(tmp_path)
-    store.record_scoring_result(conn, "comp1", "hk1", final_score=0.9, max_memory_kb=1000)
-    store.record_scoring_result(conn, "comp1", "hk2", final_score=0.5, max_memory_kb=2000)
+    store.record_scoring_result(conn, "comp1", "hk1", final_score=0.9, measured_memory_kb=1000)
+    store.record_scoring_result(conn, "comp1", "hk2", final_score=0.5, measured_memory_kb=2000)
     conn.commit()
 
     results = store.scoring_results_for_competition(conn, "comp1")
@@ -324,8 +338,8 @@ def test_record_and_read_scoring_results(tmp_path):
 
 def test_record_scoring_result_is_idempotent_on_conflict(tmp_path):
     conn = make_conn(tmp_path)
-    store.record_scoring_result(conn, "comp1", "hk1", final_score=0.5, max_memory_kb=1000)
-    store.record_scoring_result(conn, "comp1", "hk1", final_score=0.9, max_memory_kb=1000)
+    store.record_scoring_result(conn, "comp1", "hk1", final_score=0.5, measured_memory_kb=1000)
+    store.record_scoring_result(conn, "comp1", "hk1", final_score=0.9, measured_memory_kb=1000)
     conn.commit()
 
     results = store.scoring_results_for_competition(conn, "comp1")

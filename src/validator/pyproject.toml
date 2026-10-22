@@ -9,6 +9,9 @@ dependencies = [
     "common",
     "competition",
     "bittensor>=11.0.1",
+    # validator.py's weight normalisation. Previously satisfied only by accident,
+    # through the precheck container's dependency tree.
+    "numpy>=1.26",
 ]
 requires-python = ">=3.12"
 

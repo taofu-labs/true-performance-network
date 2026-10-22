@@ -11,9 +11,9 @@
 
 ## Follower hardware
 
-Follower validators do not download models, run Docker prechecks, or benchmark
-submissions. They read scoring results from the primary validator and submit
-weights on chain.
+Follower validators do not download models or benchmark submissions — and
+neither does the primary any more. They read scoring results from the primary
+validator and submit weights on chain.
 
 Minimum:
 
@@ -28,7 +28,9 @@ Comfortable:
 - 8 GB RAM
 - 50+ GB disk
 
-No GPU is required. Docker is not required for follower mode.
+No GPU is required, and Docker is not required in either mode: miners run
+their own benchmarks on the benchmark service, and the validator only verifies
+the resulting run ids.
 
 ## Install dependencies
 
@@ -170,8 +172,8 @@ The validator stores persistent state in:
 - Windows: `%APPDATA%/tpn/validator-storage/`
 
 This includes local scored submission history. On the primary scoring validator,
-it also includes full scoring runs, ban records, and weights history. Wipe with
-`--clean` flag on startup.
+it also includes full scoring runs and weights history. Wipe with the `--clean`
+flag on startup.
 
 ## pm2 management
 

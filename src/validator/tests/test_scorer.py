@@ -46,6 +46,7 @@ def make_status(**overrides) -> RunStatus:
         file_hashes={"model.gguf": ("sha256", "a" * 64)},
         benchmarks=["mmlu"],
         item_status={"mmlu": "completed"},
+        measured_memory_bytes=900 * 1024,
     )
     fields.update(overrides)
     return RunStatus(**fields)
@@ -71,13 +72,6 @@ class StubCoordinator:
         if status is None:
             raise RuntimeError(f"unknown run {run_id}")
         return status
-
-
-class FakeContainer:
-    """Precheck container stub for tests that only need to pass the early guards."""
-    def check(self, repository, revision, filename, context_length):
-        from competition.precheck_client import PrecheckVerdict
-        return PrecheckVerdict(provenance=None, ram=None, sha256="a" * 64)
 
 
 # ---------------------------------------------------------------------------
@@ -286,8 +280,11 @@ def test_verify_all_candidates_returns_scores_and_persists_rows():
     submissions = {"hk1": make_submission()}
     coordinator = StubCoordinator({"r100": make_status()})
 
-    scores = scorer.verify_all_candidates(conn, "comp1", submissions, make_spec(), coordinator)
-    assert scores == {"hk1": {"mmlu": 0.8}}
+    verified = scorer.verify_all_candidates(conn, "comp1", submissions, make_spec(), coordinator)
+    assert verified["hk1"].scores == {"mmlu": 0.8}
+    # A benchmark run carries its suite-level figure, so a competition with no
+    # KL check still has a memory number to enforce a cap against.
+    assert verified["hk1"].measured_memory_kb == 900
 
     rows = store.benchmark_results_for_hotkey(conn, "comp1", "hk1")
     assert len(rows) == 1
@@ -303,8 +300,10 @@ def test_verify_all_candidates_records_rejection_reason_and_actual_repo():
     submissions = {"hk1": make_submission()}
     coordinator = StubCoordinator({"r100": make_status(repo="someone/else")})
 
-    scores = scorer.verify_all_candidates(conn, "comp1", submissions, make_spec(), coordinator)
-    assert scores == {"hk1": {"mmlu": 0.0}}
+    verified = scorer.verify_all_candidates(conn, "comp1", submissions, make_spec(), coordinator)
+    assert verified["hk1"].scores == {"mmlu": 0.0}
+    # A rejected run's memory describes some other model, so it is not carried.
+    assert verified["hk1"].measured_memory_kb == 0
 
     row = store.benchmark_results_for_hotkey(conn, "comp1", "hk1")[0]
     assert row["status"] == "failed"
@@ -315,24 +314,28 @@ def test_verify_all_candidates_records_rejection_reason_and_actual_repo():
 
 
 # ---------------------------------------------------------------------------
-# finalize_prechecked_candidate
+# finalize_candidate
 # ---------------------------------------------------------------------------
 
 def _insert_standby(conn, hotkey="hk1"):
     store.insert_revealed_candidate(
         conn, "comp1", hotkey, rank=0,
         submission_json=make_submission().model_dump_json(),
-        reveal_block=5, status="prechecking",
+        reveal_block=5, status="standby",
     )
     conn.commit()
+
+
+def verification(scores, memory_kb=900) -> scorer.CandidateVerification:
+    return scorer.CandidateVerification(scores=scores, measured_memory_kb=memory_kb)
 
 
 def test_finalize_scores_candidate_that_passes_floors():
     conn = make_db()
     _insert_standby(conn)
 
-    scored = scorer.finalize_prechecked_candidate(
-        conn, "comp1", "hk1", make_spec(), {"mmlu": 0.8}, measured_memory_kb=900,
+    scored = scorer.finalize_candidate(
+        conn, "comp1", "hk1", make_spec(), verification({"mmlu": 0.8}),
     )
     assert scored is True
     assert store.get_candidate(conn, "comp1", "hk1")["status"] == "done"
@@ -346,8 +349,8 @@ def test_finalize_fails_candidate_below_floor():
     conn = make_db()
     _insert_standby(conn)
 
-    scored = scorer.finalize_prechecked_candidate(
-        conn, "comp1", "hk1", make_spec(), {"mmlu": 0.0}, measured_memory_kb=900,
+    scored = scorer.finalize_candidate(
+        conn, "comp1", "hk1", make_spec(), verification({"mmlu": 0.0}),
     )
     assert scored is False
     candidate = store.get_candidate(conn, "comp1", "hk1")
@@ -359,10 +362,10 @@ def test_finalize_fails_candidate_below_floor():
 def test_finalize_fails_candidate_over_memory_cap():
     conn = make_db()
     _insert_standby(conn)
-    spec = make_spec(competition_type="ram_ceiling", max_memory_kb=1000)
+    spec = make_spec(competition_type="gpu_memory_ceiling", max_gpu_memory_kb=1000)
 
-    scored = scorer.finalize_prechecked_candidate(
-        conn, "comp1", "hk1", spec, {"mmlu": 0.8}, measured_memory_kb=5000,
+    scored = scorer.finalize_candidate(
+        conn, "comp1", "hk1", spec, verification({"mmlu": 0.8}, memory_kb=5000),
     )
     assert scored is False
     candidate = store.get_candidate(conn, "comp1", "hk1")
@@ -371,17 +374,33 @@ def test_finalize_fails_candidate_over_memory_cap():
 
 
 def test_finalize_benchmark_floor_ranks_by_measured_memory():
-    """BENCHMARK_FLOOR scores the *measured* memory, not the claim — the
-    self-reported value only orders the precheck queue."""
+    """BENCHMARK_FLOOR scores the memory the coordinator measured. Miners no
+    longer self-report one, so there is nothing to rank on but the measurement."""
     conn = make_db()
     _insert_standby(conn)
 
-    scorer.finalize_prechecked_candidate(
-        conn, "comp1", "hk1", make_spec(), {"mmlu": 0.8}, measured_memory_kb=900,
+    scorer.finalize_candidate(
+        conn, "comp1", "hk1", make_spec(), verification({"mmlu": 0.8}),
     )
     result = store.scoring_results_for_competition(conn, "comp1")[0]
     assert result["final_score"] == -900.0
-    assert result["max_memory_kb"] == 900
+    assert result["measured_memory_kb"] == 900
+
+
+def test_finalize_fails_candidate_whose_memory_is_unknown():
+    """Scoring 0 KB would pass every cap and, under BENCHMARK_FLOOR, win
+    outright. A candidate with no measurement is failed instead."""
+    conn = make_db()
+    _insert_standby(conn)
+
+    scored = scorer.finalize_candidate(
+        conn, "comp1", "hk1", make_spec(), verification({"mmlu": 0.8}, memory_kb=0),
+    )
+    assert scored is False
+    candidate = store.get_candidate(conn, "comp1", "hk1")
+    assert candidate["status"] == "failed"
+    assert "GPU memory" in candidate["failure_reason"]
+    assert store.scoring_results_for_competition(conn, "comp1") == []
 
 
 # ---------------------------------------------------------------------------
@@ -408,136 +427,6 @@ def test_dedup_winner_tie_break_by_hotkey():
     assert scorer.dedup_winner(seen, "hkC", "a" * 64, 100) == ("hkB", 100)
 
 
-# ---------------------------------------------------------------------------
-# precheck_one — unchanged by the rework, still the only ban path
-# ---------------------------------------------------------------------------
-
-def test_precheck_one_fails_when_repo_not_public(monkeypatch):
-    monkeypatch.setattr(scorer, "check_repo_public", lambda repo: False)
-    result = scorer.precheck_one("hk1", make_submission(), make_spec(), FakeContainer(), make_db())
-    assert result.passed is False
-    assert "not publicly accessible" in result.reason
-
-
-
-def test_precheck_one_passes_with_measured_ram(monkeypatch):
-    from competition.precheck_client import PrecheckVerdict, RamResult
-
-    monkeypatch.setattr(scorer, "check_repo_public", lambda repo: True)
-    monkeypatch.setattr(scorer._hf_api, "list_repo_files", lambda repo_id, revision: ["model.gguf"])
-
-    class RamContainer:
-        def check(self, repository, revision, filename, context_length):
-            return PrecheckVerdict(provenance=None, sha256="a" * 64, ram=RamResult(passed=True, ram_bytes=1000 * 1024))
-
-    result = scorer.precheck_one("hk1", make_submission(), make_spec(), RamContainer(), make_db())
-    assert result.passed is True
-    assert result.gguf_file == "model.gguf"
-    assert result.measured_memory_kb == 1000
-
-
-def test_precheck_one_allows_measured_ram_below_report(monkeypatch):
-    from competition.precheck_client import PrecheckVerdict, RamResult
-
-    monkeypatch.setattr(scorer, "check_repo_public", lambda repo: True)
-    monkeypatch.setattr(scorer._hf_api, "list_repo_files", lambda repo_id, revision: ["model.gguf"])
-
-    class ConservativeRamContainer:
-        def check(self, repository, revision, filename, context_length):
-            return PrecheckVerdict(
-                provenance=None,
-                sha256="a" * 64,
-                ram=RamResult(passed=True, ram_bytes=800 * 1024),
-            )
-
-    result = scorer.precheck_one(
-        "hk1",
-        make_submission(max_memory=1000),
-        make_spec(),
-        ConservativeRamContainer(),
-        make_db(),
-    )
-    assert result.passed is True
-    assert result.measured_memory_kb == 800
-
-
-def test_precheck_one_bans_on_sha256_mismatch(monkeypatch):
-    """The only remaining ban path. Score-lying is no longer possible, since
-    scores come from the coordinator rather than the miner."""
-    from competition.precheck_client import PrecheckVerdict
-
-    monkeypatch.setattr(scorer, "check_repo_public", lambda repo: True)
-    monkeypatch.setattr(scorer._hf_api, "list_repo_files", lambda repo_id, revision: ["model.gguf"])
-
-    class MismatchContainer:
-        def check(self, repository, revision, filename, context_length):
-            return PrecheckVerdict(provenance=None, ram=None, sha256="f" * 64)
-
-    conn = make_db()
-    result = scorer.precheck_one("hk1", make_submission(), make_spec(), MismatchContainer(), conn)
-    assert result.passed is False
-    assert "hotkey banned" in result.reason
-    assert store.is_banned(conn, "hk1") is True
-
-
-def test_precheck_one_disqualifies_on_max_memory_lie(monkeypatch):
-    """max_memory stays self-reported in the commit (decision 4). A lie fails
-    the candidate but does not ban — unlike a sha256 mismatch."""
-    from competition.precheck_client import PrecheckVerdict, RamResult
-
-    monkeypatch.setattr(scorer, "check_repo_public", lambda repo: True)
-    monkeypatch.setattr(scorer._hf_api, "list_repo_files", lambda repo_id, revision: ["model.gguf"])
-
-    class LyingRamContainer:
-        def check(self, repository, revision, filename, context_length):
-            return PrecheckVerdict(provenance=None, sha256="a" * 64, ram=RamResult(passed=True, ram_bytes=5_000_000))
-
-    conn = make_db()
-    submission = make_submission(max_memory=1000)  # 1000 KB reported, ~4883 KB measured
-    result = scorer.precheck_one("hk1", submission, make_spec(), LyingRamContainer(), conn)
-    assert result.passed is False
-    assert "max_memory lie" in result.reason
-    assert store.is_banned(conn, "hk1") is False
-
-
-def test_precheck_one_uses_submitted_filename_not_first_gguf(monkeypatch):
-    """The submitted file must be checked, even when another .gguf sorts first."""
-    from competition.precheck_client import PrecheckVerdict, RamResult
-
-    monkeypatch.setattr(scorer, "check_repo_public", lambda repo: True)
-    monkeypatch.setattr(
-        scorer._hf_api, "list_repo_files",
-        lambda repo_id, revision: ["aaa-decoy.gguf", "model.gguf"],
-    )
-
-    seen = {}
-
-    class RecordingContainer:
-        def check(self, repository, revision, filename, context_length):
-            seen["filename"] = filename
-            return PrecheckVerdict(provenance=None, sha256="a" * 64,
-                                   ram=RamResult(passed=True, ram_bytes=1000 * 1024))
-
-    result = scorer.precheck_one("hk1", make_submission(file="model.gguf"), make_spec(), RecordingContainer(), make_db())
-    assert seen["filename"] == "model.gguf"
-    assert result.passed is True
-
-
-def test_precheck_one_fails_when_submitted_file_absent(monkeypatch):
-    """A missing submitted file fails cleanly — no ban, no fallback."""
-    monkeypatch.setattr(scorer, "check_repo_public", lambda repo: True)
-    monkeypatch.setattr(
-        scorer._hf_api, "list_repo_files",
-        lambda repo_id, revision: ["something-else.gguf"],
-    )
-
-    conn = make_db()
-    result = scorer.precheck_one("hk1", make_submission(file="model.gguf"), make_spec(), FakeContainer(), conn)
-    assert result.passed is False
-    assert "not found at revision" in result.reason
-    assert "something-else.gguf" in result.reason
-    assert store.is_banned(conn, "hk1") is False
-
 # ── KL comparison run verification ────────────────────────────────────────────
 # Payload shapes come from a real fidelity-v1 run on the live coordinator
 # (run 01f61c34, corpus-000002, Q4_K_M: P99 0.1455 nats -> x0.8646).
@@ -556,6 +445,7 @@ def make_kl_status(**overrides) -> RunStatus:
             "protocol": "fidelity-v1", "outcome": "complete", "reference": "transformers",
             "pairings": {scorer.KL_PAIRING: {"kl": {"mean": 0.0247, "quantiles": {"0.99": 0.1455}}}},
         },
+        measured_memory_bytes=1_700_000_000,
     )
     fields.update(overrides)
     return RunStatus(**fields)
@@ -708,10 +598,50 @@ def test_verifies_a_real_comparison_run_end_to_end():
         kl_corpus_id=data["model_source"]["dataset"]["corpus_id"],
     )
 
+    # This capture predates the coordinator's `vram` block (benchmark server
+    # 4.59.0), so it has no measured memory and is therefore unscoreable — which
+    # is exactly the right outcome: the cap cannot be enforced without a figure.
     result = scorer.verify_kl_run(submission, spec, data["short_id"], status)
-    assert result.ok, result.reason
-    assert result.score == pytest.approx(0.864555, abs=1e-6)
+    assert result.ok is False
+    assert "no measured GPU memory" in result.reason
+
+    # With the measurement present, the same run verifies and prices the KL.
+    identity = _extract_model_identity(data)
+    assert identity["measured_memory_bytes"] is None  # no vram block in this capture
+    measured = RunStatus(
+        run_id=data["run_id"], status=RunStatusCode.COMPLETED,
+        **{**identity, "measured_memory_bytes": 1_700_000_000},
+    )
+    priced = scorer.verify_kl_run(submission, spec, data["short_id"], measured)
+    assert priced.ok, priced.reason
+    assert priced.score == pytest.approx(0.864555, abs=1e-6)
+    assert priced.measured_memory_kb == 1_700_000_000 // 1024
 
     # The same run against a competition on a different base earns nothing.
     other_base = spec.model_copy(update={"model_repo": "meta-llama/Llama-3.1-8B"})
-    assert scorer.verify_kl_run(submission, other_base, data["short_id"], status).score == 0.0
+    assert scorer.verify_kl_run(submission, other_base, data["short_id"], measured).score == 0.0
+
+
+def test_parses_the_vram_block_a_comparison_reports():
+    """Synthetic, not a capture: the fixture run predates benchmark server
+    4.59.0. Shape per src/vram.js — the candidate's role is the committed model,
+    and `estimated` is theory from the quote, never a measurement."""
+    data = _live_status()
+    data["comparison"]["models"]["candidate"]["vram"] = {
+        "estimated": {"total_bytes": 999_999_999},
+        "measured": {
+            "phase": "after_load", "runtime": "llama_cpp",
+            "method": "torch_mem_get_info_delta", "scope": "all_visible_gpus",
+            "gpu_count": 1, "total_bytes": 1_700_000_000,
+            "per_gpu_bytes": [1_700_000_000],
+        },
+    }
+    data["comparison"]["models"]["base"]["vram"] = {
+        "estimated": None,
+        "measured": {
+            "runtime": "transformers", "method": "torch_mem_get_info_delta",
+            "total_bytes": 9_000_000_000,
+        },
+    }
+    identity = _extract_model_identity(data)
+    assert identity["measured_memory_bytes"] == 1_700_000_000

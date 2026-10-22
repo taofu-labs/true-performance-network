@@ -3,7 +3,7 @@ Leader validator's HTTP API.
 
 Three namespaces:
   /v1/follower/*     — minimal, stable contract followers depend on to set weights.
-  /v1/state/*        — full detail (reveals, precheck outcomes, weights history,
+  /v1/state/*        — full detail (reveals, verification outcomes, weights history,
                        task status) for dashboards. /v1/state/competitions/{id}
                        is a superset of what /v1/follower/scoring-results returns,
                        so dashboards use this instead of stitching both namespaces.
@@ -127,10 +127,10 @@ def creation_errors(spec: CompetitionSpec, current_block: int) -> list[str]:
         errors.append(f"start_block {spec.start_block} is not in the future (current block {current_block})")
     if spec.commit_end_block <= spec.start_block:
         errors.append("commit_end_block must be after start_block")
-    if spec.reveal_grace_blocks < 0 or spec.ram_check_context_length < 1:
-        errors.append("reveal_grace_blocks must be >= 0 and ram_check_context_length >= 1")
-    if spec.max_memory_kb is not None and spec.max_memory_kb <= 0:
-        errors.append("max_memory_kb must be positive")
+    if spec.reveal_grace_blocks < 0:
+        errors.append("reveal_grace_blocks must be >= 0")
+    if spec.max_gpu_memory_kb is not None and spec.max_gpu_memory_kb <= 0:
+        errors.append("max_gpu_memory_kb must be positive")
     if spec.scoring_end_block <= spec.scoring_starts_at():
         errors.append("scoring_end_block must be after commit_end_block + reveal_grace_blocks")
     if spec.top_n < 1 or any(not 0 <= share <= 1 for share in spec.emission_distribution):
@@ -148,8 +148,11 @@ def creation_errors(spec: CompetitionSpec, current_block: int) -> list[str]:
         # it scores well against, and the multiplier becomes free.
         if not spec.model_repo:
             errors.append("kl_corpus_id needs model_repo: it is the base the KL run must compare against")
-        if spec.competition_type != CompetitionType.RAM_CEILING:
-            errors.append("kl_corpus_id only affects ram_ceiling ranking; benchmark_floor ranks on memory alone")
+        if spec.competition_type != CompetitionType.GPU_MEMORY_CEILING:
+            errors.append(
+                "kl_corpus_id only affects gpu_memory_ceiling ranking; "
+                "benchmark_floor ranks on memory alone"
+            )
     return errors
 
 

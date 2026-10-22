@@ -132,6 +132,12 @@ class RunStatus:
     # the DTO's `models` block, which carries runtime descriptors and no repo id.
     base_repo: Optional[str] = None
 
+    # GPU bytes the run's model took to load, from the coordinator's
+    # `vram.measured`. This replaces the validator's own RAM measurement, so it
+    # is the figure a competition's memory cap is enforced against. None when no
+    # runtime reported a usable block.
+    measured_memory_bytes: Optional[int] = None
+
 
 # ---------------------------------------------------------------------------
 # Protocol
@@ -435,7 +441,30 @@ def _extract_model_identity(data: dict) -> dict:
         comparison=data.get("comparison"),
         dataset=model_source.get("dataset"),
         base_repo=((model_source.get("base") or {}).get("model") or {}).get("repo"),
+        measured_memory_bytes=_measured_memory_bytes(data),
     )
+
+
+def _measured_memory_bytes(data: dict) -> Optional[int]:
+    """
+    GPU bytes the run's model took to load, from the coordinator's `vram.measured`.
+
+    A comparison reports one block per role, and the candidate is the side the
+    submission commits; a benchmark reports one suite-level block, because a
+    single model load serves every child benchmark. `estimated` is theory from
+    the quote and is deliberately ignored — only a real measurement may decide a
+    memory cap.
+    """
+    candidate = ((data.get("comparison") or {}).get("models") or {}).get("candidate") or {}
+    for block in (
+        candidate.get("vram"),
+        (data.get("result_summary") or {}).get("vram"),
+        (data.get("result") or {}).get("vram"),
+    ):
+        total = ((block or {}).get("measured") or {}).get("total_bytes")
+        if isinstance(total, int) and not isinstance(total, bool) and total > 0:
+            return total
+    return None
 
 
 def _extract_item_scores(data: dict) -> Dict[str, float]:
@@ -582,5 +611,25 @@ if __name__ == "__main__":
         http._session.get = lambda *a, _s=terminal_status, **k: _FakeResp({"status": _s})
         terminal = http.poll("run-terminal")
         assert terminal.status == RunStatusCode.FAILED, f"{terminal_status} not treated as failed: {terminal}"
+
+    # _measured_memory_bytes: a comparison's candidate role wins over any
+    # suite-level block, `estimated` is never read as a measurement, and a
+    # missing or non-positive total reads as unknown rather than zero.
+    assert _measured_memory_bytes({
+        "comparison": {"models": {
+            "candidate": {"vram": {"measured": {"total_bytes": 1_700_000_000}}},
+            "base": {"vram": {"measured": {"total_bytes": 9_000_000_000}}},
+        }},
+        "result_summary": {"vram": {"measured": {"total_bytes": 5_000_000_000}}},
+    }) == 1_700_000_000
+    assert _measured_memory_bytes(
+        {"result_summary": {"vram": {"measured": {"total_bytes": 5_000_000_000}}}}
+    ) == 5_000_000_000
+    assert _measured_memory_bytes({"result": {"vram": {"measured": {"total_bytes": 42}}}}) == 42
+    assert _measured_memory_bytes({"result_summary": {"vram": {"estimated": {"total_bytes": 7}}}}) is None
+    assert _measured_memory_bytes({"result_summary": {"vram": None}}) is None
+    assert _measured_memory_bytes({"result": {"vram": {"measured": {"total_bytes": 0}}}}) is None
+    assert _measured_memory_bytes({"result": {"vram": {"measured": {"total_bytes": True}}}}) is None
+    assert _measured_memory_bytes({}) is None
 
     print(f"OK — mmlu score={status.scores['mmlu']:.4f}, run_id={run_id}")

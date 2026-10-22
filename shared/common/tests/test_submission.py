@@ -2,8 +2,9 @@
 Payload model — the on-chain commit shape.
 
 Miners commit coordinator run ids rather than self-reported scores, under
-payload spec version 2. A spec-1 payload (or anything still carrying `claims`)
-must be rejected outright rather than silently scoring zero.
+payload spec version 3. An older payload (or anything still carrying `claims`,
+or the `max_memory` self-report spec 3 dropped) must be rejected outright rather
+than silently scoring zero.
 """
 import json
 
@@ -29,7 +30,6 @@ def make_payload(**overrides) -> str:
         repository="user/repo",
         file="model.gguf",
         file_sha256="a" * 64,
-        max_memory=1000,
         runs=make_runs(),
         huggingface_revision="b" * 40,
     )
@@ -61,7 +61,13 @@ def test_rejects_malformed_run_ids(bad):
 # ---------------------------------------------------------------------------
 
 def test_build_reveal_payload_stamps_current_spec_version():
-    assert json.loads(make_payload())["spec"] == PAYLOAD_SPEC_VERSION == 2
+    assert json.loads(make_payload())["spec"] == PAYLOAD_SPEC_VERSION == 3
+
+
+def test_payload_carries_no_self_reported_memory():
+    """Spec 3 dropped `max_memory`: the validator measures memory from the
+    coordinator's runs, so a miner claim would be dead weight on chain."""
+    assert "max_memory" not in json.loads(make_payload())
 
 
 def test_round_trips_through_parse():
@@ -71,17 +77,18 @@ def test_round_trips_through_parse():
     assert submission.run_ids == {"mmlu": "r1234"}
 
 
-def test_rejects_spec_1_payload():
+@pytest.mark.parametrize("old_spec", [1, 2])
+def test_rejects_superseded_spec_payload(old_spec):
     """An old-build miner committing against a new-build validator must fail
     loudly at reveal, not silently score zero on an unrecognised field."""
-    payload = make_payload().replace('"spec":2', '"spec":1')
+    payload = make_payload().replace('"spec":3', f'"spec":{old_spec}')
     assert parse_reveal_payload(payload) is None
 
 
 def test_rejects_payload_carrying_claims_instead_of_runs():
     payload = json.dumps({
-        "spec": 2, "competition_id": "comp1", "repository": "user/repo",
-        "file": "model.gguf", "file_sha256": "a" * 64, "max_memory": 1000,
+        "spec": 3, "competition_id": "comp1", "repository": "user/repo",
+        "file": "model.gguf", "file_sha256": "a" * 64,
         "huggingface_revision": "b" * 40,
         "claims": [{"b": "mmlu", "s": 0.9}],
     })
@@ -101,7 +108,7 @@ def test_run_ids_maps_benchmark_to_run():
         competition_id="comp1",
         runs=[BenchmarkRun(b="mmlu", r="r1"), BenchmarkRun(b="gsm8k", r="r2")],
         repository="user/repo", file="m.gguf", file_sha256="a" * 64,
-        max_memory=1000, huggingface_revision="b" * 40,
+        huggingface_revision="b" * 40,
     )
     assert submission.run_ids == {"mmlu": "r1", "gsm8k": "r2"}
 
@@ -113,7 +120,7 @@ def test_run_ids_duplicate_benchmark_keeps_last():
         competition_id="comp1",
         runs=[BenchmarkRun(b="mmlu", r="r1"), BenchmarkRun(b="mmlu", r="r2")],
         repository="user/repo", file="m.gguf", file_sha256="a" * 64,
-        max_memory=1000, huggingface_revision="b" * 40,
+        huggingface_revision="b" * 40,
     )
     assert submission.run_ids == {"mmlu": "r2"}
 

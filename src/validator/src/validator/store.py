@@ -59,7 +59,6 @@ CREATE TABLE IF NOT EXISTS revealed_candidates (
     reveal_block INTEGER NOT NULL,
     status TEXT NOT NULL,
     failure_reason TEXT,
-    gguf_file TEXT,
     measured_memory_kb INTEGER,
     verified_scores_json TEXT,
     updated_at REAL NOT NULL,
@@ -87,7 +86,7 @@ CREATE TABLE IF NOT EXISTS scoring_results (
     competition_id TEXT NOT NULL,
     hotkey TEXT NOT NULL,
     final_score REAL NOT NULL,
-    max_memory_kb INTEGER NOT NULL,
+    measured_memory_kb INTEGER NOT NULL,
     finalized_at REAL NOT NULL,
     PRIMARY KEY (competition_id, hotkey)
 );
@@ -97,12 +96,6 @@ CREATE TABLE IF NOT EXISTS weights_history (
     competition_id TEXT NOT NULL,
     set_at REAL NOT NULL,
     weights_json TEXT NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS banned_hotkeys (
-    hotkey TEXT PRIMARY KEY,
-    reason TEXT NOT NULL,
-    banned_at REAL NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS competitions (
@@ -124,17 +117,17 @@ _connections: Dict[str, sqlite3.Connection] = {}
 
 # One process-wide lock guarding the shared Connection. The validator runs its
 # sync store calls from two places: the asyncio event loop (leader/weight loops
-# and the aiohttp API handlers) and the one asyncio.to_thread worker that
-# run_stage_2 hands blocking work to. Python's sqlite3 is built with
-# threadsafety=1 — module-level serialization only — so a Connection opened
-# check_same_thread=False is NOT safe to use from two threads concurrently.
-# Every public store function below is wrapped in @_locked.
+# and the aiohttp API handlers) and the asyncio.to_thread workers stage 1 hands
+# blocking work to. Python's sqlite3 is built with threadsafety=1 — module-level
+# serialization only — so a Connection opened check_same_thread=False is NOT
+# safe to use from two threads concurrently. Every public store function below
+# is wrapped in @_locked.
 #
 # Note this makes each call safe, not each pair of calls: commit() is
 # connection-global, so a commit on one thread also lands whatever the other
 # thread had open. Nothing in the current call graph runs two writers at once
-# (run_stage_2 awaits its to_thread calls one at a time), and the admin API's
-# only writer that could interleave is reset-scoring.
+# (stage 1 awaits its to_thread calls one at a time), and the admin API's only
+# writer that could interleave is reset-scoring.
 _LOCK = threading.RLock()
 
 
@@ -167,12 +160,13 @@ def init_db(path: Optional[Path] = None) -> sqlite3.Connection:
     conn.execute("PRAGMA busy_timeout=5000")
     conn.executescript(_SCHEMA)
     conn.commit()
-    _migrate_scored_competitions_stage_columns(conn)
+    _migrate_schema(conn)
     _connections[key] = conn
     return conn
 
 
-def _migrate_scored_competitions_stage_columns(conn: sqlite3.Connection) -> None:
+def _migrate_schema(conn: sqlite3.Connection) -> None:
+    """Bring an existing DB up to the current schema. Idempotent."""
     existing = {row["name"] for row in conn.execute("PRAGMA table_info(scored_competitions)")}
     if "stage" not in existing:
         conn.execute("ALTER TABLE scored_competitions ADD COLUMN stage TEXT NOT NULL DEFAULT 'finalized'")
@@ -184,6 +178,16 @@ def _migrate_scored_competitions_stage_columns(conn: sqlite3.Connection) -> None
     candidate_columns = {row["name"] for row in conn.execute("PRAGMA table_info(revealed_candidates)")}
     if "verified_scores_json" not in candidate_columns:
         conn.execute("ALTER TABLE revealed_candidates ADD COLUMN verified_scores_json TEXT")
+
+    # Banning was only ever triggered by the precheck container's sha256 rehash.
+    # That container is gone and nothing writes this table any more.
+    conn.execute("DROP TABLE IF EXISTS banned_hotkeys")
+
+    # The memory figure now comes from the coordinator and is a measurement, not
+    # a miner's claimed ceiling.
+    scoring_columns = {row["name"] for row in conn.execute("PRAGMA table_info(scoring_results)")}
+    if "max_memory_kb" in scoring_columns and "measured_memory_kb" not in scoring_columns:
+        conn.execute("ALTER TABLE scoring_results RENAME COLUMN max_memory_kb TO measured_memory_kb")
 
     conn.commit()
 
@@ -283,7 +287,7 @@ def scored_status(conn: sqlite3.Connection, competition_id: str) -> Optional[str
 def reset_competition_scoring(conn: sqlite3.Connection, competition_id: str) -> dict:
     """Clear scoring state for one competition so it re-runs from stage 1.
 
-    Keeps bans and weights history. Returns per-table deleted row counts.
+    Keeps weights history. Returns per-table deleted row counts.
     Callers must refuse anything past stage 1 that did not fail.
     """
     deleted = {}
@@ -326,12 +330,13 @@ def insert_revealed_candidates(
         conn.executemany(
             """INSERT INTO revealed_candidates
                (competition_id, hotkey, rank, submission_json, reveal_block, status,
-                failure_reason, verified_scores_json, updated_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                failure_reason, verified_scores_json, measured_memory_kb, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             [
                 (competition_id, c["hotkey"], c["rank"], c["submission_json"],
                  c["reveal_block"], c["status"], c.get("failure_reason"),
                  json.dumps(c["verified_scores"]) if c.get("verified_scores") is not None else None,
+                 c.get("measured_memory_kb"),
                  now)
                 for c in candidates
             ],
@@ -350,39 +355,6 @@ def set_candidate_status(
         """UPDATE revealed_candidates SET status = ?, failure_reason = ?, updated_at = ?
            WHERE competition_id = ? AND hotkey = ?""",
         (status, failure_reason, time.time(), competition_id, hotkey),
-    )
-    conn.commit()
-
-
-@_locked
-def reset_stale_candidate_statuses(conn: sqlite3.Connection, competition_id: str) -> int:
-    """Recover candidates left mid-precheck by a process that died before
-    writing a terminal status. Safe only at startup — nothing is genuinely
-    in flight the moment a fresh process boots. Returns count reset."""
-    cur = conn.execute(
-        """UPDATE revealed_candidates SET status = 'standby', updated_at = ?
-           WHERE competition_id = ? AND status = 'prechecking'""",
-        (time.time(), competition_id),
-    )
-    conn.commit()
-    return cur.rowcount
-
-
-@_locked
-def mark_precheck_passed(
-    conn: sqlite3.Connection,
-    competition_id: str,
-    hotkey: str,
-    gguf_file: str,
-    measured_memory_kb: int,
-) -> None:
-    # Status is left at 'prechecking': the caller scores the candidate
-    # immediately afterwards, so there is no queue to move it into.
-    conn.execute(
-        """UPDATE revealed_candidates
-           SET gguf_file = ?, measured_memory_kb = ?, updated_at = ?
-           WHERE competition_id = ? AND hotkey = ?""",
-        (gguf_file, measured_memory_kb, time.time(), competition_id, hotkey),
     )
     conn.commit()
 
@@ -407,16 +379,6 @@ def candidates_by_status(
         (competition_id, *statuses),
     ).fetchall()
     return [dict(r) for r in rows]
-
-
-@_locked
-def count_candidates_by_status(conn: sqlite3.Connection, competition_id: str, statuses: tuple) -> int:
-    placeholders = ",".join("?" for _ in statuses)
-    row = conn.execute(
-        f"SELECT COUNT(*) AS n FROM revealed_candidates WHERE competition_id = ? AND status IN ({placeholders})",
-        (competition_id, *statuses),
-    ).fetchone()
-    return row["n"]
 
 
 @_locked
@@ -489,16 +451,16 @@ def record_scoring_result(
     competition_id: str,
     hotkey: str,
     final_score: float,
-    max_memory_kb: int,
+    measured_memory_kb: int,
 ) -> None:
     now = time.time()
     conn.execute(
-        """INSERT INTO scoring_results (competition_id, hotkey, final_score, max_memory_kb, finalized_at)
+        """INSERT INTO scoring_results (competition_id, hotkey, final_score, measured_memory_kb, finalized_at)
            VALUES (?, ?, ?, ?, ?)
            ON CONFLICT(competition_id, hotkey) DO UPDATE SET
-             final_score = excluded.final_score, max_memory_kb = excluded.max_memory_kb,
+             final_score = excluded.final_score, measured_memory_kb = excluded.measured_memory_kb,
              finalized_at = excluded.finalized_at""",
-        (competition_id, hotkey, final_score, max_memory_kb, now),
+        (competition_id, hotkey, final_score, measured_memory_kb, now),
     )
     conn.commit()
 
@@ -509,17 +471,17 @@ def finalize_candidate(
     competition_id: str,
     hotkey: str,
     final_score: float,
-    max_memory_kb: int,
+    measured_memory_kb: int,
 ) -> None:
     now = time.time()
     with conn:
         conn.execute(
-            """INSERT INTO scoring_results (competition_id, hotkey, final_score, max_memory_kb, finalized_at)
+            """INSERT INTO scoring_results (competition_id, hotkey, final_score, measured_memory_kb, finalized_at)
                VALUES (?, ?, ?, ?, ?)
                ON CONFLICT(competition_id, hotkey) DO UPDATE SET
-                 final_score = excluded.final_score, max_memory_kb = excluded.max_memory_kb,
+                 final_score = excluded.final_score, measured_memory_kb = excluded.measured_memory_kb,
                  finalized_at = excluded.finalized_at""",
-            (competition_id, hotkey, final_score, max_memory_kb, now),
+            (competition_id, hotkey, final_score, measured_memory_kb, now),
         )
         conn.execute(
             """UPDATE revealed_candidates SET status = 'done', failure_reason = NULL, updated_at = ?
@@ -648,16 +610,4 @@ def delete_competition(conn: sqlite3.Connection, competition_id: str) -> bool:
     return cur.rowcount > 0
 
 
-@_locked
-def ban(conn: sqlite3.Connection, hotkey: str, reason: str) -> None:
-    conn.execute(
-        "INSERT OR IGNORE INTO banned_hotkeys (hotkey, reason, banned_at) VALUES (?, ?, ?)",
-        (hotkey, reason, time.time()),
-    )
-    conn.commit()
 
-
-@_locked
-def is_banned(conn: sqlite3.Connection, hotkey: str) -> bool:
-    row = conn.execute("SELECT 1 FROM banned_hotkeys WHERE hotkey = ?", (hotkey,)).fetchone()
-    return row is not None

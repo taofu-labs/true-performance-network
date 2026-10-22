@@ -5,7 +5,6 @@ After commit_end_block the chain auto-decrypts TLE commitments and stores
 plaintext in RevealedCommitments storage. Validators read that storage directly.
 """
 from __future__ import annotations
-import sqlite3
 from typing import TYPE_CHECKING, Dict, Tuple
 from loguru import logger
 
@@ -15,14 +14,12 @@ if TYPE_CHECKING:
 from common.models.submission import MinerSubmission, parse_reveal_payload
 from common.models.competition import CompetitionSpec
 from common.chain import read_revealed_commitments
-from validator import store
 from common import settings
 
 
 def scan_reveals(
     subtensor: Subtensor,
     competition: CompetitionSpec,
-    conn: sqlite3.Connection,
 ) -> Dict[str, Tuple[MinerSubmission, int]]:
     """
     Read auto-revealed payloads from RevealedCommitments storage.
@@ -37,9 +34,6 @@ def scan_reveals(
     logger.debug(f"scan_reveals | {competition.id} | commit_end_block={competition.commit_end_block} | {len(all_reveals)} hotkeys with reveals: {all_reveals}")
 
     for hotkey, entries in all_reveals.items():
-        if store.is_banned(conn, hotkey):
-            logger.debug(f"Skipping banned hotkey {hotkey[:12]}")
-            continue
         # Accept reveals landing within a small window after commit_end_block —
         # the chain's TLE auto-decrypt lands within ~5 blocks, not exactly on it.
         for raw, reveal_block in entries:

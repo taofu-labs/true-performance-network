@@ -11,9 +11,9 @@
 
 ## Follower hardware
 
-Follower validators do not download models, run Docker prechecks, or benchmark
-submissions. They read scoring results from the primary validator and submit
-weights on chain.
+Follower validators do not download models or benchmark submissions — and
+neither does the primary any more. They read scoring results from the primary
+validator and submit weights on chain.
 
 Minimum:
 
@@ -28,7 +28,9 @@ Comfortable:
 - 8 GB RAM
 - 50+ GB disk
 
-No GPU is required. Docker is not required for follower mode.
+No GPU is required, and Docker is not required in either mode: miners run
+their own benchmarks on the benchmark service, and the validator only verifies
+the resulting run ids.
 
 ## Install dependencies
 
@@ -114,8 +116,8 @@ validator. Running multiple leaders can produce conflicting scoring state.
 | `LAUNCH_HEALTH` | `False` | Set `True` to enable health endpoint on port 9100 |
 | `FOLLOWER_POLL_INTERVAL` | `60` | Seconds between polls of the leader's scoring results |
 | `BENCHMARK_BACKEND` | `mock` | `http` for real coordinator calls; `mock` for offline runs |
-| `COORDINATOR_BASE_URL` | `https://bench.trueperformancenetwork.com` | Benchmark coordinator API |
-| `COORDINATOR_API_KEY` | (unset) | Required when `BENCHMARK_BACKEND=http` |
+| `COORDINATOR_BASE_URL` | `https://bench.trueperformancenetwork.com/api/coordinator` | Benchmark coordinator API. The `/api/coordinator` suffix is required — the bare host serves the Workbench frontend, whose SPA catch-all answers every API path with HTML and a 404 |
+| `COORDINATOR_API_KEY` | (unset) | Required when `BENCHMARK_BACKEND=http`. Needs ADMIN scope; a billing token (`bapi_…`) is rejected by design |
 
 ### Coordinator token scope (leader only)
 
@@ -170,8 +172,8 @@ The validator stores persistent state in:
 - Windows: `%APPDATA%/tpn/validator-storage/`
 
 This includes local scored submission history. On the primary scoring validator,
-it also includes full scoring runs, ban records, and weights history. Wipe with
-`--clean` flag on startup.
+it also includes full scoring runs and weights history. Wipe with the `--clean`
+flag on startup.
 
 ## pm2 management
 

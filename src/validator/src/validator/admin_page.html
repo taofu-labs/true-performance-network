@@ -78,7 +78,7 @@
       <div><label for="name">Name</label><input id="name"></div>
     </div>
     <div style="margin-top:12px"><label for="description">Description (optional)</label><textarea id="description"></textarea></div>
-    <div style="margin-top:12px"><label for="model_repo">Base model HF repo (optional)</label><input id="model_repo" placeholder="org/model"></div>
+    <div style="margin-top:12px"><label for="model_repo">Base model HF repo (optional)</label><input id="model_repo" placeholder="org/model"><div class="hint" id="model_repo_hint">Required when a KL check is on — it is the base miners are compared against.</div></div>
   </section>
 
   <section>
@@ -95,10 +95,10 @@
     <div class="grid">
       <div><label for="competition_type">Type</label>
         <select id="competition_type">
-          <option value="ram_ceiling">RAM ceiling: under memory cap, best score wins</option>
+          <option value="gpu_memory_ceiling">GPU memory ceiling: under memory cap, best score wins</option>
           <option value="benchmark_floor">Benchmark floor: pass scores, lowest memory wins</option>
         </select></div>
-      <div id="memory_box"><label for="max_memory_gib">Memory cap (GiB)</label><input id="max_memory_gib" type="number" min="0" step="any"></div>
+      <div id="memory_box"><label for="max_memory_gib">GPU memory cap (GiB)</label><input id="max_memory_gib" type="number" min="0" step="any"><div class="hint">GPU memory the coordinator measures loading the candidate. Not host RAM — a cap from before 4.59.0 does not transfer.</div></div>
       <div><label for="emission_weight">Share of subnet emission (%)</label><input id="emission_weight" type="number" min="0" max="100" step="any"></div>
     </div>
   </section>
@@ -117,17 +117,22 @@
   </section>
 
   <section>
+    <h2>7 · KL check</h2>
+    <div><label for="kl_corpus_id">Platform corpus ID (blank = no KL check)</label><input id="kl_corpus_id" placeholder="corpus-000002"></div>
+    <div class="hint" id="kl_hint"></div>
+  </section>
+
+  <section>
     <details>
       <summary>Advanced</summary>
       <div class="grid" style="margin-top:12px">
         <div><label for="reveal_grace_blocks">Reveal grace (blocks)</label><input id="reveal_grace_blocks" type="number" min="0"></div>
-        <div><label for="ram_check_context_length">RAM check context length</label><input id="ram_check_context_length" type="number" min="1"></div>
       </div>
     </details>
   </section>
 
   <section>
-    <h2>7 · Review &amp; create</h2>
+    <h2>8 · Review &amp; create</h2>
     <div id="problems"></div>
     <pre id="preview"></pre>
     <button id="submit" class="primary" disabled>Sign &amp; create</button>
@@ -143,9 +148,9 @@ const SIGNED_PATH = "/v1/admin/competitions";  // path the validator sees; signe
 const $ = id => document.getElementById(id);
 
 const PRESETS = {
-  fluid:     { max_memory_gib: 11, ctx: 32768, rewards: [60, 25, 15], benchmarks: ["fluid_knowledge"] },
-  general:   { max_memory_gib: 4,  ctx: 4096,  rewards: [40, 25, 20, 10, 5], benchmarks: ["mmlu", "hellaswag", "arc_challenge", "truthfulqa", "gsm8k"] },
-  reasoning: { max_memory_gib: 16, ctx: 4096,  rewards: [40, 25, 20, 10, 5], benchmarks: ["ifeval", "arc_challenge", "gsm8k"] },
+  fluid:     { max_memory_gib: 11, rewards: [60, 25, 15], benchmarks: ["fluid_knowledge"] },
+  general:   { max_memory_gib: 4,  rewards: [40, 25, 20, 10, 5], benchmarks: ["mmlu", "hellaswag", "arc_challenge", "truthfulqa", "gsm8k"] },
+  reasoning: { max_memory_gib: 16, rewards: [40, 25, 20, 10, 5], benchmarks: ["ifeval", "arc_challenge", "gsm8k"] },
 };
 
 let head = null;       // {block, time_ms, receiver, local_ms}
@@ -324,14 +329,14 @@ function applyPreset(name, announce = true) {
   const p = PRESETS[name];
   document.querySelectorAll("[data-preset]").forEach(b => b.setAttribute("aria-pressed", b.dataset.preset === name));
   if (announce) setStatus(`Loaded ${capitalize(name)} preset: rules, rewards and benchmarks updated below.`, "good");
-  $("competition_type").value = "ram_ceiling";
+  $("competition_type").value = "gpu_memory_ceiling";
   $("max_memory_gib").value = p.max_memory_gib;
-  $("ram_check_context_length").value = p.ctx;
   $("reveal_grace_blocks").value = 150;
   $("emission_weight").value = 25;
   $("distribution_days").value = 7;
   $("rewards").replaceChildren(); p.rewards.forEach(addReward);
   $("benchmarks").replaceChildren(); p.benchmarks.forEach(b => addBenchmark(b));
+  $("kl_corpus_id").value = p.kl_corpus_id || "";
   update();
 }
 
@@ -360,11 +365,11 @@ function buildSpec() {
     benchmarks,
     model_requirements: { format: "gguf" },
     reveal_grace_blocks: num("reveal_grace_blocks"),
-    ram_check_context_length: num("ram_check_context_length"),
     emission_weight: num("emission_weight") / 100,
     distribution_blocks: Math.round(num("distribution_days") * BLOCKS_PER_DAY),
     competition_type: type,
-    max_memory_kb: type === "ram_ceiling" ? Math.round(num("max_memory_gib") * 1048576) : null,
+    max_gpu_memory_kb: type === "gpu_memory_ceiling" ? Math.round(num("max_memory_gib") * 1048576) : null,
+    kl_corpus_id: $("kl_corpus_id").value.trim() || null,
   };
 
   if (!spec.id) problems.push("Enter an ID.");
@@ -380,14 +385,20 @@ function buildSpec() {
   if (Math.abs(sum - 100) > 0.1) problems.push("Reward shares must total 100%.");
   if (!benchmarks.length) problems.push("Add at least one benchmark.");
   if (benchmarks.some(b => b.name === "fluid_knowledge" && !b.fluid_epoch_id)) problems.push("fluid_knowledge needs a Fluid epoch.");
+  if (benchmarks.some(b => b.name === "kl")) problems.push("\"kl\" is reserved for the KL check and cannot name a benchmark.");
+  if (spec.kl_corpus_id && !spec.model_repo) problems.push("A KL check needs the base model HF repo — it is what miners are compared against.");
+  if (spec.kl_corpus_id && type === "benchmark_floor") problems.push("Benchmark floor ranks on memory alone, so the KL check would be recorded but never affect rank.");
   if (!(spec.emission_weight > 0 && spec.emission_weight <= 1)) problems.push("Emission share must be above 0 and at most 100%.");
-  if (type === "ram_ceiling" && !(spec.max_memory_kb > 0)) problems.push("Enter a memory cap.");
+  if (type === "gpu_memory_ceiling" && !(spec.max_gpu_memory_kb > 0)) problems.push("Enter a memory cap.");
   if (!(spec.distribution_blocks >= 0)) problems.push("Enter how many days to pay winners.");
   return { spec, problems };
 }
 
 function update() {
-  $("memory_box").hidden = $("competition_type").value !== "ram_ceiling";
+  $("memory_box").hidden = $("competition_type").value !== "gpu_memory_ceiling";
+  $("kl_hint").textContent = $("kl_corpus_id").value.trim()
+    ? "Miners submit a comparison run against this corpus as {\"b\":\"kl\",\"r\":\"<run id>\"}. Its P99 KL becomes a multiplier on the lowest benchmark score: identical to the base scores x1.00, a Q4_K_M about x0.86, a Q2_K about x0.27. An unverifiable run scores x0, which zeroes the final score."
+    : "No KL check: miners rank on benchmarks alone, exactly as before.";
   const days = num("distribution_days");
   $("distribution_hint").textContent = days >= 0 ? `${Math.round(days * BLOCKS_PER_DAY)} blocks` : "";
   const { spec, problems } = buildSpec();

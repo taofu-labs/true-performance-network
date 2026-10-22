@@ -1,3 +1,8 @@
+import pathlib
+
+import pytest
+from pydantic import ValidationError
+
 from common.models.competition import CompetitionSpec
 from validator import store
 
@@ -62,13 +67,6 @@ def test_bump_stage1_attempts_increments_and_caps(tmp_path):
     assert store.STAGE1_MAX_ATTEMPTS == 3
 
 
-def test_ban_and_is_banned(tmp_path):
-    conn = make_conn(tmp_path)
-    assert store.is_banned(conn, "hk1") is False
-    store.ban(conn, "hk1", "cheating")
-    assert store.is_banned(conn, "hk1") is True
-
-
 
 def test_record_and_get_latest_weights(tmp_path):
     conn = make_conn(tmp_path)
@@ -118,7 +116,6 @@ def test_insert_and_get_candidate(tmp_path):
     candidate = store.get_candidate(conn, "comp1", "hk1")
     assert candidate["status"] == "standby"
     assert candidate["rank"] == 0
-    assert candidate["gguf_file"] is None
     assert candidate["measured_memory_kb"] is None
 
 
@@ -133,18 +130,203 @@ def test_set_candidate_status(tmp_path):
     assert candidate["failure_reason"] == "provenance fail"
 
 
-def test_mark_precheck_passed_records_fields_without_changing_status(tmp_path):
-    """There is no benchmark queue any more: the caller scores the candidate
-    immediately after this, so the status is left for that step to set."""
+def test_insert_revealed_candidates_persists_measured_memory(tmp_path):
+    """The memory figure comes out of stage-1 verification, so it is written
+    with the candidate rather than filled in by a later step."""
     conn = make_conn(tmp_path)
-    store.insert_revealed_candidate(conn, "comp1", "hk1", rank=0, submission_json="{}", reveal_block=10, status="prechecking")
-    conn.commit()
+    store.insert_revealed_candidates(conn, "comp1", [{
+        "hotkey": "hk1", "rank": 0, "submission_json": "{}", "reveal_block": 10,
+        "status": "standby", "verified_scores": {"mmlu": 0.8}, "measured_memory_kb": 1234,
+    }])
+    assert store.get_candidate(conn, "comp1", "hk1")["measured_memory_kb"] == 1234
 
-    store.mark_precheck_passed(conn, "comp1", "hk1", gguf_file="model.gguf", measured_memory_kb=1234)
+
+def test_insert_revealed_candidates_is_idempotent(tmp_path):
+    """A scoring pass that dies partway leaves rows behind and the next tick
+    re-runs the whole pass. A plain INSERT would raise on the primary key and
+    burn the competition's stage-1 attempts."""
+    conn = make_conn(tmp_path)
+    row = dict(hotkey="hk1", rank=0, submission_json="{}", reveal_block=5,
+               status="standby", verified_scores={"mmlu": 0.8}, measured_memory_kb=900)
+    store.insert_revealed_candidates(conn, "comp1", [row])
+    store.insert_revealed_candidates(
+        conn, "comp1", [{**row, "status": "done", "measured_memory_kb": 950, "rank": 1}],
+    )
+
     candidate = store.get_candidate(conn, "comp1", "hk1")
-    assert candidate["status"] == "prechecking"
-    assert candidate["gguf_file"] == "model.gguf"
-    assert candidate["measured_memory_kb"] == 1234
+    assert candidate["status"] == "done"       # the re-run's values win
+    assert candidate["measured_memory_kb"] == 950
+    assert candidate["rank"] == 1
+    assert len(store.all_candidates_for_competition(conn, "comp1")) == 1
+
+
+def test_migration_rewrites_stored_competition_specs(tmp_path):
+    """Stored specs are JSON and are validated on every leader tick, so one
+    row still saying `ram_ceiling` would take down the whole loop, not just
+    its own competition."""
+    import json as _json
+    import sqlite3
+
+    from common.models.competition import CompetitionSpec
+
+    path = tmp_path / "specs.db"
+    old_db = sqlite3.connect(path)
+    old_db.executescript("""
+        CREATE TABLE competitions (id TEXT PRIMARY KEY, spec_json TEXT NOT NULL,
+                                   created_at REAL NOT NULL, updated_at REAL NOT NULL);
+    """)
+    stored = {
+        "id": "old", "name": "old", "start_block": 0, "commit_end_block": 10,
+        "scoring_end_block": 20, "top_n": 1, "emission_distribution": [1.0],
+        "benchmarks": [{"name": "mmlu", "min_score": 0.5}],
+        "competition_type": "ram_ceiling", "max_memory_kb": 4096,
+        "ram_check_context_length": 4096,
+    }
+    old_db.execute("INSERT INTO competitions VALUES ('old', ?, 1.0, 1.0)", (_json.dumps(stored),))
+    old_db.commit()
+    old_db.close()
+
+    conn = store.init_db(path)
+    spec_json = conn.execute("SELECT spec_json FROM competitions WHERE id = 'old'").fetchone()[0]
+    migrated = _json.loads(spec_json)
+    assert migrated["competition_type"] == "gpu_memory_ceiling"
+    assert migrated["max_gpu_memory_kb"] == 4096
+    assert "max_memory_kb" not in migrated
+    assert "ram_check_context_length" not in migrated
+    # The whole point: it loads again.
+    assert CompetitionSpec.model_validate(migrated).max_gpu_memory_kb == 4096
+
+
+def test_migration_loads_a_real_production_spec(tmp_path):
+    """Pinned against a spec captured from the live validator
+    (val0.trueperformancenetwork.com, tpn-001). Every stored spec there is
+    `ram_ceiling` with max_memory_kb and ram_check_context_length, and none of
+    them load under the current model — so without this migration the leader
+    raises on every tick, for every competition, not just the stale one.
+
+    It also carries a `weight` key on each benchmark that BenchmarkTask does
+    not define, which must keep being ignored rather than becoming an error.
+    """
+    import json as _json
+    import sqlite3
+
+    from common.models.competition import CompetitionSpec, CompetitionType
+
+    raw = _json.loads(
+        (pathlib.Path(__file__).parent / "fixtures" / "legacy_competition_spec.json").read_text()
+    )
+    assert raw["competition_type"] == "ram_ceiling"          # the captured shape
+    with pytest.raises(ValidationError):
+        CompetitionSpec.model_validate(raw)                  # ... does not load today
+
+    path = tmp_path / "prod.db"
+    old_db = sqlite3.connect(path)
+    old_db.executescript("""
+        CREATE TABLE competitions (id TEXT PRIMARY KEY, spec_json TEXT NOT NULL,
+                                   created_at REAL NOT NULL, updated_at REAL NOT NULL);
+    """)
+    old_db.execute("INSERT INTO competitions VALUES (?, ?, 1.0, 1.0)", (raw["id"], _json.dumps(raw)))
+    old_db.commit()
+    old_db.close()
+
+    conn = store.init_db(path)
+    migrated = _json.loads(
+        conn.execute("SELECT spec_json FROM competitions WHERE id = ?", (raw["id"],)).fetchone()[0]
+    )
+    spec = CompetitionSpec.model_validate(migrated)
+    assert spec.competition_type == CompetitionType.GPU_MEMORY_CEILING
+    assert spec.max_gpu_memory_kb == raw["max_memory_kb"]    # the cap is carried over verbatim
+    assert [t.name for t in spec.benchmarks] == [b["name"] for b in raw["benchmarks"]]
+
+
+def test_migration_drops_an_unpinned_kl_corpus(tmp_path):
+    """CompetitionSpec now refuses kl_corpus_id without model_repo, and stored
+    specs are validated on every leader tick — so one such row would stall the
+    whole loop. The corpus is dropped so the competition still loads and scores
+    on its benchmarks, which is what it effectively did anyway: an unpinned base
+    made the multiplier free for everyone."""
+    import json as _json
+    import sqlite3
+
+    from common.models.competition import CompetitionSpec
+
+    path = tmp_path / "unpinned.db"
+    old_db = sqlite3.connect(path)
+    old_db.executescript("""
+        CREATE TABLE competitions (id TEXT PRIMARY KEY, spec_json TEXT NOT NULL,
+                                   created_at REAL NOT NULL, updated_at REAL NOT NULL);
+    """)
+    stored = {
+        "id": "unpinned", "name": "unpinned", "start_block": 0, "commit_end_block": 10,
+        "scoring_end_block": 20, "top_n": 1, "emission_distribution": [1.0],
+        "benchmarks": [{"name": "mmlu", "min_score": 0.5}],
+        "competition_type": "gpu_memory_ceiling", "max_gpu_memory_kb": 1000,
+        "kl_corpus_id": "corpus-000002",   # no model_repo
+    }
+    old_db.execute("INSERT INTO competitions VALUES ('unpinned', ?, 1.0, 1.0)", (_json.dumps(stored),))
+    old_db.commit()
+    old_db.close()
+
+    conn = store.init_db(path)
+    migrated = _json.loads(
+        conn.execute("SELECT spec_json FROM competitions WHERE id = 'unpinned'").fetchone()[0]
+    )
+    assert "kl_corpus_id" not in migrated
+    # The whole point: the leader can load it again instead of raising every tick.
+    assert CompetitionSpec.model_validate(migrated).kl_corpus_id is None
+
+
+def test_migration_keeps_a_properly_pinned_kl_corpus(tmp_path):
+    import json as _json
+    import sqlite3
+
+    path = tmp_path / "pinned.db"
+    old_db = sqlite3.connect(path)
+    old_db.executescript("""
+        CREATE TABLE competitions (id TEXT PRIMARY KEY, spec_json TEXT NOT NULL,
+                                   created_at REAL NOT NULL, updated_at REAL NOT NULL);
+    """)
+    stored = {
+        "id": "pinned", "name": "pinned", "start_block": 0, "commit_end_block": 10,
+        "scoring_end_block": 20, "top_n": 1, "emission_distribution": [1.0],
+        "benchmarks": [{"name": "mmlu", "min_score": 0.5}],
+        "competition_type": "gpu_memory_ceiling", "max_gpu_memory_kb": 1000,
+        "kl_corpus_id": "corpus-000002", "model_repo": "Qwen/Qwen2.5-0.5B-Instruct",
+    }
+    old_db.execute("INSERT INTO competitions VALUES ('pinned', ?, 1.0, 1.0)", (_json.dumps(stored),))
+    old_db.commit()
+    old_db.close()
+
+    conn = store.init_db(path)
+    migrated = _json.loads(
+        conn.execute("SELECT spec_json FROM competitions WHERE id = 'pinned'").fetchone()[0]
+    )
+    assert migrated["kl_corpus_id"] == "corpus-000002"
+
+
+def test_migration_drops_banned_hotkeys_and_renames_memory_column(tmp_path):
+    """An existing DB carrying the pre-removal schema must come forward without
+    manual surgery: banning is gone and the memory column is a measurement."""
+    import sqlite3
+
+    path = tmp_path / "old.db"
+    old = sqlite3.connect(path)
+    old.executescript("""
+        CREATE TABLE banned_hotkeys (hotkey TEXT PRIMARY KEY, reason TEXT NOT NULL, banned_at REAL NOT NULL);
+        CREATE TABLE scoring_results (
+            competition_id TEXT NOT NULL, hotkey TEXT NOT NULL, final_score REAL NOT NULL,
+            max_memory_kb INTEGER NOT NULL, finalized_at REAL NOT NULL,
+            PRIMARY KEY (competition_id, hotkey));
+    """)
+    old.execute("INSERT INTO scoring_results VALUES ('comp1', 'hk1', 0.9, 4096, 1.0)")
+    old.commit()
+    old.close()
+
+    conn = store.init_db(path)
+    tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    assert "banned_hotkeys" not in tables
+    row = conn.execute("SELECT * FROM scoring_results WHERE hotkey = 'hk1'").fetchone()
+    assert row["measured_memory_kb"] == 4096  # the row survives the rename
 
 
 def test_candidates_by_status_filters_and_orders_by_rank(tmp_path):
@@ -314,8 +496,8 @@ def test_migration_preserves_rows_in_superseded_benchmark_runs(tmp_path):
 
 def test_record_and_read_scoring_results(tmp_path):
     conn = make_conn(tmp_path)
-    store.record_scoring_result(conn, "comp1", "hk1", final_score=0.9, max_memory_kb=1000)
-    store.record_scoring_result(conn, "comp1", "hk2", final_score=0.5, max_memory_kb=2000)
+    store.record_scoring_result(conn, "comp1", "hk1", final_score=0.9, measured_memory_kb=1000)
+    store.record_scoring_result(conn, "comp1", "hk2", final_score=0.5, measured_memory_kb=2000)
     conn.commit()
 
     results = store.scoring_results_for_competition(conn, "comp1")
@@ -324,8 +506,8 @@ def test_record_and_read_scoring_results(tmp_path):
 
 def test_record_scoring_result_is_idempotent_on_conflict(tmp_path):
     conn = make_conn(tmp_path)
-    store.record_scoring_result(conn, "comp1", "hk1", final_score=0.5, max_memory_kb=1000)
-    store.record_scoring_result(conn, "comp1", "hk1", final_score=0.9, max_memory_kb=1000)
+    store.record_scoring_result(conn, "comp1", "hk1", final_score=0.5, measured_memory_kb=1000)
+    store.record_scoring_result(conn, "comp1", "hk1", final_score=0.9, measured_memory_kb=1000)
     conn.commit()
 
     results = store.scoring_results_for_competition(conn, "comp1")

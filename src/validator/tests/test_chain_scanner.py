@@ -1,10 +1,7 @@
-import sqlite3
-
 import pytest
 
 from common.models.competition import BenchmarkTask, CompetitionSpec
 from common.models.submission import BenchmarkRun, build_reveal_payload
-from validator import store
 from validator.chain_scanner import scan_reveals
 
 
@@ -31,7 +28,6 @@ def make_payload(competition_id="comp1") -> str:
         repository="user/repo",
         file="model.gguf",
         file_sha256="a" * 64,
-        max_memory=1000,
         runs=[BenchmarkRun(b="mmlu", r="r100")],
         huggingface_revision="a" * 40,
     )
@@ -40,13 +36,6 @@ def make_payload(competition_id="comp1") -> str:
 class FakeSubtensor:
     def __init__(self, reveals):
         self._reveals = reveals
-
-
-def make_db():
-    conn = sqlite3.connect(":memory:")
-    conn.row_factory = sqlite3.Row
-    conn.executescript(store._SCHEMA)
-    return conn
 
 
 @pytest.mark.parametrize("reveal_block,accepted", [
@@ -61,19 +50,8 @@ def test_scan_reveals_block_window(monkeypatch, reveal_block, accepted):
     reveals = {"hk1": [(make_payload(), reveal_block)]}
     monkeypatch.setattr("validator.chain_scanner.read_revealed_commitments", lambda subtensor, netuid: reveals)
 
-    result = scan_reveals(FakeSubtensor(reveals), spec, make_db())
+    result = scan_reveals(FakeSubtensor(reveals), spec)
     assert set(result) == ({"hk1"} if accepted else set())
-
-
-def test_scan_reveals_skips_banned_hotkey(monkeypatch):
-    spec = make_spec(commit_end_block=100)
-    reveals = {"hk1": [(make_payload(), 100)]}
-    monkeypatch.setattr("validator.chain_scanner.read_revealed_commitments", lambda subtensor, netuid: reveals)
-
-    conn = make_db()
-    store.ban(conn, "hk1", "test ban")
-    result = scan_reveals(FakeSubtensor(reveals), spec, conn)
-    assert result == {}
 
 
 def test_scan_reveals_skips_wrong_competition_id(monkeypatch):
@@ -81,7 +59,7 @@ def test_scan_reveals_skips_wrong_competition_id(monkeypatch):
     reveals = {"hk1": [(make_payload(competition_id="other-comp"), 100)]}
     monkeypatch.setattr("validator.chain_scanner.read_revealed_commitments", lambda subtensor, netuid: reveals)
 
-    result = scan_reveals(FakeSubtensor(reveals), spec, make_db())
+    result = scan_reveals(FakeSubtensor(reveals), spec)
     assert result == {}
 
 
@@ -90,7 +68,7 @@ def test_scan_reveals_skips_malformed_payload(monkeypatch):
     reveals = {"hk1": [("not json", 100)]}
     monkeypatch.setattr("validator.chain_scanner.read_revealed_commitments", lambda subtensor, netuid: reveals)
 
-    result = scan_reveals(FakeSubtensor(reveals), spec, make_db())
+    result = scan_reveals(FakeSubtensor(reveals), spec)
     assert result == {}
 
 
@@ -99,7 +77,7 @@ def test_scan_reveals_returns_reveal_block(monkeypatch):
     reveals = {"hk1": [(make_payload(), 103)]}
     monkeypatch.setattr("validator.chain_scanner.read_revealed_commitments", lambda subtensor, netuid: reveals)
 
-    result = scan_reveals(FakeSubtensor(reveals), spec, make_db())
+    result = scan_reveals(FakeSubtensor(reveals), spec)
     submission, reveal_block = result["hk1"]
     assert reveal_block == 103
     assert submission.competition_id == "comp1"

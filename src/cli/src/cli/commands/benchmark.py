@@ -14,11 +14,15 @@ from rich.table import Table
 
 from cli.utils.config import load_competition_config, save_competition_config
 from cli.utils.context import get as get_ctx, resolve_competition_or_exit
+from common.models.competition import KL_RUN_NAME
 from common.urls import InvalidBaseUrl
 from competition.billing_client import (
+    COMPARISON_QUOTE_PATH,
+    COMPARISON_SUBMIT_PATH,
     DEFAULT_BILLING_URL,
     BillingClient,
     BillingError,
+    build_comparison_request,
     build_request,
 )
 
@@ -78,6 +82,14 @@ def benchmark(
 
     wanted = [t.name for t in spec.benchmarks]
     epochs = {t.name: t.fluid_epoch_id for t in spec.benchmarks}
+    if spec.kl_corpus_id:
+        if not spec.model_repo:
+            console.print(
+                f"[red]{competition_id} asks for a KL check but pins no base model.[/red]\n"
+                "[dim]The competition is misconfigured; ask the operator to set model_repo.[/dim]"
+            )
+            raise typer.Exit(1)
+        wanted.append(KL_RUN_NAME)
     if only:
         requested = [n.strip() for n in only.split(",") if n.strip()]
         unknown = [n for n in requested if n not in wanted]
@@ -105,6 +117,27 @@ def benchmark(
         console.print(f"[red]{e}[/red]")
         raise typer.Exit(1)
 
+    # The KL check is a comparison, not a benchmark: different request shape,
+    # different billing path, same quote -> submit -> run id flow.
+    def request_for(name: str) -> tuple:
+        if name == KL_RUN_NAME:
+            return (
+                build_comparison_request(
+                    cfg["repository"], cfg["huggingface_revision"], cfg["file"],
+                    spec.model_repo, spec.kl_corpus_id,
+                ),
+                COMPARISON_QUOTE_PATH,
+                COMPARISON_SUBMIT_PATH,
+            )
+        return (
+            build_request(
+                cfg["repository"], cfg["huggingface_revision"], cfg["file"], name,
+                fluid_epoch_id=epochs[name],
+            ),
+            "/benchmarks/quote",
+            "/benchmarks",
+        )
+
     console.print(
         f"[bold]Benchmarking[/bold] [cyan]{cfg['repository']}[/cyan]"
         f" [dim]@{cfg['huggingface_revision'][:12]}/{cfg['file']}[/dim]\n"
@@ -116,16 +149,17 @@ def benchmark(
     if not force_price:
         total_cents = 0
         for name in todo:
-            request = build_request(cfg["repository"], cfg["huggingface_revision"], cfg["file"], name, fluid_epoch_id=epochs[name])
+            request, quote_path, _ = request_for(name)
             try:
-                quotes[name] = client.quote(request)
+                quotes[name] = client.quote(request, path=quote_path)
             except BillingError as e:
                 console.print(f"[red]Quote failed for {name}: {e}[/red]")
                 raise typer.Exit(1)
             total_cents += quotes[name].payable_cents
 
         table = Table(show_header=True, header_style="bold")
-        table.add_column("Benchmark")
+        table.add_column("Run")
+        table.add_column("Kind")
         table.add_column("Price", justify="right")
         table.add_column("Notes")
         for name in todo:
@@ -135,7 +169,8 @@ def benchmark(
                 notes.append("cached result")
             if q.review_required:
                 notes.append("needs review")
-            table.add_row(name, f"${q.charged_cents / 100:,.2f}", ", ".join(notes) or "—")
+            kind = "KL check" if name == KL_RUN_NAME else "benchmark"
+            table.add_row(name, kind, f"${q.charged_cents / 100:,.2f}", ", ".join(notes) or "—")
         console.print(table)
 
         credit = next(iter(quotes.values())).available_credit_cents
@@ -158,9 +193,9 @@ def benchmark(
     runs = dict(existing)
     failures = []
     for name in todo:
-        request = build_request(cfg["repository"], cfg["huggingface_revision"], cfg["file"], name, fluid_epoch_id=epochs[name])
+        request, _, submit_path = request_for(name)
         try:
-            order = client.submit(request, quotes.get(name))
+            order = client.submit(request, quotes.get(name), path=submit_path)
             console.print(f"[dim]{name}: order {order.id} ({order.status}) — waiting for run id[/dim]")
             order = client.wait_for_run_id(order.id)
         except BillingError as e:
@@ -192,8 +227,10 @@ def benchmark(
 
 def _print_runs(runs: dict, wanted: list) -> None:
     table = Table(show_header=True, header_style="bold")
-    table.add_column("Benchmark")
+    table.add_column("Run")
+    table.add_column("Kind")
     table.add_column("Run id")
     for name in wanted:
-        table.add_row(name, runs.get(name) or "[dim]—[/dim]")
+        kind = "KL check" if name == KL_RUN_NAME else "benchmark"
+        table.add_row(name, kind, runs.get(name) or "[dim]—[/dim]")
     console.print(table)

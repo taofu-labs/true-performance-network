@@ -1,14 +1,21 @@
 import json
 import re
 from typing import Dict, List, Optional
-from pydantic import BaseModel, field_validator
+from pydantic import AliasChoices, BaseModel, Field, field_validator
 
 
 # Coordinator run ids are either a short id ("r1234") or a full UUID. Both are
 # accepted by the coordinator's /status/:run_id route.
 _RUN_ID_RE = re.compile(r"^(r[1-9][0-9]{0,18}|[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})$")
 
-PAYLOAD_SPEC_VERSION = 2
+PAYLOAD_SPEC_VERSION = 3
+
+# Specs a reveal may still carry. Spec 3 dropped the `max_memory` self-report,
+# which pydantic ignores as an extra field, so a spec-2 payload is otherwise
+# identical and still scores correctly. Rejecting it would strand every miner
+# who committed before the validator upgraded — their reveal is already sealed
+# on chain and cannot be re-made.
+SUPPORTED_SPEC_VERSIONS = frozenset({2, PAYLOAD_SPEC_VERSION})
 
 
 """Coordinator benchmark run submitted by the miner"""
@@ -32,7 +39,6 @@ class MinerSubmission(BaseModel):
     repository: str  # bare HF repo ID: "user/repo"
     file: str
     file_sha256: str
-    max_memory: int  # maximum memory in KB the model consumes at inference time (self-reported)
     huggingface_revision: str  # immutable HF commit SHA the model was uploaded at
 
     @field_validator("repository")
@@ -57,18 +63,13 @@ class MinerSubmission(BaseModel):
             raise ValueError("file_sha256 must be 64 hex characters")
         return v.lower()
 
-    @field_validator("max_memory")
-    @classmethod
-    def max_memory_must_be_positive(cls, v: int) -> int:
-        if v <= 0:
-            raise ValueError("max_memory must be positive")
-        return v
-
     @field_validator("spec")
     @classmethod
-    def spec_must_be_current(cls, v: int) -> int:
-        if v != PAYLOAD_SPEC_VERSION:
-            raise ValueError(f"unsupported payload spec {v}, expected {PAYLOAD_SPEC_VERSION}")
+    def spec_must_be_supported(cls, v: int) -> int:
+        if v not in SUPPORTED_SPEC_VERSIONS:
+            raise ValueError(
+                f"unsupported payload spec {v}, expected one of {sorted(SUPPORTED_SPEC_VERSIONS)}"
+            )
         return v
 
     @property
@@ -84,7 +85,14 @@ class ScoringResult(BaseModel):
     hotkey: str
     competition_id: str
     final_score: float
-    max_memory_kb: int
+    # GPU bytes the coordinator measured, in KB. Not a miner claim.
+    #
+    # Followers are run by other operators and upgrade at their own pace, so
+    # this is read over the wire from a leader that may be on either version.
+    # The old name is accepted so a mixed-version pair keeps setting weights.
+    measured_memory_kb: int = Field(
+        validation_alias=AliasChoices("measured_memory_kb", "max_memory_kb")
+    )
 
 
 # ── Commit/reveal helpers ─────────────────────────────────────────────────────
@@ -94,7 +102,6 @@ def build_reveal_payload(
     repository: str,
     file: str,
     file_sha256: str,
-    max_memory: int,
     runs: List[BenchmarkRun],
     huggingface_revision: str,
 ) -> str:
@@ -105,7 +112,6 @@ def build_reveal_payload(
         "repository": repository,
         "file": file,
         "file_sha256": file_sha256,
-        "max_memory": max_memory,
         "huggingface_revision": huggingface_revision,
         "runs": [{"b": r.b, "r": r.r} for r in runs],
     }

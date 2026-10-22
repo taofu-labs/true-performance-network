@@ -6,10 +6,12 @@ TPN rewards miners for producing **quantized GGUF versions of a base model** tha
 
 | `competition_type` | Pass/fail gate | Ranked by |
 |---|---|---|
-| `benchmark_floor` (default) | Every benchmark ≥ its `min_score` | **Lowest measured RAM** wins |
-| `ram_ceiling` | Measured RAM ≤ `max_memory_kb` | **Highest minimum benchmark score** (your weakest benchmark) |
+| `benchmark_floor` (default) | Every benchmark ≥ its `min_score` | **Lowest measured GPU memory** wins |
+| `gpu_memory_ceiling` | Measured GPU memory ≤ `max_gpu_memory_kb` | **Highest minimum benchmark score** (your weakest benchmark), times the KL fidelity multiplier |
 
-In `ram_ceiling`, a model is only as good as its weakest benchmark — a strong result on one cannot buy rank for a weak result on another.
+In `gpu_memory_ceiling`, a model is only as good as its weakest benchmark — a strong result on one cannot buy rank for a weak result on another.
+
+**Memory is measured by the benchmark service**, not by you and not by the validator: it is the GPU memory your model took to load during its runs, reported on every coordinator result. You no longer report a memory figure at all.
 
 Competitions are served by the leader validator (`GET /v1/competitions`); `tpn competitions` lists them.
 
@@ -23,7 +25,7 @@ start_block ──OPEN──▶ commit_end_block ──REVEALING──▶ +revea
 
 - **OPEN** — upload, benchmark, commit.
 - **REVEALING** — chain decrypts the timelocked commitments; validators wait out the grace period.
-- **SCORING** — the leader verifies, ranks and prechecks submissions.
+- **SCORING** — the leader verifies every committed run, then ranks and scores submissions from what those runs report.
 - **DISTRIBUTING** — validators set weights from the final ranking; emissions flow to winners.
 - **COMPLETE** — the competition no longer receives emissions.
 
@@ -34,24 +36,30 @@ start_block ──OPEN──▶ commit_end_block ──REVEALING──▶ +revea
 3. **Benchmark** the model yourself on the benchmark service (`tpn benchmark`, paid by you). Every run must be **completed** before the scoring phase starts — a run still in progress then scores 0.0.
 4. **Commit** (`tpn commit`): writes a TimeLocked (TLE-encrypted) payload to chain:
    ```json
-   {"spec":2,"competition_id":"…","repository":"user/repo","file":"model.gguf",
-    "file_sha256":"…","max_memory":<KB>,"huggingface_revision":"<sha>",
+   {"spec":3,"competition_id":"…","repository":"user/repo","file":"model.gguf",
+    "file_sha256":"…","huggingface_revision":"<sha>",
     "runs":[{"b":"mmlu","r":"r1234"}, …]}
    ```
    Nobody can read it until the chain auto-decrypts it around `commit_end_block`, so submissions cannot be copied.
-5. **Publish** the HF repo (`tpn publish`) before scoring starts. A private repo fails precheck.
+
+   A payload committed under spec 2 (which also carried a `max_memory` field) is still accepted, so a commit made just before a validator upgrade is not lost. Spec 1 predates run ids and is rejected.
+5. **Publish** the HF repo (`tpn publish`) so the benchmark service can read it, and **leave it public**. The coordinator records whether the repo was private or gated when it read it, and a run against a non-public repo scores 0.0.
 6. **Monitor** with `tpn status`, or the leader's `GET /v1/state/competitions/{id}` (per-candidate status and failure reasons).
 
 ## Validator side: leader and followers
 
-- One **leader** validator does the real work: reads chain, verifies runs, runs the precheck container, ranks, and publishes results via its API.
+- One **leader** validator does the real work: reads chain, verifies runs against the benchmark coordinator, ranks, scores, and publishes results via its API. It downloads no models and runs no inference — every number it scores on comes from a coordinator run.
 - **Followers** download nothing. They poll the leader's final results, compute the same emission weights locally and set weights on chain. When no competition is distributing, every validator copies stake-weighted consensus weights from chain.
 
 ## Scoring pipeline (leader)
 
-### Stage 1 — reveal, verify, rank
+Scoring is one stage. The leader verifies every committed run, reads the scores
+and the measured memory out of them, ranks, scores and finalizes — all in one
+pass, with no model download and no local inference.
 
-1. **Scan reveals** from chain `RevealedCommitments`. A reveal is accepted only if it landed within `commit_end_block ± reveal_grace_blocks`, parses as a valid payload, and matches the competition id. **Banned hotkeys are skipped**; unregistered hotkeys are dropped.
+### Stage 1 — reveal, verify, rank, score
+
+1. **Scan reveals** from chain `RevealedCommitments`. A reveal is accepted only if it landed within `commit_end_block ± reveal_grace_blocks`, parses as a valid payload, and matches the competition id. Unregistered hotkeys are dropped.
 2. **Dedup**: if several hotkeys reveal the same `file_sha256`, the **earliest reveal block** wins; the others fail as duplicates. Copying someone's file gains nothing.
 3. **Verify runs**: for each competition benchmark, the leader fetches your run id from the benchmark coordinator and accepts it only if:
    - status is `completed`
@@ -61,26 +69,20 @@ start_block ──OPEN──▶ commit_end_block ──REVEALING──▶ +revea
    - where HF exposes an LFS sha256, it matches your `file_sha256`
    - the run covers that benchmark, the benchmark completed, and it has a score
 
-   Any failure → **that benchmark scores 0.0**. Not fatal by itself, but it will almost certainly fail the floors later. A missing run id also scores 0.0.
-4. **Rank** candidates by provisional final score from the verified scores. For `benchmark_floor`, RAM is not yet measured, so this ranking uses your **self-reported** `max_memory`.
+   Any failure → **that benchmark scores 0.0**. Not fatal by itself, but it will almost certainly fail the floors. A missing run id also scores 0.0.
+4. **Verify the KL run** when the competition sets a `kl_corpus_id` — see *The KL check* below.
+5. **Read the measured memory**: the largest GPU figure any *verified* run reported. The KL run is the authoritative source (it loads your model against the competition's base); benchmark runs carry a suite-level figure too, so a competition without a KL check still gets a number. A rejected run's figure is ignored — it describes some other model.
+6. **Rank** candidates by final score from the verified scores and the measured memory.
+7. **Score**, in rank order, until `top_n` candidates are through. A candidate is scored when:
+   - every verified benchmark score is ≥ its `min_score`
+   - a verified run actually reported a memory figure (no figure → not scored; a missing number must never read as "fits")
+   - for `gpu_memory_ceiling`: measured memory is ≤ `max_gpu_memory_kb`
 
-### Stage 2 — precheck, in rank order
+   A candidate that fails any of these is marked `failed` and the next-ranked one takes its slot (backfill).
 
-The leader prechecks **one candidate per loop tick**, top rank first, until `top_n` candidates are scored, candidates run out, or `scoring_end_block` hits. A candidate that fails is marked `failed` and the next one moves up (backfill).
-
-Precheck passes when:
-- the HF repo is public
-- the committed filename exists at the committed revision
-- the **precheck container** (below) accepts the model
-- measured RAM is within **±1%** of your reported `max_memory` (`RAM_CHECK_LYING_TOLERANCE`, default 0.01)
-
-After precheck:
-- every verified benchmark score must be ≥ its `min_score`
-- for `ram_ceiling`: measured RAM must be ≤ `max_memory_kb`
-
-Then the candidate is **scored**:
-- `benchmark_floor`: `final_score = −measured_memory_kb` (less RAM ranks higher)
-- `ram_ceiling`: `final_score = min(verified benchmark scores)`
+   Then:
+   - `benchmark_floor`: `final_score = −measured_memory_kb` (less memory ranks higher)
+   - `gpu_memory_ceiling`: `final_score = min(verified benchmark scores) × kl_norm`
 
 ### Stage 3 — finalize and set weights
 
@@ -93,30 +95,34 @@ While a competition is distributing, each validator:
 - drops winners no longer registered (their share is not redistributed)
 - burns any unallocated weight to uid 0
 
-## The precheck container
+## The KL check
 
-A Docker image (`ghcr.io/taofu-labs/tpn-precheck`, built from `shared/validation/precheck.Dockerfile`), public on GHCR. The leader starts one per competition. It runs a small FastAPI service with a pinned CPU build of llama.cpp (`b10020`).
+A competition with a `kl_corpus_id` requires one extra run: a **comparison** of your
+model against the competition's base model (`model_repo`), measuring how far your
+quantization moved the output distribution. Run it with `tpn benchmark` like any
+other, and commit its run id under the name `kl`.
 
-**On startup** it downloads the competition's base model (`model_repo`) once. `/health` reports ready when done.
+The validator accepts the run only if it measured *your* committed artifact against
+*this* competition's base on *this* competition's private platform corpus. It then
+prices the divergence:
 
-**`POST /check`** (validator path) downloads your GGUF at the exact committed repo/revision/filename (rejects files > 50 GiB), runs three independent checks, then deletes the file:
-
-1. **Provenance — is this really derived from the base model?**
-   - *Tokenizer*: tokenizer type, vocab size and BPE merge count must match exactly; individual entries may differ < 1% (allows added chat-template tokens).
-   - *Embedding CKA*: samples 4096 rows of `token_embd.weight` from both models, dequantizes them and computes linear Centered Kernel Alignment. Must be **≥ 0.80**. CKA is invariant to rotation, permutation and scaling, so quantizing or pruning the real base model keeps it high; an unrelated or from-scratch/distilled model falls below the threshold.
-   - Fail → `provenance fail`.
-2. **RAM measurement**: runs `llama-cli` CPU-only (`-ngl 0`, `-c <ram_check_context_length>` (default 4096), f16 KV cache, `--no-mmap`, generates 1 token) and parses llama.cpp's logged CPU weight and KV-cache buffer sizes. **Measured RAM = weights + KV cache.** Load failure, timeout (600s), OOM kill, or no CPU weight buffer → fail.
-3. **sha256** of the downloaded file, compared against your committed `file_sha256`. **A mismatch permanently bans your hotkey** — banned hotkeys are skipped in every future competition.
-
-**`POST /check-local`** (miner self-check) reads a file from a `/data` volume mount and runs the RAM measurement and sha256 (no provenance). Use it to get the exact `max_memory` value before committing:
-
-```bash
-docker run -d -p 8080:8080 -v $(pwd):/data ghcr.io/taofu-labs/tpn-precheck
-curl -X POST localhost:8080/check-local \
-  -H 'content-type: application/json' \
-  -d '{"path":"/data/my-model.gguf","context_length":4096}'
-# commit ram.ram_bytes / 1024 as max_memory (KB)
 ```
+kl_norm = exp(−KL_p99)
+```
+
+P99 on the `control_to_candidate` pairing, in nats. The control is the base model
+converted to F16 on the same pod and run through the same engine, so engine noise
+cancels and only quantization damage is left. Measured anchors: a Q4_K_M reaches
+0.146 nats at P99 → ×0.865; a Q2_K around 1.30 → ×0.27.
+
+That multiplier scales your benchmark composite, so fidelity and accuracy both
+count. **A missing, failed or unverifiable KL run gives `kl_norm = 0.0`**, which
+zeroes the final score — an unverifiable run must never read as perfect fidelity.
+A candidate scoring 0 is not scored at all, so it cannot occupy a payable rank
+even when the field is thin. Nothing about a failed KL check bans a hotkey.
+
+`benchmark_floor` competitions ignore the multiplier: that mode ranks on negated
+memory, which a (0,1] factor would *improve*.
 
 ## Ways to lose (in pipeline order)
 
@@ -125,19 +131,18 @@ curl -X POST localhost:8080/check-local \
 | Reveal outside grace window / malformed payload / wrong competition id | Not considered |
 | Same sha256 as an earlier reveal | Dedup loss |
 | Run not completed, or benchmarked a different repo/revision/file | That benchmark = 0.0 |
-| Repo private, or file missing at revision | Precheck fail (backfilled) |
-| Tokenizer or CKA mismatch with base model | Precheck fail |
-| llama-cli can't load the model | Precheck fail |
-| Reported `max_memory` off by > 1% from measured RAM | Precheck fail |
-| sha256 mismatch | Precheck fail **+ permanent ban** |
-| Below a benchmark floor / above the RAM cap | Not scored |
+| Committed sha256 contradicts the hash the coordinator reports | That run = 0.0 |
+| Repo private or gated when the run read it | That run = 0.0 |
+| KL run missing, failed, or measured against the wrong base or corpus | `kl_norm = 0.0` → **not scored**, no emission |
+| No verified run reported a memory figure | Not scored (backfilled) |
+| Below a benchmark floor / above the memory cap | Not scored (backfilled) |
 | Ranked below `top_n` | 0 weight |
 
 ## Practical tips
 
 - Commit exactly the revision and file you benchmarked; don't push to the repo after benchmarking.
-- Measure `max_memory` with `/check-local` at the competition's `ram_check_context_length` — don't guess.
-- Make sure every benchmark run has completed before the scoring phase starts.
-- Publish the repo before scoring starts.
-- In `benchmark_floor`, you're prechecked in order of your *claimed* RAM but paid on *measured* RAM, and a claim off by more than 1% fails outright.
+- Make sure every run has completed before the scoring phase starts, including the KL run.
+- Publish the repo before you benchmark, and leave it public — a run that read a private or gated repo scores 0.0.
+- You no longer report a memory figure — it is measured during your runs. Memory is **GPU memory at full offload**, so it is not comparable to a CPU-side RAM number you may have measured before.
+- If the competition requires a KL check, commit its run id. Without it your final score is 0, and the payload is sealed at commit so it cannot be added later.
 - Emissions only start flowing at `scoring_end_block`, not when your candidate is scored.

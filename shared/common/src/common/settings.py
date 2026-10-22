@@ -20,7 +20,7 @@ BITTENSOR = os.getenv("BITTENSOR", "True") == "True"
 NETUID = int(os.getenv("NETUID", 0))
 NETWORK = os.getenv("NETWORK", "finney")
 
-# Validator role: "leader" runs chain scan/precheck/benchmark/score and serves the read API.
+# Validator role: "leader" runs chain scan/verification/score and serves the read API.
 # "follower" reads scoring results from a leader validator and sets weights from them.
 VALIDATOR_MODE: str = os.getenv("VALIDATOR_MODE", "leader")
 
@@ -33,10 +33,6 @@ HF_ORG: str | None = os.getenv("HF_ORG") or None
 BENCHMARK_BACKEND: str = os.getenv("BENCHMARK_BACKEND", "mock")  # "mock" | "http"
 COORDINATOR_BASE_URL: str = os.getenv("COORDINATOR_BASE_URL", "https://bench.trueperformancenetwork.com/api/coordinator")
 COORDINATOR_API_KEY: str | None = os.getenv("COORDINATOR_API_KEY") or None
-
-# Precheck container (provenance + RAM check)
-PRECHECK_IMAGE: str = os.getenv("PRECHECK_IMAGE", "ghcr.io/taofu-labs/tpn-precheck")
-RAM_CHECK_LYING_TOLERANCE: float = float(os.getenv("RAM_CHECK_LYING_TOLERANCE", "0.01"))
 
 
 def configure_logging() -> None:

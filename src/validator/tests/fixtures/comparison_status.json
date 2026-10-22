@@ -1,0 +1,343 @@
+{
+  "benchmark": "fidelity-v1",
+  "benchmark_items": [
+    {
+      "benchmark": "fidelity-v1",
+      "benchmark_engine": "fidelity",
+      "position": 0,
+      "status": "completed"
+    }
+  ],
+  "benchmarks": [
+    "fidelity-v1"
+  ],
+  "cleanup_settled": true,
+  "comparison": {
+    "control": {
+      "present": true
+    },
+    "elapsed_seconds": 109.362,
+    "head_precision_floor": {
+      "base": {
+        "max_kl": 0.00183134,
+        "mean_kl": 0.000246207,
+        "rows": 88424
+      }
+    },
+    "headline_pairing": "original_to_candidate",
+    "models": {
+      "base": {
+        "architecture": "qwen2",
+        "backend": "transformers",
+        "dtype": "bfloat16",
+        "gpu_count": 1,
+        "head_precision": "native",
+        "hidden_capture": "available",
+        "model_class": "AutoModelForCausalLM",
+        "text_architecture": "qwen2",
+        "torch_version": "2.7.1+cu128",
+        "transformers_version": "5.14.0"
+      },
+      "candidate": {
+        "architecture": "qwen2",
+        "backend": "llama_cpp",
+        "gpu_count": 1,
+        "hidden_capture": "available",
+        "llama_cpp_python_version": "0.3.36",
+        "unquantized": false
+      },
+      "control": {
+        "architecture": "qwen2",
+        "backend": "llama_cpp",
+        "converted_from_base": true,
+        "gpu_count": 1,
+        "hidden_capture": "available",
+        "llama_cpp_python_version": "0.3.36",
+        "unquantized": true
+      }
+    },
+    "outcome": "complete",
+    "pair_contract": {
+      "architecture": "qwen2",
+      "gguf_architectures": [
+        "qwen2"
+      ],
+      "hidden_size": 896,
+      "layer_count": 24,
+      "padded_rows": 271,
+      "tokenizer_vocabulary_size": 151665,
+      "vocabulary_rows": 151936,
+      "vocabulary_sha256": "16b8891acb442d5168162b13bceb02f5e34a9971f471ba0e54f7050a0b1c9354"
+    },
+    "pairings": {
+      "control_to_candidate": {
+        "hidden": {
+          "available": true,
+          "complete": true,
+          "layers": [],
+          "max_nrmse": 0.111316,
+          "mean_nrmse": 0.0444547
+        },
+        "kl": {
+          "max": 1.62179,
+          "mean": 0.024745,
+          "mean_interval": [
+            0.0232537,
+            0.0265819
+          ],
+          "quantiles": {
+            "0.5": 0.01816,
+            "0.9": 0.0503119,
+            "0.99": 0.14554,
+            "0.999": 0.408994
+          }
+        },
+        "perplexity": {
+          "candidate_nll": 2.85548,
+          "candidate_ppl": 17.3828,
+          "delta_nll": 0.0229708,
+          "delta_nll_interval": [
+            0.0209052,
+            0.0250749
+          ],
+          "ppl_ratio": 1.02324,
+          "reference_nll": 2.83251,
+          "reference_ppl": 16.988
+        },
+        "scored_tokens": 88424
+      },
+      "original_to_candidate": {
+        "hidden": {
+          "available": true,
+          "complete": true,
+          "layers": [],
+          "max_nrmse": 0.112393,
+          "mean_nrmse": 0.0452594
+        },
+        "kl": {
+          "max": 1.66375,
+          "mean": 0.0254404,
+          "mean_interval": [
+            0.0239496,
+            0.0272788
+          ],
+          "quantiles": {
+            "0.5": 0.0188136,
+            "0.9": 0.0515478,
+            "0.99": 0.14926,
+            "0.999": 0.442979
+          }
+        },
+        "perplexity": {
+          "candidate_nll": 2.85548,
+          "candidate_ppl": 17.3828,
+          "delta_nll": 0.0219927,
+          "delta_nll_interval": [
+            0.0198751,
+            0.0240351
+          ],
+          "ppl_ratio": 1.02224,
+          "reference_nll": 2.83349,
+          "reference_ppl": 17.0047
+        },
+        "scored_tokens": 88424
+      },
+      "original_to_control": {
+        "hidden": {
+          "available": true,
+          "complete": true,
+          "layers": [],
+          "max_nrmse": 0.0160311,
+          "mean_nrmse": 0.00943095
+        },
+        "kl": {
+          "max": 0.272409,
+          "mean": 0.000769678,
+          "mean_interval": [
+            0.00073835,
+            0.000808465
+          ],
+          "quantiles": {
+            "0.5": 0.000577792,
+            "0.9": 0.0014285,
+            "0.99": 0.00395596,
+            "0.999": 0.0148666
+          }
+        },
+        "perplexity": {
+          "candidate_nll": 2.83251,
+          "candidate_ppl": 16.988,
+          "delta_nll": -0.000978166,
+          "delta_nll_interval": [
+            -0.00133466,
+            -0.000627766
+          ],
+          "ppl_ratio": 0.999022,
+          "reference_nll": 2.83349,
+          "reference_ppl": 17.0047
+        },
+        "scored_tokens": 88424
+      }
+    },
+    "protocol": "fidelity-v1",
+    "protocol_parameters": {
+      "activation_sample_seed": 28445,
+      "activation_sample_size": 4096,
+      "context_bucket_edges": [
+        1,
+        16,
+        128,
+        512,
+        2048,
+        8192
+      ],
+      "context_length": 2048,
+      "stride": 1024
+    },
+    "reference": "transformers",
+    "runtime_agreement": "consistent",
+    "warnings": [],
+    "workload": {
+      "activation_samples": 4096,
+      "documents": 60,
+      "excluded_first_tokens": 60,
+      "processed_tokens": 116132,
+      "scored_tokens": 88424,
+      "windows": 87
+    }
+  },
+  "failure_reason": null,
+  "kind": "model_comparison",
+  "model_source": {
+    "base": {
+      "model": {
+        "files": [
+          {
+            "hash": {
+              "algorithm": "sha256",
+              "size": 988097824,
+              "value": "fdf756fa7fcbe7404d5c60e26bff1a0c8b8aa1f72ced49e7dd0210fe288fb7fe"
+            },
+            "path": "model.safetensors",
+            "repo": "Qwen/Qwen2.5-0.5B-Instruct",
+            "revision": "7ae557604adf67be50417f59c2c2f167def9a775",
+            "role": "model",
+            "size": 988097824
+          },
+          {
+            "hash": {
+              "algorithm": "git_blob",
+              "size": 659,
+              "value": "0dbb161213629a23f0fc00ef286e6b1e366d180f"
+            },
+            "path": "config.json",
+            "repo": "Qwen/Qwen2.5-0.5B-Instruct",
+            "revision": "7ae557604adf67be50417f59c2c2f167def9a775",
+            "role": "model",
+            "size": 659
+          },
+          {
+            "hash": {
+              "algorithm": "git_blob",
+              "size": 242,
+              "value": "dfc11073787daf1b0f9c0f1499487ab5f4c93738"
+            },
+            "path": "generation_config.json",
+            "repo": "Qwen/Qwen2.5-0.5B-Instruct",
+            "revision": "7ae557604adf67be50417f59c2c2f167def9a775",
+            "role": "model",
+            "size": 242
+          },
+          {
+            "hash": {
+              "algorithm": "git_blob",
+              "size": 1671839,
+              "value": "20024bfe7c83998e9aeaf98a0cd6a2ce6306c2f0"
+            },
+            "path": "merges.txt",
+            "repo": "Qwen/Qwen2.5-0.5B-Instruct",
+            "revision": "7ae557604adf67be50417f59c2c2f167def9a775",
+            "role": "tokenizer",
+            "size": 1671839
+          },
+          {
+            "hash": {
+              "algorithm": "git_blob",
+              "size": 7031645,
+              "value": "443909a61d429dff23010e5bddd28ff530edda00"
+            },
+            "path": "tokenizer.json",
+            "repo": "Qwen/Qwen2.5-0.5B-Instruct",
+            "revision": "7ae557604adf67be50417f59c2c2f167def9a775",
+            "role": "tokenizer",
+            "size": 7031645
+          },
+          {
+            "hash": {
+              "algorithm": "git_blob",
+              "size": 7305,
+              "value": "07bfe0640cb5a0037f9322287fbfc682806cf672"
+            },
+            "path": "tokenizer_config.json",
+            "repo": "Qwen/Qwen2.5-0.5B-Instruct",
+            "revision": "7ae557604adf67be50417f59c2c2f167def9a775",
+            "role": "tokenizer",
+            "size": 7305
+          },
+          {
+            "hash": {
+              "algorithm": "git_blob",
+              "size": 2776833,
+              "value": "4783fe10ac3adce15ac8f358ef5462739852c569"
+            },
+            "path": "vocab.json",
+            "repo": "Qwen/Qwen2.5-0.5B-Instruct",
+            "revision": "7ae557604adf67be50417f59c2c2f167def9a775",
+            "role": "tokenizer",
+            "size": 2776833
+          }
+        ],
+        "gated": false,
+        "private": false,
+        "repo": "Qwen/Qwen2.5-0.5B-Instruct",
+        "revision": "7ae557604adf67be50417f59c2c2f167def9a775",
+        "sha": "7ae557604adf67be50417f59c2c2f167def9a775"
+      }
+    },
+    "candidate": {
+      "model": {
+        "files": [
+          {
+            "hash": {
+              "algorithm": "sha256",
+              "size": 397808192,
+              "value": "6eb923e7d26e9cea28811e1a8e852009b21242fb157b26149d3b188f3a8c8653"
+            },
+            "path": "Qwen2.5-0.5B-Instruct-Q4_K_M.gguf",
+            "repo": "bartowski/Qwen2.5-0.5B-Instruct-GGUF",
+            "revision": "41ba88dbac95fed2528c92514c131d73eb5a174b",
+            "role": "model",
+            "size": 397808192
+          }
+        ],
+        "gated": false,
+        "private": false,
+        "repo": "bartowski/Qwen2.5-0.5B-Instruct-GGUF",
+        "revision": "41ba88dbac95fed2528c92514c131d73eb5a174b",
+        "sha": "41ba88dbac95fed2528c92514c131d73eb5a174b"
+      }
+    },
+    "dataset": {
+      "bytes": 428459,
+      "corpus_id": "corpus-000002",
+      "kind": "platform",
+      "manifest_digest": "f2bf0eb7613fd7b89c3a68a4639dbc0373063930c7352ff17cde2911bdd84fe5",
+      "sha256": "e77a6f7b3908b0535172abfe0cb81cb158e68d82da005e135b03f9a5dca4f69a"
+    }
+  },
+  "percent_complete": 100,
+  "phase": "completed",
+  "run_id": "01f61c34-aab7-4a05-a268-414dca3cb488",
+  "short_id": "r1351",
+  "status": "completed"
+}

@@ -42,18 +42,6 @@ class Validator(HealthServerMixin, LeaderApiMixin):
         self._db = store.init_db()
         self._coordinator = None
 
-        if self.mode == "leader":
-            from competition.precheck_client import cleanup_stale_containers
-            in_flight = [
-                spec["id"] for spec in store.list_competitions(self._db)
-                if store.get_stage(self._db, spec["id"]) == "stage2_scoring"
-            ]
-            cleanup_stale_containers(keep_competition_ids=in_flight)
-            for cid in in_flight:
-                reset_count = store.reset_stale_candidate_statuses(self._db, cid)
-                if reset_count:
-                    logger.info(f"{cid}: reset {reset_count} candidate(s) stuck in 'prechecking' from a previous run")
-
         if self.mode == "follower":
             from validator.leader_client import LeaderClient
             self._leader_client = LeaderClient(validator_settings.LEADER_VALIDATOR_URL)
@@ -132,22 +120,16 @@ class Validator(HealthServerMixin, LeaderApiMixin):
                     elif phase == CompetitionPhase.REVEALING:
                         logger.debug(f"REVEALING phase — waiting for reveal grace to end at {spec.scoring_starts_at()}")
 
-                    # DISTRIBUTING is included so a competition whose last
-                    # candidate is scored on the final scoring tick still gets
-                    # finalized: run_stage_2's first branch already handles a
-                    # closed window, it just never ran once the phase moved on.
-                    # Also recovers a validator that was down across the boundary.
+                    # DISTRIBUTING is included so a validator that was down
+                    # across the scoring boundary still scores the competition
+                    # instead of skipping it for good.
                     elif phase in (CompetitionPhase.SCORING, CompetitionPhase.DISTRIBUTING):
                         if store.is_scored(self._db, spec.id):
                             continue
                         if store.is_paused(self._db, spec.id):
                             logger.info(f"{spec.id}: paused — skipping scoring tick")
                             continue
-                        stage = store.get_stage(self._db, spec.id)
-                        if stage == "stage1_ranking":
-                            await self.run_stage_1(spec)
-                        elif stage == "stage2_scoring":
-                            await self.run_stage_2(spec, current_block)
+                        await self.run_stage_1(spec)
 
             except Exception as e:
                 logger.exception(f"Leader loop error: {e}")
@@ -209,13 +191,13 @@ class Validator(HealthServerMixin, LeaderApiMixin):
 
     async def run_stage_1(self, spec) -> None:
         from validator.chain_scanner import scan_reveals
-        from validator.scorer import dedup_winner, verify_all_candidates
+        from validator.scorer import dedup_winner, finalize_candidate, verify_all_candidates
         from competition.scoring import sort_by_verified_scores
 
         logger.info(f"🏆 Stage 1 (reveal/verify/rank) for {spec.id}")
 
         try:
-            reveals = scan_reveals(self.subtensor, spec, self._db)
+            reveals = scan_reveals(self.subtensor, spec)
         except Exception as e:
             self._bump_stage1_or_fail(spec.id, f"scan_reveals failed: {e}")
             return
@@ -278,7 +260,7 @@ class Validator(HealthServerMixin, LeaderApiMixin):
         # candidate that fails everything still appears here and is rejected by
         # the competition's floors rather than vanishing without a record.
         try:
-            verified_scores = await asyncio.to_thread(
+            verified = await asyncio.to_thread(
                 verify_all_candidates,
                 self._db, spec.id, eligible_submissions, spec, coordinator,
                 validator_settings.SCORING_QUEUE_CONCURRENCY,
@@ -287,7 +269,11 @@ class Validator(HealthServerMixin, LeaderApiMixin):
             self._bump_stage1_or_fail(spec.id, f"run verification failed: {e}")
             return
 
-        ranked_candidates = sort_by_verified_scores(eligible_submissions, verified_scores, spec)
+        verified_scores = {hk: v.scores for hk, v in verified.items()}
+        memory_kb = {hk: v.measured_memory_kb for hk, v in verified.items()}
+        ranked_candidates = sort_by_verified_scores(
+            eligible_submissions, verified_scores, spec, memory_kb,
+        )
         logger.debug(f"Ranked candidates by verified score: {[hk[:12] for hk, _ in ranked_candidates]}")
 
         candidates = [
@@ -298,6 +284,7 @@ class Validator(HealthServerMixin, LeaderApiMixin):
                 "reveal_block": reveals[hotkey][1],
                 "status": "standby",
                 "verified_scores": verified_scores.get(hotkey, {}),
+                "measured_memory_kb": memory_kb.get(hotkey, 0),
             }
             for rank, (hotkey, submission) in enumerate(ranked_candidates)
         ] + [
@@ -318,9 +305,25 @@ class Validator(HealthServerMixin, LeaderApiMixin):
             self._bump_stage1_or_fail(spec.id, f"failed to persist revealed_candidates: {e}")
             return
 
-        store.set_stage(self._db, spec.id, "stage2_scoring")
-        logger.info(f"{spec.id}: stage 1 done — {len(ranked_candidates)} ranked, "
+        logger.info(f"{spec.id}: ranked {len(ranked_candidates)} candidate(s), "
                     f"{len(dedup_failed)} failed stage-1 filters")
+
+        # Score in rank order until top_n are through. Every number comes from
+        # the runs just verified, so this is pure bookkeeping — a candidate that
+        # fails its floors or the memory cap is skipped and the next-ranked one
+        # takes the slot, which is the backfill the old stage 2 walked one tick
+        # at a time.
+        scored = 0
+        for hotkey, _submission in ranked_candidates:
+            if scored >= spec.top_n:
+                break
+            if await asyncio.to_thread(
+                finalize_candidate, self._db, spec.id, hotkey, spec, verified[hotkey],
+            ):
+                scored += 1
+
+        logger.info(f"{spec.id}: scored {scored}/{spec.top_n} candidate(s)")
+        self._finalize_stage_3(spec)
 
     def _bump_stage1_or_fail(self, competition_id: str, reason: str) -> None:
         attempts = store.bump_stage1_attempts(self._db, competition_id)
@@ -330,68 +333,6 @@ class Validator(HealthServerMixin, LeaderApiMixin):
         else:
             logger.warning(f"{competition_id}: stage 1 infra failure, attempt {attempts}/{store.STAGE1_MAX_ATTEMPTS} — {reason}")
 
-    async def run_stage_2(self, spec, current_block: int) -> None:
-        """Precheck candidates in verified-score order until top_n are scored.
-
-        Benchmarks were already run by the miners and verified in stage 1, so
-        this stage only has to prove each candidate's model is what it claims:
-        RAM measurement, sha256 match and base-model provenance.
-        """
-        import json
-
-        from validator.scorer import finalize_prechecked_candidate, precheck_one
-        from competition.precheck_client import PrecheckContainer, is_container_up, stop_container
-        from common.models.submission import MinerSubmission
-
-        db = self._db
-        cid = spec.id
-        done_count = store.count_candidates_by_status(db, cid, ("done",))
-        still_active = store.count_candidates_by_status(db, cid, ("standby", "prechecking"))
-
-        if current_block >= spec.scoring_end_block or done_count >= spec.top_n or still_active == 0:
-            stop_container(cid)
-            self._finalize_stage_3(spec)
-            return
-
-        precheck_ctr = PrecheckContainer(competition_id=cid, base_repo=spec.model_repo)
-        try:
-            await asyncio.to_thread(precheck_ctr.launch)
-        except Exception as e:
-            logger.warning(f"{cid}: precheck container launch failed (will retry next tick): {e}")
-            return
-
-        if not await asyncio.to_thread(is_container_up, cid):
-            logger.debug(f"{cid}: precheck container not ready yet, skipping precheck this tick")
-            return
-
-        # One candidate per tick, highest rank first. The container serialises
-        # check() anyway, so there is nothing to gain from batching here.
-        if store.count_candidates_by_status(db, cid, ("prechecking",)) > 0:
-            return
-
-        standbys = store.candidates_by_status(db, cid, ("standby",))[:1]
-        for row in standbys:
-            submission = MinerSubmission.model_validate_json(row["submission_json"])
-            store.set_candidate_status(db, cid, row["hotkey"], "prechecking")
-            try:
-                result = await asyncio.to_thread(precheck_one, row["hotkey"], submission, spec, precheck_ctr, db)
-            except Exception as e:
-                logger.warning(f"{row['hotkey'][:12]} precheck raised: {e} — backfilling")
-                store.set_candidate_status(db, cid, row["hotkey"], "failed", f"precheck raised: {e}")
-                continue
-
-            if not result.passed:
-                logger.info(f"{row['hotkey'][:12]} failed precheck: {result.reason} — backfilling")
-                store.set_candidate_status(db, cid, row["hotkey"], "failed", result.reason)
-                continue
-
-            store.mark_precheck_passed(db, cid, row["hotkey"], result.gguf_file, result.measured_memory_kb)
-            verified_scores = json.loads(row["verified_scores_json"] or "{}")
-            await asyncio.to_thread(
-                finalize_prechecked_candidate,
-                db, cid, row["hotkey"], spec, verified_scores, result.measured_memory_kb,
-            )
-
     def _finalize_stage_3(self, spec) -> None:
         from competition.scoring import compute_emission_weights
         from common.models.submission import ScoringResult
@@ -400,7 +341,7 @@ class Validator(HealthServerMixin, LeaderApiMixin):
         results = store.scoring_results_for_competition(self._db, cid)
         ranked = sorted(
             (ScoringResult(hotkey=r["hotkey"], competition_id=cid,
-                           final_score=r["final_score"], max_memory_kb=r["max_memory_kb"])
+                           final_score=r["final_score"], measured_memory_kb=r["measured_memory_kb"])
              for r in results),
             key=lambda r: r.final_score, reverse=True,
         )

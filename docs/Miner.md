@@ -60,18 +60,35 @@ export BENCHMARK_API_KEY=bapi_...
 tpn benchmark --wallet <coldkey> --competition <competition-id>
 ```
 
-This quotes every benchmark the competition requires, shows the total price
-against your available credit, and — once you confirm — submits each run
-against exactly the repo, revision and `.gguf` file you uploaded in step 3. Run
-ids are saved to your competition config as each one succeeds, ready for
-`tpn commit`.
+This quotes everything the competition requires — every benchmark, plus the
+**KL check** if the competition configures one — shows the total price against
+your available credit, and, once you confirm, submits each run against exactly
+the repo, revision and `.gguf` file you uploaded in step 3. Run ids are saved to
+your competition config as each one succeeds, ready for `tpn commit`.
+
+The quote table labels each run so you can see what you are paying for:
+
+```
+┏━━━━━━━┳━━━━━━━━━━━┳━━━━━━━┳━━━━━━━┓
+┃ Run   ┃ Kind      ┃ Price ┃ Notes ┃
+┡━━━━━━━╇━━━━━━━━━━━╇━━━━━━━╇━━━━━━━┩
+│ mmlu  │ benchmark │ $3.20 │ —     │
+│ gsm8k │ benchmark │ $3.20 │ —     │
+│ kl    │ KL check  │ $5.16 │ —     │
+└───────┴───────────┴───────┴───────┘
+
+Total: $11.56  Available credit: $100.00
+```
+
+Re-quoting the same model hits the service's identity cache, so iterating on an
+unchanged model does not pay twice.
 
 The command returns as soon as each run has an id; it does not wait for the
 benchmarks to finish.
 
 | Flag | Effect |
 |---|---|
-| `--only mmlu,gsm8k` | Run just these benchmarks |
+| `--only mmlu,gsm8k` | Run just these (`--only kl` runs the KL check alone) |
 | `--rerun` | Re-run benchmarks that already have a saved run id |
 | `--yes` | Skip the price confirmation prompt |
 | `--force-price` | Accept the current price without quoting first |
@@ -87,6 +104,44 @@ for that benchmark. Check progress in the benchmark service GUI.
 
 Driving the benchmark service directly is also fine: `tpn commit --runs`
 accepts run ids from any source.
+
+#### The KL check
+
+If `tpn competitions` shows a **KL check** for the competition, one of your runs
+is a *comparison* rather than a benchmark: it measures how far your quantization
+moved the model's output distribution away from the competition's base model, on
+a private corpus whose text is never published.
+
+That divergence becomes a multiplier on your benchmark score:
+
+```
+kl_norm = exp(−KL_p99)
+```
+
+A Q4_K_M typically lands around 0.146 nats at P99 → ×0.865. A Q2_K around
+1.30 → ×0.27. So a tiny model that scores well on benchmarks but drifts far from
+the base is priced down, and accuracy alone is not enough.
+
+**A missing or unverifiable KL run means a multiplier of 0.0, which zeroes your
+final score** — and a zero-scoring candidate is not scored at all, so it earns
+nothing even if nobody else entered. `tpn benchmark` includes the KL run by
+default and `tpn commit` refuses a payload without it, because the commit
+payload is sealed — a missing run cannot be added after the fact.
+
+Keep your HuggingFace repo **public** from the moment you benchmark. The
+coordinator records whether the repo was private or gated when it read it, and
+the validator fails any run that read a non-public repo.
+
+#### Memory
+
+You do not report your model's memory usage. The benchmark service measures the
+GPU memory your model takes to load during its runs, and the validator reads
+that figure from the run. A competition with a memory cap enforces it against
+that measurement.
+
+This is **GPU memory at full offload**, which is not the same quantity as a
+host-RAM figure measured on CPU — don't carry a threshold over from one to the
+other.
 
 ### 5. Commit
 
@@ -109,7 +164,8 @@ A run id is either the service's short id (`r1234`) or the full UUID.
 Validators verify every run id against your commit: the run must have
 benchmarked the same repo, the same revision and the same file you committed.
 A run that benchmarked anything else scores 0.0 for that benchmark, so commit
-the same model you benchmarked.
+the same model you benchmarked. The KL run is checked the same way, plus that it
+measured against this competition's base model and corpus.
 
 Use `--dry-run` to inspect the payload without writing to chain.
 
@@ -144,7 +200,7 @@ tpn register           Register hotkey on subnet
 tpn collateral-status  Show locked miner collateral for a hotkey (optional)
 tpn competitions       List competitions (--refresh/-r to bypass the 10 min cache)
 tpn upload             Upload GGUF to HuggingFace
-tpn benchmark          Run the competition's benchmarks (needs BENCHMARK_API_KEY)
+tpn benchmark          Run the competition's benchmarks + KL check (needs BENCHMARK_API_KEY)
 tpn commit             Submit TimeLocked Commit to chain
 tpn publish            Make HF repo public
 tpn status             Show submission state
@@ -164,7 +220,7 @@ For local development or non-standard setups, all commands accept these global f
 | `--block-time` | `12.0` | Seconds per block (use `0.300` for localnet) |
 
 `tpn benchmark` additionally takes `--billing-url`
-(default `https://benchmarks.trueperformancenetwork.com/api/v1`) and
+(default `https://bench.trueperformancenetwork.com/api/v1`) and
 `--api-key` (`$BENCHMARK_API_KEY`) after the subcommand.
 
 Example:

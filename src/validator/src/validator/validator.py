@@ -308,21 +308,21 @@ class Validator(HealthServerMixin, LeaderApiMixin):
         logger.info(f"{spec.id}: ranked {len(ranked_candidates)} candidate(s), "
                     f"{len(dedup_failed)} failed stage-1 filters")
 
-        # Score in rank order until top_n are through. Every number comes from
-        # the runs just verified, so this is pure bookkeeping — a candidate that
-        # fails its floors or the memory cap is skipped and the next-ranked one
-        # takes the slot, which is the backfill the old stage 2 walked one tick
-        # at a time.
+        # Finalize every candidate in rank order so none is left in standby.
+        # Every number comes from the runs just verified, so this is pure
+        # bookkeeping. A candidate that fails its floors or the memory cap is
+        # failed and the next-ranked one moves up. Payout stays capped at top_n:
+        # shares go by position and emission_distribution has exactly top_n
+        # entries, so anyone scored past it is recorded but paid 0.
         scored = 0
         for hotkey, _submission in ranked_candidates:
-            if scored >= spec.top_n:
-                break
             if await asyncio.to_thread(
                 finalize_candidate, self._db, spec.id, hotkey, spec, verified[hotkey],
             ):
                 scored += 1
 
-        logger.info(f"{spec.id}: scored {scored}/{spec.top_n} candidate(s)")
+        logger.info(f"{spec.id}: scored {scored} candidate(s), "
+                    f"{min(scored, spec.top_n)}/{spec.top_n} payable")
         self._finalize_stage_3(spec)
 
     def _bump_stage1_or_fail(self, competition_id: str, reason: str) -> None:

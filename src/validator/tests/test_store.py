@@ -596,3 +596,16 @@ def test_paused_at_column_migrates_onto_existing_db(tmp_path):
     assert store.is_paused(conn, "comp1") is False
     store.set_paused(conn, "comp1", True)
     assert store.is_paused(conn, "comp1") is True
+
+
+def test_scoring_results_break_ties_by_stage1_rank(tmp_path):
+    """Results past top_n are stored, so a tie at the payout boundary decides
+    who is paid. It must follow the stage-1 rank, not insertion order."""
+    conn = make_conn(tmp_path)
+    store.insert_revealed_candidate(conn, "comp1", "hk_a", rank=0, submission_json="{}", reveal_block=10, status="standby")
+    store.insert_revealed_candidate(conn, "comp1", "hk_b", rank=1, submission_json="{}", reveal_block=10, status="standby")
+    store.finalize_candidate(conn, "comp1", "hk_b", 0.5, 900)
+    store.finalize_candidate(conn, "comp1", "hk_a", 0.5, 900)
+
+    results = store.scoring_results_for_competition(conn, "comp1")
+    assert [r["hotkey"] for r in results] == ["hk_a", "hk_b"]

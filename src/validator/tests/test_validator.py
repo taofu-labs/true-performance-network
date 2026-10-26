@@ -498,9 +498,10 @@ async def test_stage_1_backfills_past_a_failing_candidate(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_stage_1_stops_scoring_at_top_n(monkeypatch):
-    """Only top_n candidates are scored, in rank order — the rest stay standby
-    rather than being paid a slot that does not exist."""
+async def test_stage_1_scores_past_top_n_but_pays_only_top_n(monkeypatch):
+    """Every candidate gets a terminal status and a score, but only top_n are
+    paid — the rest are recorded at weight 0, not given a slot that does not
+    exist."""
     metagraph = FakeMetagraph(hotkeys=["hk_first", "hk_second"], uids=[0, 1], stake=[1.0, 1.0],
                               weights=[[1.0, 0.0], [0.0, 1.0]], validator_permit=[True, True])
     v = make_validator(monkeypatch, metagraph=metagraph)
@@ -510,7 +511,7 @@ async def test_stage_1_stops_scoring_at_top_n(monkeypatch):
     }
     _stage1_env(monkeypatch, reveals, statuses={
         "r903": make_run_status(run_id="r903", scores={"mmlu": 0.9}),
-        "r904": make_run_status(run_id="r904", scores={"mmlu": 0.4},
+        "r904": make_run_status(run_id="r904", scores={"mmlu": 0.6},
                                  file_hashes={"model.gguf": ("sha256", "b" * 64)}),
     })
 
@@ -519,7 +520,10 @@ async def test_stage_1_stops_scoring_at_top_n(monkeypatch):
     ))
 
     assert store.get_candidate(v._db, "comp1", "hk_first")["status"] == "done"
-    assert store.get_candidate(v._db, "comp1", "hk_second")["status"] == "standby"
+    assert store.get_candidate(v._db, "comp1", "hk_second")["status"] == "done"
+    results = store.scoring_results_for_competition(v._db, "comp1")
+    assert [r["hotkey"] for r in results] == ["hk_first", "hk_second"]
+    assert store.latest_weights_for_competition(v._db, "comp1") == {"hk_first": 1.0, "hk_second": 0.0}
 
 
 @pytest.mark.asyncio

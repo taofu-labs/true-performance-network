@@ -559,8 +559,15 @@ def finalize_candidate(
 
 @_locked
 def scoring_results_for_competition(conn: sqlite3.Connection, competition_id: str) -> List[dict]:
+    # Ties fall back to the stage-1 rank. Results past top_n are stored too, so
+    # a tie at the payout boundary decides who is paid at all; leader and
+    # followers both stable-sort this list by final_score, so the order must
+    # be deterministic here.
     rows = conn.execute(
-        "SELECT * FROM scoring_results WHERE competition_id = ? ORDER BY final_score DESC",
+        """SELECT s.* FROM scoring_results s
+           LEFT JOIN revealed_candidates r USING (competition_id, hotkey)
+           WHERE s.competition_id = ?
+           ORDER BY s.final_score DESC, r.rank ASC""",
         (competition_id,),
     ).fetchall()
     return [dict(r) for r in rows]

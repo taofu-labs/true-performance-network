@@ -191,7 +191,7 @@ def make_submission(**overrides):
     from common.models.submission import BenchmarkRun, MinerSubmission
     fields = dict(
         competition_id="comp1", runs=[BenchmarkRun(b="mmlu", r="r100")], repository="user/repo",
-        file="model.gguf", file_sha256="a" * 64, max_memory=1000, huggingface_revision="a" * 40,
+        file="model.gguf", file_sha256="a" * 64, huggingface_revision="a" * 40,
     )
     fields.update(overrides)
     return MinerSubmission(**fields)
@@ -205,6 +205,7 @@ def make_run_status(**overrides):
         repo="user/repo", revision="a" * 40, model_files=["model.gguf"],
         file_hashes={"model.gguf": ("sha256", "a" * 64)},
         benchmarks=["mmlu"], item_status={"mmlu": "completed"},
+        measured_memory_bytes=900 * 1024,
     )
     fields.update(overrides)
     return RunStatus(**fields)
@@ -236,7 +237,7 @@ async def test_run_stage_1_terminal_when_no_reveals(monkeypatch):
     chain-provably immutable once the commit window closes."""
     metagraph = FakeMetagraph(hotkeys=["hk1"], uids=[0], stake=[1.0], weights=[[1.0]], validator_permit=[True])
     v = make_validator(monkeypatch, metagraph=metagraph)
-    monkeypatch.setattr("validator.chain_scanner.scan_reveals", lambda subtensor, spec, db: {})
+    monkeypatch.setattr("validator.chain_scanner.scan_reveals", lambda subtensor, spec: {})
 
     await v.run_stage_1(make_spec())
     assert store.scored_status(v._db, "comp1") == "failed_no_reveals"
@@ -250,7 +251,7 @@ async def test_run_stage_1_retries_on_infra_failure(monkeypatch):
     metagraph = FakeMetagraph(hotkeys=["hk1"], uids=[0], stake=[1.0], weights=[[1.0]], validator_permit=[True])
     v = make_validator(monkeypatch, metagraph=metagraph)
 
-    def boom(subtensor, spec, db):
+    def boom(subtensor, spec):
         raise RuntimeError("chain RPC failed")
     monkeypatch.setattr("validator.chain_scanner.scan_reveals", boom)
 
@@ -264,21 +265,22 @@ async def test_run_stage_1_retries_on_infra_failure(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_run_stage_1_persists_ranked_candidates_and_advances_stage(monkeypatch):
+async def test_run_stage_1_persists_ranked_candidates(monkeypatch):
     metagraph = FakeMetagraph(hotkeys=["hk1"], uids=[0], stake=[1.0], weights=[[1.0]], validator_permit=[True])
     metagraph.neurons = [FakeNeuron("hk1")]
     v = make_validator(monkeypatch, metagraph=metagraph)
 
     submission = make_submission()
-    monkeypatch.setattr("validator.chain_scanner.scan_reveals", lambda subtensor, spec, db: {"hk1": (submission, 5)})
+    monkeypatch.setattr("validator.chain_scanner.scan_reveals", lambda subtensor, spec: {"hk1": (submission, 5)})
     stub_coordinator(monkeypatch)
 
     await v.run_stage_1(make_spec())
 
-    assert store.get_stage(v._db, "comp1") == "stage2_scoring"
+    # Ranked, scored and finalized in the one pass — there is no second stage.
     candidate = store.get_candidate(v._db, "comp1", "hk1")
-    assert candidate["status"] == "standby"
+    assert candidate["status"] == "done"
     assert candidate["rank"] == 0
+    assert store.get_stage(v._db, "comp1") == "finalized"
 
 
 @pytest.mark.asyncio
@@ -296,14 +298,14 @@ async def test_run_stage_1_ranks_by_verified_score_not_by_claim(monkeypatch):
     high = make_submission(runs=[BenchmarkRun(b="mmlu", r="r2")], file_sha256="2" * 64)
     monkeypatch.setattr(
         "validator.chain_scanner.scan_reveals",
-        lambda subtensor, spec, db: {"hk_low": (low, 5), "hk_high": (high, 5)},
+        lambda subtensor, spec: {"hk_low": (low, 5), "hk_high": (high, 5)},
     )
     stub_coordinator(monkeypatch, statuses={
         "r1": make_run_status(run_id="r1", scores={"mmlu": 0.51}, file_hashes={"model.gguf": ("sha256", "1" * 64)}),
         "r2": make_run_status(run_id="r2", scores={"mmlu": 0.95}, file_hashes={"model.gguf": ("sha256", "2" * 64)}),
     })
 
-    await v.run_stage_1(make_spec(competition_type="ram_ceiling", max_memory_kb=10_000))
+    await v.run_stage_1(make_spec(competition_type="gpu_memory_ceiling", max_gpu_memory_kb=10_000))
 
     assert store.get_candidate(v._db, "comp1", "hk_high")["rank"] == 0
     assert store.get_candidate(v._db, "comp1", "hk_low")["rank"] == 1
@@ -318,13 +320,15 @@ async def test_run_stage_1_keeps_candidate_whose_runs_all_failed_verification(mo
     metagraph.neurons = [FakeNeuron("hk1")]
     v = make_validator(monkeypatch, metagraph=metagraph)
 
-    monkeypatch.setattr("validator.chain_scanner.scan_reveals", lambda subtensor, spec, db: {"hk1": (make_submission(), 5)})
+    monkeypatch.setattr("validator.chain_scanner.scan_reveals", lambda subtensor, spec: {"hk1": (make_submission(), 5)})
     stub_coordinator(monkeypatch, statuses={"r100": make_run_status(repo="someone/else")})
 
     await v.run_stage_1(make_spec())
 
-    assert store.get_stage(v._db, "comp1") == "stage2_scoring"
-    assert store.get_candidate(v._db, "comp1", "hk1")["status"] == "standby"
+    # Kept with a record of why, then failed by the floors rather than dropped.
+    candidate = store.get_candidate(v._db, "comp1", "hk1")
+    assert candidate["status"] == "failed"
+    assert "failed floors" in candidate["failure_reason"]
     row = store.benchmark_results_for_hotkey(v._db, "comp1", "hk1")[0]
     assert row["status"] == "failed"
     assert "repo mismatch" in row["last_message"]
@@ -338,7 +342,7 @@ async def test_run_stage_1_retries_when_coordinator_unreachable_during_verificat
     metagraph.neurons = [FakeNeuron("hk1")]
     v = make_validator(monkeypatch, metagraph=metagraph)
 
-    monkeypatch.setattr("validator.chain_scanner.scan_reveals", lambda subtensor, spec, db: {"hk1": (make_submission(), 5)})
+    monkeypatch.setattr("validator.chain_scanner.scan_reveals", lambda subtensor, spec: {"hk1": (make_submission(), 5)})
     stub_coordinator(monkeypatch)
     monkeypatch.setattr(
         "validator.scorer.verify_all_candidates",
@@ -371,7 +375,7 @@ async def test_run_stage_1_dedup_tie_break_demotes_displaced_winner(monkeypatch)
     submission_a = make_submission(file_sha256=same_sha)
     monkeypatch.setattr(
         "validator.chain_scanner.scan_reveals",
-        lambda subtensor, spec, db: {"hk_z": (submission_z, 5), "hk_a": (submission_a, 5)},
+        lambda subtensor, spec: {"hk_z": (submission_z, 5), "hk_a": (submission_a, 5)},
     )
     stub_coordinator(monkeypatch, statuses={
         "r100": make_run_status(file_hashes={"model.gguf": ("sha256", same_sha)}),
@@ -381,7 +385,7 @@ async def test_run_stage_1_dedup_tie_break_demotes_displaced_winner(monkeypatch)
 
     winner = store.get_candidate(v._db, "comp1", "hk_a")
     loser = store.get_candidate(v._db, "comp1", "hk_z")
-    assert winner["status"] == "standby"
+    assert winner["status"] == "done"
     assert loser["status"] == "failed"
     assert "duplicate" in loser["failure_reason"]
 
@@ -394,7 +398,7 @@ async def test_run_stage_1_retries_when_coordinator_missing_benchmarks(monkeypat
     metagraph.neurons = [FakeNeuron("hk1")]
     v = make_validator(monkeypatch, metagraph=metagraph)
 
-    monkeypatch.setattr("validator.chain_scanner.scan_reveals", lambda subtensor, spec, db: {"hk1": (make_submission(), 5)})
+    monkeypatch.setattr("validator.chain_scanner.scan_reveals", lambda subtensor, spec: {"hk1": (make_submission(), 5)})
     stub_coordinator(monkeypatch, benchmarks=set())  # missing "mmlu"
 
     await v.run_stage_1(make_spec())
@@ -403,122 +407,45 @@ async def test_run_stage_1_retries_when_coordinator_missing_benchmarks(monkeypat
 
 
 # ---------------------------------------------------------------------------
-# run_stage_2 — precheck only; benchmarks were verified in stage 1
+# Scoring inside stage 1 — the work the old stage 2 did per tick
 # ---------------------------------------------------------------------------
 
-def _insert_standby(db, hotkey, rank=0, scores='{"mmlu": 0.8}', **overrides):
-    fields = dict(
-        submission_json=make_submission().model_dump_json(),
-        reveal_block=5, status="standby",
-    )
-    fields.update(overrides)
-    store.insert_revealed_candidate(db, "comp1", hotkey, rank=rank, **fields)
-    db.execute(
-        "UPDATE revealed_candidates SET verified_scores_json = ? WHERE competition_id = 'comp1' AND hotkey = ?",
-        (scores, hotkey),
-    )
-    db.commit()
-
-
-def _stub_precheck_env(monkeypatch, container_up=True):
-    monkeypatch.setattr("competition.precheck_client.PrecheckContainer.launch", lambda self: None)
-    monkeypatch.setattr("competition.precheck_client.is_container_up", lambda cid: container_up)
+def _stage1_env(monkeypatch, reveals, statuses=None, benchmarks={"mmlu"}):
+    """Drive a full stage 1 from canned reveals and coordinator statuses."""
+    monkeypatch.setattr("validator.chain_scanner.scan_reveals", lambda subtensor, spec: reveals)
+    stub_coordinator(monkeypatch, statuses=statuses, benchmarks=benchmarks)
 
 
 @pytest.mark.asyncio
-async def test_run_stage_2_finalizes_when_scoring_window_closed(monkeypatch):
+async def test_stage_1_scores_candidate_in_the_same_pass(monkeypatch):
+    """There is no second stage: a verified candidate is scored, and the
+    competition finalized, within the one stage-1 run."""
     metagraph = FakeMetagraph(hotkeys=["hk1"], uids=[0], stake=[1.0], weights=[[1.0]], validator_permit=[True])
     v = make_validator(monkeypatch, metagraph=metagraph)
-    store.set_stage(v._db, "comp1", "stage2_scoring")
-    monkeypatch.setattr("competition.precheck_client.stop_container", lambda cid: None)
+    _stage1_env(monkeypatch, {"hk1": (make_submission(), 5)})
 
-    spec = make_spec()  # scoring_end_block=20
-    await v.run_stage_2(spec, current_block=25)  # window closed
-
-    assert store.get_stage(v._db, "comp1") == "failed_no_participants"
-    assert store.is_scored(v._db, "comp1") is True
-
-
-@pytest.mark.asyncio
-async def test_run_stage_2_finalizes_when_top_n_reached(monkeypatch):
-    metagraph = FakeMetagraph(hotkeys=["hk1"], uids=[0], stake=[1.0], weights=[[1.0]], validator_permit=[True])
-    v = make_validator(monkeypatch, metagraph=metagraph)
-    store.set_stage(v._db, "comp1", "stage2_scoring")
-    store.insert_revealed_candidate(v._db, "comp1", "hk1", rank=0, submission_json=make_submission().model_dump_json(), reveal_block=5, status="done")
-    v._db.commit()
-    store.record_scoring_result(v._db, "comp1", "hk1", final_score=0.7, max_memory_kb=1000)
-    v._db.commit()
-    monkeypatch.setattr("competition.precheck_client.stop_container", lambda cid: None)
-
-    spec = make_spec(top_n=1)
-    await v.run_stage_2(spec, current_block=15)
-
-    assert store.get_stage(v._db, "comp1") == "finalized"
-    weights = store.latest_weights_for_competition(v._db, "comp1")
-    assert weights == {"hk1": 1.0}
-
-
-@pytest.mark.asyncio
-async def test_run_stage_2_finalizes_when_candidates_exhausted(monkeypatch):
-    metagraph = FakeMetagraph(hotkeys=["hk1"], uids=[0], stake=[1.0], weights=[[1.0]], validator_permit=[True])
-    v = make_validator(monkeypatch, metagraph=metagraph)
-    store.set_stage(v._db, "comp1", "stage2_scoring")
-    store.insert_revealed_candidate(v._db, "comp1", "hk1", rank=0, submission_json=make_submission().model_dump_json(), reveal_block=5, status="failed", failure_reason="x")
-    v._db.commit()
-    monkeypatch.setattr("competition.precheck_client.stop_container", lambda cid: None)
-
-    # more payable slots than candidates that could ever fill them
-    spec = make_spec(top_n=5, emission_distribution=[0.4, 0.3, 0.15, 0.1, 0.05])
-    await v.run_stage_2(spec, current_block=15)
-
-    assert store.scored_status(v._db, "comp1") == "failed_no_participants"
-    assert store.get_stage(v._db, "comp1") == "failed_no_participants"
-    assert store.latest_weights_for_competition(v._db, "comp1") is None
-
-
-@pytest.mark.asyncio
-async def test_run_stage_2_scores_candidate_immediately_after_precheck(monkeypatch):
-    """There is no benchmark wait any more: a passing precheck produces a
-    scored candidate within the same tick, using the stage-1 scores."""
-    metagraph = FakeMetagraph(hotkeys=["hk1"], uids=[0], stake=[1.0], weights=[[1.0]], validator_permit=[True])
-    v = make_validator(monkeypatch, metagraph=metagraph)
-    store.set_stage(v._db, "comp1", "stage2_scoring")
-    _insert_standby(v._db, "hk1")
-    _stub_precheck_env(monkeypatch)
-
-    from validator.scorer import PrecheckResult
-    monkeypatch.setattr(
-        "validator.scorer.precheck_one",
-        lambda hotkey, submission, spec, ctr, conn: PrecheckResult(True, gguf_file="model.gguf", measured_memory_kb=999),
-    )
-
-    await v.run_stage_2(make_spec(top_n=1), current_block=15)
+    await v.run_stage_1(make_spec(top_n=1))
 
     candidate = store.get_candidate(v._db, "comp1", "hk1")
-    assert candidate["status"] == "done"
-    assert candidate["gguf_file"] == "model.gguf"
+    assert candidate["status"] == "done", candidate["failure_reason"]
     results = store.scoring_results_for_competition(v._db, "comp1")
     assert len(results) == 1
-    assert results[0]["max_memory_kb"] == 999
+    # 900 KB is what make_run_status reports as the coordinator's measurement.
+    assert results[0]["measured_memory_kb"] == 900
+    assert store.get_stage(v._db, "comp1") == "finalized"
+    assert store.latest_weights_for_competition(v._db, "comp1") == {"hk1": 1.0}
 
 
 @pytest.mark.asyncio
-async def test_run_stage_2_fails_candidate_whose_verified_scores_miss_the_floor(monkeypatch):
-    """A candidate whose runs were all rejected in stage 1 passes precheck but
-    still fails, because its verified scores are all 0.0."""
+async def test_stage_1_fails_candidate_whose_verified_scores_miss_the_floor(monkeypatch):
+    """A candidate whose runs were all rejected reaches scoring and is failed
+    by the floors, rather than vanishing without a record."""
     metagraph = FakeMetagraph(hotkeys=["hk1"], uids=[0], stake=[1.0], weights=[[1.0]], validator_permit=[True])
     v = make_validator(monkeypatch, metagraph=metagraph)
-    store.set_stage(v._db, "comp1", "stage2_scoring")
-    _insert_standby(v._db, "hk1", scores='{"mmlu": 0.0}')
-    _stub_precheck_env(monkeypatch)
+    _stage1_env(monkeypatch, {"hk1": (make_submission(), 5)},
+                statuses={"r100": make_run_status(repo="someone/else")})
 
-    from validator.scorer import PrecheckResult
-    monkeypatch.setattr(
-        "validator.scorer.precheck_one",
-        lambda hotkey, submission, spec, ctr, conn: PrecheckResult(True, gguf_file="model.gguf", measured_memory_kb=999),
-    )
-
-    await v.run_stage_2(make_spec(top_n=1), current_block=15)
+    await v.run_stage_1(make_spec(top_n=1))
 
     candidate = store.get_candidate(v._db, "comp1", "hk1")
     assert candidate["status"] == "failed"
@@ -527,101 +454,154 @@ async def test_run_stage_2_fails_candidate_whose_verified_scores_miss_the_floor(
 
 
 @pytest.mark.asyncio
-async def test_run_stage_2_backfills_on_precheck_failure(monkeypatch):
-    """A failed precheck must not stop the whole competition — the next
-    standby is picked up on the following pass, since only one candidate
-    is prechecked at a time."""
-    metagraph = FakeMetagraph(hotkeys=["hk1", "hk2"], uids=[0, 1], stake=[1.0, 1.0], weights=[[1.0, 0.0], [0.0, 1.0]], validator_permit=[True, True])
-    v = make_validator(monkeypatch, metagraph=metagraph)
-    store.set_stage(v._db, "comp1", "stage2_scoring")
-    _insert_standby(v._db, "hk1", rank=0)
-    _insert_standby(v._db, "hk2", rank=1)
-    _stub_precheck_env(monkeypatch)
-
-    from validator.scorer import PrecheckResult
-
-    def fake_precheck(hotkey, submission, spec, ctr, conn):
-        if hotkey == "hk1":
-            return PrecheckResult(False, reason="provenance fail")
-        return PrecheckResult(True, gguf_file="model.gguf", measured_memory_kb=999)
-    monkeypatch.setattr("validator.scorer.precheck_one", fake_precheck)
-
-    spec = make_spec(top_n=1)
-    await v.run_stage_2(spec, current_block=15)
-
-    assert store.get_candidate(v._db, "comp1", "hk1")["status"] == "failed"
-    assert store.get_candidate(v._db, "comp1", "hk2")["status"] == "standby"
-
-    await v.run_stage_2(spec, current_block=15)
-
-    assert store.get_candidate(v._db, "comp1", "hk2")["status"] == "done"
-
-
-@pytest.mark.asyncio
-async def test_run_stage_2_walks_candidates_in_rank_order(monkeypatch):
-    """Precheck is the expensive step, so it must be spent on the highest
-    verified scorer first."""
-    metagraph = FakeMetagraph(hotkeys=["hk_first", "hk_second"], uids=[0, 1], stake=[1.0, 1.0],
-                              weights=[[1.0, 0.0], [0.0, 1.0]], validator_permit=[True, True])
-    v = make_validator(monkeypatch, metagraph=metagraph)
-    store.set_stage(v._db, "comp1", "stage2_scoring")
-    _insert_standby(v._db, "hk_second", rank=1)
-    _insert_standby(v._db, "hk_first", rank=0)
-    _stub_precheck_env(monkeypatch)
-
-    prechecked = []
-
-    from validator.scorer import PrecheckResult
-
-    def recording_precheck(hotkey, submission, spec, ctr, conn):
-        prechecked.append(hotkey)
-        return PrecheckResult(True, gguf_file="model.gguf", measured_memory_kb=999)
-    monkeypatch.setattr("validator.scorer.precheck_one", recording_precheck)
-
-    await v.run_stage_2(make_spec(top_n=2, emission_distribution=[0.6, 0.4]), current_block=15)
-    assert prechecked == ["hk_first"]
-
-
-@pytest.mark.asyncio
-async def test_run_stage_2_precheck_raise_fails_candidate_not_stranded(monkeypatch):
-    """precheck_one raising (e.g. an unguarded check inside it) must resolve
-    the candidate to 'failed', not leave it stuck in 'prechecking' forever —
-    nothing re-selects a 'prechecking' row once admitted."""
+async def test_stage_1_fails_candidate_over_the_memory_cap(monkeypatch):
+    """The cap is enforced against the coordinator's measured figure."""
     metagraph = FakeMetagraph(hotkeys=["hk1"], uids=[0], stake=[1.0], weights=[[1.0]], validator_permit=[True])
     v = make_validator(monkeypatch, metagraph=metagraph)
-    store.set_stage(v._db, "comp1", "stage2_scoring")
-    _insert_standby(v._db, "hk1")
-    _stub_precheck_env(monkeypatch)
+    _stage1_env(monkeypatch, {"hk1": (make_submission(), 5)},
+                statuses={"r100": make_run_status(measured_memory_bytes=5000 * 1024)})
 
-    def raising_precheck(hotkey, submission, spec, ctr, conn):
-        raise RuntimeError("HF API list_repo_files failed: connection reset")
-    monkeypatch.setattr("validator.scorer.precheck_one", raising_precheck)
-
-    await v.run_stage_2(make_spec(top_n=1), current_block=15)
+    await v.run_stage_1(make_spec(
+        top_n=1, competition_type="gpu_memory_ceiling", max_gpu_memory_kb=1000,
+    ))
 
     candidate = store.get_candidate(v._db, "comp1", "hk1")
     assert candidate["status"] == "failed"
-    assert "precheck raised" in candidate["failure_reason"]
+    assert "exceeded memory cap" in candidate["failure_reason"]
+
+
+@pytest.mark.asyncio
+async def test_stage_1_backfills_past_a_failing_candidate(monkeypatch):
+    """A candidate that fails scoring must not consume a payable slot — the
+    next-ranked one takes it, which is the backfill the old stage 2 walked one
+    tick at a time."""
+    metagraph = FakeMetagraph(hotkeys=["hk_bad", "hk_good"], uids=[0, 1], stake=[1.0, 1.0],
+                              weights=[[1.0, 0.0], [0.0, 1.0]], validator_permit=[True, True])
+    v = make_validator(monkeypatch, metagraph=metagraph)
+    # hk_bad scores higher but reports no memory, so it cannot be scored.
+    reveals = {
+        "hk_bad": (make_submission(runs=[{"b": "mmlu", "r": "r901"}], file_sha256="b" * 64), 5),
+        "hk_good": (make_submission(runs=[{"b": "mmlu", "r": "r902"}]), 5),
+    }
+    _stage1_env(monkeypatch, reveals, statuses={
+        "r901": make_run_status(run_id="r901", scores={"mmlu": 0.9},
+                                 file_hashes={"model.gguf": ("sha256", "b" * 64)},
+                                 measured_memory_bytes=None),
+        "r902": make_run_status(run_id="r902", scores={"mmlu": 0.7}),
+    })
+
+    await v.run_stage_1(make_spec(top_n=1))
+
+    assert store.get_candidate(v._db, "comp1", "hk_bad")["status"] == "failed"
+    assert store.get_candidate(v._db, "comp1", "hk_good")["status"] == "done"
+    assert store.latest_weights_for_competition(v._db, "comp1") == {"hk_good": 1.0}
+
+
+@pytest.mark.asyncio
+async def test_stage_1_scores_past_top_n_but_pays_only_top_n(monkeypatch):
+    """Every candidate gets a terminal status and a score, but only top_n are
+    paid — the rest are recorded at weight 0, not given a slot that does not
+    exist."""
+    metagraph = FakeMetagraph(hotkeys=["hk_first", "hk_second"], uids=[0, 1], stake=[1.0, 1.0],
+                              weights=[[1.0, 0.0], [0.0, 1.0]], validator_permit=[True, True])
+    v = make_validator(monkeypatch, metagraph=metagraph)
+    reveals = {
+        "hk_second": (make_submission(runs=[{"b": "mmlu", "r": "r904"}], file_sha256="b" * 64), 5),
+        "hk_first": (make_submission(runs=[{"b": "mmlu", "r": "r903"}]), 5),
+    }
+    _stage1_env(monkeypatch, reveals, statuses={
+        "r903": make_run_status(run_id="r903", scores={"mmlu": 0.9}),
+        "r904": make_run_status(run_id="r904", scores={"mmlu": 0.6},
+                                 file_hashes={"model.gguf": ("sha256", "b" * 64)}),
+    })
+
+    await v.run_stage_1(make_spec(
+        top_n=1, competition_type="gpu_memory_ceiling", max_gpu_memory_kb=10_000,
+    ))
+
+    assert store.get_candidate(v._db, "comp1", "hk_first")["status"] == "done"
+    assert store.get_candidate(v._db, "comp1", "hk_second")["status"] == "done"
+    results = store.scoring_results_for_competition(v._db, "comp1")
+    assert [r["hotkey"] for r in results] == ["hk_first", "hk_second"]
+    assert store.latest_weights_for_competition(v._db, "comp1") == {"hk_first": 1.0, "hk_second": 0.0}
+
+
+@pytest.mark.asyncio
+async def test_stage_1_can_run_twice_without_stranding_the_competition(monkeypatch):
+    """Scoring no longer advances a stage marker, so a tick that dies partway
+    is re-run from the chain on the next one. The second pass must not trip
+    over the rows the first one wrote."""
+    metagraph = FakeMetagraph(hotkeys=["hk1"], uids=[0], stake=[1.0], weights=[[1.0]], validator_permit=[True])
+    v = make_validator(monkeypatch, metagraph=metagraph)
+    _stage1_env(monkeypatch, {"hk1": (make_submission(), 5)})
+
+    await v.run_stage_1(make_spec(top_n=1))
+    assert store.get_candidate(v._db, "comp1", "hk1")["status"] == "done"
+
+    # Simulate a crash between persisting candidates and finalizing: the
+    # candidate rows survive, the scored marker does not.
+    v._db.execute("DELETE FROM scored_competitions WHERE competition_id = 'comp1'")
+    v._db.commit()
+    assert store.is_scored(v._db, "comp1") is False
+
+    await v.run_stage_1(make_spec(top_n=1))
+
+    assert store.get_candidate(v._db, "comp1", "hk1")["status"] == "done"
+    assert store.scored_status(v._db, "comp1") == "scored"
+    assert store.latest_weights_for_competition(v._db, "comp1") == {"hk1": 1.0}
+
+
+@pytest.mark.asyncio
+async def test_stage_1_scores_a_reveal_committed_under_the_previous_spec(monkeypatch):
+    """A reveal is sealed on chain before the validator upgrades. Spec 2 only
+    carried an extra `max_memory`, so it must still score."""
+    import json as _json
+
+    from common.models.submission import parse_reveal_payload
+
+    metagraph = FakeMetagraph(hotkeys=["hk1"], uids=[0], stake=[1.0], weights=[[1.0]], validator_permit=[True])
+    v = make_validator(monkeypatch, metagraph=metagraph)
+
+    payload = _json.loads(make_submission().model_dump_json())
+    payload["spec"] = 2
+    payload["max_memory"] = 1000          # the field spec 3 dropped
+    old_submission = parse_reveal_payload(_json.dumps(payload))
+    assert old_submission is not None, "a spec-2 reveal must still parse"
+
+    _stage1_env(monkeypatch, {"hk1": (old_submission, 5)})
+    await v.run_stage_1(make_spec(top_n=1))
+
+    assert store.get_candidate(v._db, "comp1", "hk1")["status"] == "done"
+    assert store.latest_weights_for_competition(v._db, "comp1") == {"hk1": 1.0}
+
+
+@pytest.mark.asyncio
+async def test_stage_1_terminal_when_no_candidate_can_be_scored(monkeypatch):
+    metagraph = FakeMetagraph(hotkeys=["hk1"], uids=[0], stake=[1.0], weights=[[1.0]], validator_permit=[True])
+    v = make_validator(monkeypatch, metagraph=metagraph)
+    _stage1_env(monkeypatch, {"hk1": (make_submission(), 5)},
+                statuses={"r100": make_run_status(status="failed", failure_reason="pod died")})
+
+    await v.run_stage_1(make_spec(top_n=1))
+
+    assert store.scored_status(v._db, "comp1") == "failed_no_participants"
+    assert store.latest_weights_for_competition(v._db, "comp1") is None
 
 
 @pytest.mark.asyncio
 async def test_leader_loop_finalizes_competition_that_crossed_into_distributing(monkeypatch):
     """A candidate scored on the final scoring tick must still be paid.
 
-    Stage work used to run only in the SCORING phase, so a competition whose
-    last candidate finished within one loop interval of scoring_end_block
-    crossed into DISTRIBUTING before anything could call _finalize_stage_3 —
-    stranding it in stage2_scoring with scored candidates and no weights.
+    Stage work used to run only in the SCORING phase, so a validator that was
+    down across scoring_end_block would never score the competition at all.
     """
     metagraph = FakeMetagraph(hotkeys=["hk1"], uids=[0], stake=[1.0], weights=[[1.0]], validator_permit=[True])
     v = make_validator(monkeypatch, metagraph=metagraph)
     spec = make_spec(top_n=1, distribution_blocks=1000, reveal_grace_blocks=0)
 
-    store.set_stage(v._db, "comp1", "stage2_scoring")
-    _insert_standby(v._db, "hk1", status="done")
-    store.record_scoring_result(v._db, "comp1", "hk1", final_score=0.9, max_memory_kb=999)
-    v._db.commit()
-    monkeypatch.setattr("competition.precheck_client.stop_container", lambda cid: None)
+    monkeypatch.setattr("validator.chain_scanner.scan_reveals",
+                        lambda subtensor, _spec: {"hk1": (make_submission(), 5)})
+    stub_coordinator(monkeypatch)
 
     # Block 25 is past scoring_end_block=20 -> DISTRIBUTING, not SCORING.
     from common.models.competition import CompetitionPhase
@@ -641,73 +621,25 @@ async def test_leader_loop_does_not_rework_an_already_scored_competition(monkeyp
     v = make_validator(monkeypatch, metagraph=metagraph)
     spec = make_spec(top_n=1, distribution_blocks=1000, reveal_grace_blocks=0)
 
-    store.set_stage(v._db, "comp1", "stage2_scoring")
     store.mark_scored(v._db, "comp1", status="scored")
 
     called = []
-    async def fake_stage_2(s, b):
+    async def fake_stage_1(s):
         called.append(s.id)
-    monkeypatch.setattr(v, "run_stage_2", fake_stage_2)
+    monkeypatch.setattr(v, "run_stage_1", fake_stage_1)
 
     await _run_one_leader_tick(monkeypatch, v, spec, current_block=25)
     assert called == []
-
-
-def test_reset_stale_candidate_statuses_recovers_orphaned_prechecking_row(monkeypatch):
-    """A candidate left in 'prechecking' by a process that died mid-call
-    (kill, OOM, restart) must be swept back to 'standby' on the next
-    Validator startup for any competition still in stage2_scoring."""
-    db_path = Path(tempfile.mkstemp(suffix=".db")[1])
-    monkeypatch.setattr(store, "validator_db_path", lambda: db_path)
-    monkeypatch.setattr(common_settings, "BITTENSOR", False)
-    monkeypatch.setattr(common_settings, "VALIDATOR_MODE", "leader", raising=False)
-
-    db = store.init_db()
-    store.upsert_competition(db, make_spec(id="comp1"))
-    store.set_stage(db, "comp1", "stage2_scoring")
-    store.insert_revealed_candidate(db, "comp1", "hk1", rank=0, submission_json=make_submission().model_dump_json(), reveal_block=5, status="prechecking")
-    db.commit()
-
-    Validator(wallet=FakeWallet(), subtensor=FakeSubtensor(metagraph=None), metagraph=None)
-
-    assert store.get_candidate(db, "comp1", "hk1")["status"] == "standby"
-
-
-@pytest.mark.asyncio
-async def test_run_stage_2_skips_precheck_without_blocking_when_container_not_ready(monkeypatch):
-    """launch() must be called (fast, non-blocking) but precheck work must be
-    skipped entirely — not waited on — while the container is still starting
-    (e.g. downloading a base model)."""
-    metagraph = FakeMetagraph(hotkeys=["hk1"], uids=[0], stake=[1.0], weights=[[1.0]], validator_permit=[True])
-    v = make_validator(monkeypatch, metagraph=metagraph)
-    store.set_stage(v._db, "comp1", "stage2_scoring")
-    _insert_standby(v._db, "hk1")
-
-    launch_calls = {"n": 0}
-    monkeypatch.setattr("competition.precheck_client.PrecheckContainer.launch", lambda self: launch_calls.__setitem__("n", launch_calls["n"] + 1))
-    monkeypatch.setattr("competition.precheck_client.is_container_up", lambda cid: False)  # still starting
-
-    def exploding_precheck(*a, **k):
-        raise AssertionError("precheck_one must not be called while container is not ready")
-    monkeypatch.setattr("validator.scorer.precheck_one", exploding_precheck)
-
-    await v.run_stage_2(make_spec(top_n=1), current_block=15)
-
-    assert launch_calls["n"] == 1  # launch() was still called (idempotent, cheap)
-    candidate = store.get_candidate(v._db, "comp1", "hk1")
-    assert candidate["status"] == "standby"  # untouched — not pulled into precheck this tick
-
-
 # ---------------------------------------------------------------------------
 # Restart resume — no in-process state, just DB continuity
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
-async def test_stage2_scoring_state_survives_across_separate_validator_instances(monkeypatch):
+async def test_scoring_state_survives_across_separate_validator_instances(monkeypatch):
     """No background tasks, no in-process state — a 'restart' is just
-    constructing a new Validator against the same DB. The stage-1 verified
-    scores in particular must survive, since stage 2 scores from them and
-    never re-polls the coordinator."""
+    constructing a new Validator against the same DB. The verified scores and
+    the coordinator's memory figure must both survive, since they are what a
+    candidate was scored on."""
     import json
 
     db_path = Path(tempfile.mkstemp(suffix=".db")[1])
@@ -716,17 +648,15 @@ async def test_stage2_scoring_state_survives_across_separate_validator_instances
     monkeypatch.setattr(common_settings, "VALIDATOR_MODE", "leader", raising=False)
 
     v1 = Validator(wallet=FakeWallet(), subtensor=FakeSubtensor(), metagraph=None)
-    store.set_stage(v1._db, "comp1", "stage2_scoring")
     store.insert_revealed_candidates(v1._db, "comp1", [{
         "hotkey": "hk1", "rank": 0, "submission_json": make_submission().model_dump_json(),
         "reveal_block": 5, "status": "done", "verified_scores": {"mmlu": 0.8},
+        "measured_memory_kb": 999,
     }])
-    store.mark_precheck_passed(v1._db, "comp1", "hk1", gguf_file="model.gguf", measured_memory_kb=999)
 
     v2 = Validator(wallet=FakeWallet(), subtensor=FakeSubtensor(), metagraph=None)
     candidate = store.get_candidate(v2._db, "comp1", "hk1")
     assert candidate["status"] == "done"
-    assert candidate["gguf_file"] == "model.gguf"
     assert candidate["measured_memory_kb"] == 999
     assert json.loads(candidate["verified_scores_json"]) == {"mmlu": 0.8}
 
@@ -761,7 +691,7 @@ async def test_follower_does_not_mark_scored_when_all_weights_zero(monkeypatch):
     monkeypatch.setattr("validator.validator.get_current_block", lambda subtensor: 15)
     monkeypatch.setattr("competition.scoring.compute_emission_weights", lambda ranked, dist: {"hk1": 0.0})
 
-    results = [{"hotkey": "hk1", "competition_id": "comp1", "final_score": 0.7, "max_memory_kb": 1000}]
+    results = [{"hotkey": "hk1", "competition_id": "comp1", "final_score": 0.7, "measured_memory_kb": 1000}]
     await _run_one_follower_tick(monkeypatch, v, results, "scored")
 
     assert store.is_scored(v._db, "comp1") is False
@@ -776,7 +706,7 @@ async def test_follower_marks_scored_on_real_weights(monkeypatch):
     monkeypatch.setattr(v, "_get_active_competitions", lambda current_block: [spec])
     monkeypatch.setattr("validator.validator.get_current_block", lambda subtensor: 15)
 
-    results = [{"hotkey": "hk1", "competition_id": "comp1", "final_score": 0.7, "max_memory_kb": 1000}]
+    results = [{"hotkey": "hk1", "competition_id": "comp1", "final_score": 0.7, "measured_memory_kb": 1000}]
     await _run_one_follower_tick(monkeypatch, v, results, "scored")
 
     assert store.is_scored(v._db, "comp1") is True
@@ -860,12 +790,12 @@ async def test_follower_tracks_leader_result_changes_after_finalizing(monkeypatc
     monkeypatch.setattr(v, "_get_active_competitions", lambda current_block: [spec])
     monkeypatch.setattr("validator.validator.get_current_block", lambda subtensor: 15)
 
-    first = [{"hotkey": "hk1", "competition_id": "comp1", "final_score": 0.7, "max_memory_kb": 1000}]
+    first = [{"hotkey": "hk1", "competition_id": "comp1", "final_score": 0.7, "measured_memory_kb": 1000}]
     await _run_one_follower_tick(monkeypatch, v, first, "scored")
     assert store.latest_weights_for_competition(v._db, "comp1") == {"hk1": 1.0}
 
     # admin corrects the winner on the leader
-    second = [{"hotkey": "hk2", "competition_id": "comp1", "final_score": 0.9, "max_memory_kb": 1000}]
+    second = [{"hotkey": "hk2", "competition_id": "comp1", "final_score": 0.9, "measured_memory_kb": 1000}]
     await _run_one_follower_tick(monkeypatch, v, second, "scored")
     assert store.latest_weights_for_competition(v._db, "comp1") == {"hk2": 1.0}
 
@@ -881,7 +811,7 @@ async def test_follower_holds_weights_while_leader_is_mid_reset(monkeypatch):
     monkeypatch.setattr(v, "_get_active_competitions", lambda current_block: [spec])
     monkeypatch.setattr("validator.validator.get_current_block", lambda subtensor: 15)
 
-    results = [{"hotkey": "hk1", "competition_id": "comp1", "final_score": 0.7, "max_memory_kb": 1000}]
+    results = [{"hotkey": "hk1", "competition_id": "comp1", "final_score": 0.7, "measured_memory_kb": 1000}]
     await _run_one_follower_tick(monkeypatch, v, results, "scored")
     await _run_one_follower_tick(monkeypatch, v, [], None)
 
@@ -898,7 +828,7 @@ async def test_follower_does_not_rewrite_unchanged_weights(monkeypatch):
     monkeypatch.setattr(v, "_get_active_competitions", lambda current_block: [spec])
     monkeypatch.setattr("validator.validator.get_current_block", lambda subtensor: 15)
 
-    results = [{"hotkey": "hk1", "competition_id": "comp1", "final_score": 0.7, "max_memory_kb": 1000}]
+    results = [{"hotkey": "hk1", "competition_id": "comp1", "final_score": 0.7, "measured_memory_kb": 1000}]
     for _ in range(3):
         await _run_one_follower_tick(monkeypatch, v, results, "scored")
 

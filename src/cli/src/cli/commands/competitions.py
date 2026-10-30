@@ -46,8 +46,19 @@ def competitions(
         ]
         for task in spec.benchmarks:
             lines.append(f"  {task.name:<14} min={task.min_score:.2f}")
-        if spec.max_memory_kb:
-            lines.append(f"\n[dim]Max memory:[/dim]     {spec.max_memory_kb:,} KB")
+        if spec.kl_corpus_id:
+            lines += [
+                "",
+                "[bold]KL check:[/bold] required",
+                f"  corpus         {spec.kl_corpus_id}",
+                "  [dim]Divergence from the base model multiplies your lowest[/dim]",
+                "  [dim]benchmark score. Without a verifiable run the multiplier[/dim]",
+                "  [dim]is 0, and a candidate scoring 0 earns nothing.[/dim]",
+            ]
+        if spec.max_gpu_memory_kb:
+            lines.append(f"\n[dim]GPU memory cap:[/dim] {spec.max_gpu_memory_kb:,} KB")
+            lines.append("  [dim]Measured by the benchmark service while loading your[/dim]")
+            lines.append("  [dim]model. Over the cap means no score.[/dim]")
 
         lines += [
             "",

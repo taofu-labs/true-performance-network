@@ -1,0 +1,39 @@
+{
+  "benchmarks": [
+    {
+      "min_score": 0.0,
+      "name": "mmlu",
+      "weight": 0.7
+    },
+    {
+      "min_score": 0.0,
+      "name": "hellaswag",
+      "weight": 0.3
+    }
+  ],
+  "commit_end_block": 8913992,
+  "competition_type": "ram_ceiling",
+  "description": "The Arena is open. For our inaugural competition, the target is tpnlabs/tpn-001-\u2026",
+  "distribution_blocks": 50400,
+  "emission_distribution": [
+    0.4,
+    0.25,
+    0.2,
+    0.1,
+    0.05
+  ],
+  "emission_weight": 0.25,
+  "id": "tpn-001",
+  "max_memory_kb": 2097152,
+  "model_repo": "tpnlabs/tpn-001-base",
+  "model_requirements": {
+    "format": "gguf"
+  },
+  "name": "tpn-001-base",
+  "ram_check_context_length": 2096,
+  "reveal_grace_blocks": 10,
+  "schema_version": 1,
+  "scoring_end_block": 8935592,
+  "start_block": 8867192,
+  "top_n": 5
+}

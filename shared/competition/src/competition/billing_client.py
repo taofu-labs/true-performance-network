@@ -14,6 +14,7 @@ directly, and they cannot buy credits. Top up through the web GUI first.
     status = client.order_status(order_id)    # run_id lands here once queued
 """
 import os
+import re
 import time
 from dataclasses import dataclass
 from typing import Dict, List, Optional
@@ -23,7 +24,7 @@ from loguru import logger
 
 from common.urls import validate_base_url
 
-DEFAULT_BILLING_URL = os.getenv("BENCHMARK_BILLING_URL", "https://benchmarks.trueperformancenetwork.com/api/v1")
+DEFAULT_BILLING_URL = os.getenv("BENCHMARK_BILLING_URL", "https://bench.trueperformancenetwork.com/api/v1")
 
 # Order statuses that will never progress further.
 _TERMINAL_ORDER_STATUSES = {"completed", "failed", "cancelled", "refunded"}
@@ -123,11 +124,18 @@ class BillingClient:
 
     # ── Quote / submit / poll ─────────────────────────────────────────────
 
-    def quote(self, request: dict, huggingface_token_id: Optional[str] = None) -> Quote:
+    def quote(
+        self,
+        request: dict,
+        huggingface_token_id: Optional[str] = None,
+        path: str = "/benchmarks/quote",
+    ) -> Quote:
+        """Price one request. `path` selects the service: comparisons quote on
+        /comparisons/quote and answer with the same billing_price shape."""
         body: dict = {"request": request}
         if huggingface_token_id:
             body["huggingface_token_id"] = huggingface_token_id
-        data = self._call("POST", "/benchmarks/quote", json=body)
+        data = self._call("POST", path, json=body)
         price = data.get("billing_price") or {}
         coordinator_quote = data.get("quote") or {}
         return Quote(
@@ -147,6 +155,7 @@ class BillingClient:
         request: dict,
         quote: Optional[Quote] = None,
         huggingface_token_id: Optional[str] = None,
+        path: str = "/benchmarks",
     ) -> Order:
         """
         Place a benchmark order, spending prepaid credit.
@@ -164,7 +173,7 @@ class BillingClient:
         else:
             body["force"] = True
 
-        data = self._call("POST", "/benchmarks", json=body)
+        data = self._call("POST", path, json=body)
         order = data.get("order") or {}
         return Order(
             id=order.get("id", ""),
@@ -247,4 +256,55 @@ def build_request(
         "model_files": [file],
         "benchmark_engine": benchmark_engine,
         "benchmark": benchmark,
+    }
+
+
+COMPARISON_QUOTE_PATH = "/comparisons/quote"
+COMPARISON_SUBMIT_PATH = "/comparisons"
+
+# Quantization tag in a GGUF filename, e.g. Model-Q4_K_M.gguf, Model-IQ3_XXS.gguf.
+_GGUF_QUANTIZATION = re.compile(
+    r"-((?:I?Q\d[0-9_A-Z]*)|F16|F32|BF16|MXFP4|NVFP4)\.gguf$", re.IGNORECASE
+)
+
+
+def gguf_quantization(file: str) -> Optional[str]:
+    """
+    Quantization tag of a GGUF filename, or None when it carries no tag.
+
+    A repo holding several GGUF variants needs this to disambiguate which one
+    model_files selects; a single-variant repo, or one whose quantization the
+    service cannot read from metadata, rejects an explicit value instead.
+    """
+    match = _GGUF_QUANTIZATION.search(file)
+    return match.group(1).upper() if match else None
+
+
+def build_comparison_request(
+    repository: str,
+    revision: str,
+    file: str,
+    base_repo: str,
+    corpus_id: str,
+) -> dict:
+    """
+    Build the KL comparison request for a competition's pinned base and corpus.
+
+    `reference: transformers` is required, not a default: a gguf reference never
+    loads the HF base, so it produces no base-side pairing and the validator
+    cannot check the run was measured against the competition's base.
+    """
+    quantization = gguf_quantization(file)
+    return {
+        "protocol": "fidelity-v1",
+        "workload": "standard",
+        "reference": "transformers",
+        "base": {"huggingface_repo": base_repo},
+        "candidate": {
+            "huggingface_repo": repository,
+            "huggingface_revision": revision,
+            "model_files": [file],
+            **({"quantization": quantization} if quantization else {}),
+        },
+        "dataset": {"kind": "platform", "corpus_id": corpus_id},
     }

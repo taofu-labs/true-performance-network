@@ -55,3 +55,18 @@ def test_competitions_all_flag_shows_inactive_too(monkeypatch):
     result_all = runner.invoke(app, ["--leader-url", LEADER_URL, "competitions", "--all"])
     assert result_all.exit_code == 0
     assert "comp-a" in result_all.stdout
+
+
+def test_shows_the_kl_check_so_miners_know_it_is_required(monkeypatch):
+    stub_leader(monkeypatch, {"kl_corpus_id": "corpus-000002",
+                              "model_repo": "Qwen/Qwen2.5-0.5B-Instruct"})
+    result = runner.invoke(app, ["--leader-url", LEADER_URL, "competitions", "--all"])
+    assert result.exit_code == 0, result.stdout
+    assert "KL check" in result.stdout
+    assert "corpus-000002" in result.stdout
+
+
+def test_hides_the_kl_check_when_the_competition_has_none(monkeypatch):
+    stub_leader(monkeypatch)
+    result = runner.invoke(app, ["--leader-url", LEADER_URL, "competitions", "--all"])
+    assert "KL check" not in result.stdout

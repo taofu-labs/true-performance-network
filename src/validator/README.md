@@ -2,13 +2,14 @@
 
 Two validator modes, controlled by `VALIDATOR_MODE` (`.env`):
 
-- **leader** (default) — scans chain reveals, verifies the benchmark run ids
-  miners committed, ranks on those verified scores, prechecks the top candidates,
-  computes and sets weights, persists every scoring run to SQLite, and serves a
-  read-only HTTP API for followers and dashboards.
+- **leader** (default) — scans chain reveals, verifies the benchmark and KL run ids
+  miners committed, ranks and scores on what those runs report (including the GPU
+  memory the coordinator measured), computes and sets weights, persists every
+  scoring run to SQLite, and serves a read-only HTTP API for followers and
+  dashboards. It downloads no models and runs no inference.
 - **follower** — parses competitions itself but reads scoring results from a leader
-  validator's API instead of verifying/prechecking. Recomputes emission weights
-  locally from the leader's `ScoringResult`s and sets its own weights.
+  validator's API instead of verifying runs. Recomputes emission weights locally
+  from the leader's `ScoringResult`s and sets its own weights.
 
 Both modes run the same chain-copy `weight_loop()` fallback in parallel — if a
 follower can't reach its leader, it just skips that competition's cycle and keeps
@@ -17,7 +18,7 @@ again.
 
 ## Persistence
 
-All validator state (scored competitions, bans, and — leader-only — full scoring
+All validator state (scored competitions and — leader-only — full scoring
 history and weights history) lives in a single SQLite file:
 
 ```
@@ -72,7 +73,7 @@ weights. `competition_id` is required — 400 without it.
 {
   "results": [
     {"competition_id": "tpn-001", "hotkey": "5F...", "final_score": -812345,
-     "max_memory_kb": 812345, "finalized_at": 1756100000.0}
+     "measured_memory_kb": 812345, "finalized_at": 1756100000.0}
   ],
   "scored_status": "scored"
 }
@@ -126,21 +127,19 @@ Clear scoring state so the competition re-runs from stage 1. For a competition t
 gave up on a transient failure — `failed_stage1_infra` (coordinator unreachable, chain
 scan failed), `failed_no_reveals`, or `failed_no_participants` — while its scoring
 window is still open. Without this the only recovery was `--clean`, which wipes every
-competition's history plus the ban list.
+competition's history.
 
 Deletes that competition's `revealed_candidates`, `benchmark_results`,
 `scoring_results`, and its `scored_competitions` row, and reports
-the per-table counts. **Bans and weights history are preserved** — a ban records
-proven miner misbehaviour that a validator-side infra failure does not undo, and
-weights history stays as an audit trail of what was already set on chain.
+the per-table counts. **Weights history is preserved** — it stays as an audit
+trail of what was already set on chain.
 
 **There is no override.** A reset is allowed only when both hold:
 
 - The competition's stage is `stage1_ranking` (including a competition that has not
   been touched yet), `failed_no_reveals`, `failed_no_participants`, or
-  `failed_stage1_infra`. A competition in `stage2_scoring` or `finalized` is refused
-  with 409 — stage 2 is mid-run, and a finalized competition already had weights
-  computed and published from its result.
+  `failed_stage1_infra`. A competition in `finalized` is refused with 409 — it
+  already had weights computed and published from its result.
 - Its scoring window is still open (`current_block < scoring_end_block`). Refused with
   409 once closed, since no further reveals can arrive and a re-run cannot produce new
   results.
@@ -156,14 +155,14 @@ needed.
 Halt the leader's scoring loop for one competition, and start it again — for stopping
 a competition mid-flight without losing its state.
 
-Pause stops only the leader's per-tick scoring work (stage 1 and stage 2) for that
+Pause stops only the leader's per-tick scoring work for that
 competition. Weights already recorded keep distributing, followers are unaffected, and
 block-based phases keep advancing — a long pause can run a competition past its
 `scoring_end_block`, and the next unpaused tick then finalizes it with whatever was
 scored.
 
-Takes effect at the next tick boundary; work already in flight finishes. A candidate
-left in `prechecking` keeps that status and resumes from there.
+Takes effect at the next tick boundary; work already in flight finishes. A competition
+mid-scoring restarts its scoring pass from the beginning on the next tick.
 
 Both routes are idempotent. 404 if not found. Pause returns 409 once a competition has
 finished scoring; resume has no such guard. `reset-scoring` clears the flag along with

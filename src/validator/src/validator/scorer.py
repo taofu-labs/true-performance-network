@@ -1,29 +1,24 @@
 """
-Scorer for TPN — no full model download in the validator process.
+Scorer for TPN — nothing is downloaded or run in the validator process.
 
-Miners run their own benchmarks on the coordinator and commit the resulting run
-ids on chain. This module verifies those runs really benchmarked the committed
-model, then prechecks candidates in verified-score order.
+Miners run their own benchmarks and KL comparison on the coordinator and commit
+the resulting run ids on chain. This module verifies those runs really measured
+the committed model, and reads every number it scores on out of them: benchmark
+scores, the KL fidelity multiplier, and the GPU memory the candidate took to
+load.
 """
 import sqlite3
-import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 
-from huggingface_hub import HfApi
 from loguru import logger
 
-from common import settings as common_settings
-from common.models.competition import CompetitionSpec
+from common.models.competition import KL_RUN_NAME, CompetitionSpec, CompetitionType
 from common.models.submission import MinerSubmission
 from competition.benchmark_client import Coordinator, RunStatus, RunStatusCode
-from competition.model_store import check_repo_public
-from competition.precheck_client import PrecheckContainer
-from competition.scoring import final_score, passes_floors, passes_memory_cap
+from competition.scoring import final_score, kl_norm, passes_floors, passes_memory_cap
 from validator import store
-
-_hf_api = HfApi()
 
 
 def dedup_winner(
@@ -52,102 +47,6 @@ def dedup_winner(
     return existing_hotkey, existing_block
 
 
-@dataclass
-class PrecheckResult:
-    passed: bool
-    reason: str = ""
-    gguf_file: str = ""
-    measured_memory_kb: int = 0
-
-
-def precheck_one(
-    hotkey: str,
-    submission: MinerSubmission,
-    spec: CompetitionSpec,
-    precheck_ctr: PrecheckContainer,
-    conn: sqlite3.Connection,
-) -> PrecheckResult:
-    if not check_repo_public(submission.repository):
-        return PrecheckResult(False, "repo not publicly accessible")
-
-    try:
-        files = list(_hf_api.list_repo_files(
-            repo_id=submission.repository,
-            revision=submission.huggingface_revision,
-        ))
-    except Exception as e:
-        return PrecheckResult(False, f"HF API list_repo_files failed: {e}")
-
-    # Match the submitted filename exactly. Picking "the first .gguf" measures
-    # RAM on, benchmarks, and hashes a file the miner may not have submitted —
-    # and a hash mismatch there bans the hotkey permanently.
-    gguf_file = submission.file
-    if gguf_file:
-        if gguf_file not in files:
-            available = ", ".join(f for f in files if f.endswith(".gguf")) or "none"
-            return PrecheckResult(
-                False,
-                f"submitted file '{gguf_file}' not found at revision (.gguf present: {available})",
-            )
-    else:
-        gguf_file = next((f for f in files if f.endswith(".gguf")), None)
-        if not gguf_file:
-            return PrecheckResult(False, "no .gguf file found at revision")
-        logger.warning(f"{hotkey[:12]} submission has no file field — falling back to {gguf_file}")
-
-    logger.debug(
-        f"{hotkey[:12]} starting precheck | {submission.repository}"
-        f"@{submission.huggingface_revision[:12]}/{gguf_file}"
-        f" | context_length={spec.ram_check_context_length}"
-    )
-    started = time.monotonic()
-    verdict = precheck_ctr.check(
-        submission.repository,
-        submission.huggingface_revision,
-        gguf_file,
-        spec.ram_check_context_length,
-    )
-    logger.debug(f"{hotkey[:12]} precheck call took {time.monotonic() - started:.1f}s")
-
-    if verdict.error:
-        logger.warning(f"{hotkey[:12]} precheck error: {verdict.error}")
-        return PrecheckResult(False, f"precheck error: {verdict.error}")
-
-    if verdict.provenance and not verdict.provenance.is_derivative:
-        notes = "; ".join(verdict.provenance.notes) or "CKA below threshold"
-        logger.warning(f"{hotkey[:12]} provenance fail: {notes}")
-        return PrecheckResult(False, f"provenance fail: {notes}")
-
-    if verdict.sha256 and verdict.sha256.lower() != submission.file_sha256:
-        reason = f"sha256 mismatch: revealed={submission.file_sha256[:12]} actual={verdict.sha256[:12]}"
-        store.ban(conn, hotkey, reason)
-        logger.warning(f"{hotkey[:12]} BANNED — {reason}")
-        return PrecheckResult(False, f"{reason} (hotkey banned)")
-
-    if not verdict.ram:
-        return PrecheckResult(False, "no RAM measurement returned by precheck")
-
-    if not verdict.ram.passed:
-        return PrecheckResult(False, "llama-cli load failed")
-
-    reported_bytes = submission.max_memory * 1024
-    measured_bytes = verdict.ram.ram_bytes
-    tolerance = common_settings.RAM_CHECK_LYING_TOLERANCE
-    if reported_bytes > 0 and measured_bytes > reported_bytes * (1 + tolerance):
-        diff = abs(measured_bytes - reported_bytes) / reported_bytes
-        reason = f"max_memory lie: reported {reported_bytes}B measured {measured_bytes}B ({diff:.1%})"
-        logger.warning(f"{hotkey[:12]} {reason}")
-        return PrecheckResult(False, reason)
-
-    logger.info(
-        f"{hotkey[:12]} precheck OK"
-        f" ram={verdict.ram.ram_bytes:,}B"
-        + (f" CKA={verdict.provenance.cka:.3f}" if verdict.provenance else "")
-    )
-
-    return PrecheckResult(True, gguf_file=gguf_file, measured_memory_kb=measured_bytes // 1024)
-
-
 # ---------------------------------------------------------------------------
 # Run-id verification
 #
@@ -165,6 +64,10 @@ class RunVerification:
     reason: str = ""
     repo: str = ""
     revision: str = ""
+    # GPU memory the coordinator measured for this run's candidate, in KB. Only
+    # the KL run carries it (it loads the committed model against the base);
+    # 0 means the run reported none.
+    measured_memory_kb: int = 0
 
 
 def verify_run(
@@ -212,11 +115,18 @@ def verify_run(
 
     # HF only exposes a true content sha256 for LFS files; `xet` and `git_blob`
     # hashes are not comparable to the miner's file_sha256. Repo+revision+path
-    # already pins the content, and precheck rehashes the real file, so a
-    # non-sha256 algorithm skips this check rather than failing the run.
+    # already pins the content, so a non-sha256 algorithm skips this check rather
+    # than failing the run. A mismatch fails the run; nothing bans a hotkey.
     algorithm, value = status.file_hashes.get(submission.file, (None, None))
     if algorithm == "sha256" and value and value.lower() != submission.file_sha256:
         return fail(f"file hash mismatch: run has {value[:12]}, submission commits {submission.file_sha256[:12]}")
+
+    # A winner's model has to be downloadable by anyone. The validator never
+    # contacts the Hub, so the run's own view of the repo is the evidence —
+    # a miner who publishes only long enough to benchmark is caught here.
+    if status.repo_private or status.repo_gated:
+        state = "private" if status.repo_private else "gated"
+        return fail(f"repo was {state} when the run read it — publish it before scoring")
 
     if benchmark_name not in status.benchmarks:
         covered = ", ".join(status.benchmarks) or "none"
@@ -241,6 +151,139 @@ def verify_run(
         score=status.scores[benchmark_name],
         repo=status.repo or "",
         revision=status.revision or "",
+        # Suite-level: one model load serves every benchmark in the run. Absent
+        # on older runs, which is why the KL run is the authoritative source.
+        measured_memory_kb=(status.measured_memory_bytes or 0) // 1024,
+    )
+
+
+# `control_to_candidate` compares against an F16 control converted from the same
+# base on the same pod, so both sides run llama.cpp and engine noise cancels,
+# leaving quantization damage alone. `original_to_candidate` conflates the two:
+# measured control noise is 0.004 nats at P99. P99 rather than the mean prices
+# tail damage: a Q4_K_M means 0.025 nats but reaches 0.146 at P99.
+KL_PAIRING = "control_to_candidate"
+KL_QUANTILE = "0.99"
+
+
+def verify_kl_run(
+    submission: MinerSubmission,
+    spec: CompetitionSpec,
+    run_id: str,
+    status: RunStatus,
+) -> RunVerification:
+    """
+    Check a comparison run measured the committed model against the
+    competition's base on the competition's platform corpus, and return its KL
+    fidelity multiplier as `score`.
+
+    Rejection is never fatal and never bans: the multiplier is 0.0, which zeroes
+    the final score through the multiplication without removing the candidate.
+    An unverifiable run must never read as perfect fidelity.
+    """
+    fail = lambda reason: RunVerification(
+        benchmark=KL_RUN_NAME, run_id=run_id, ok=False, reason=reason,
+        repo=status.repo or "", revision=status.revision or "",
+    )
+
+    if status.status == RunStatusCode.FAILED:
+        return fail(f"KL run failed: {status.failure_reason or 'unknown'}")
+
+    if status.status != RunStatusCode.COMPLETED:
+        return fail(f"KL run not complete at scoring time (status={status.status})")
+
+    comparison = status.comparison
+    if not isinstance(comparison, dict):
+        return fail("run carries no comparison result — not a comparison run")
+
+    # A verifier run reports one 0-100 score over a private sharded suite, not
+    # pairings over the competition's corpus.
+    if comparison.get("protocol") != "fidelity-v1":
+        return fail(f"wrong comparison protocol {comparison.get('protocol')!r}, need fidelity-v1")
+
+    if comparison.get("outcome") != "complete":
+        return fail(f"comparison outcome {comparison.get('outcome')!r}, need complete")
+
+    # A gguf reference never loads the HF base: no base-side pairing, nothing to
+    # pin model_repo against.
+    if comparison.get("reference") != "transformers":
+        return fail(f"comparison reference {comparison.get('reference')!r}, need transformers")
+
+    # Never optional: an unpinned base lets the miner choose what they are
+    # measured against. A spec stored before that rule reached CompetitionSpec
+    # fails here rather than scoring a free multiplier.
+    if not spec.model_repo:
+        return fail("competition sets kl_corpus_id but pins no model_repo — cannot verify the base")
+    if not status.base_repo:
+        return fail("coordinator returned no base model identity for KL run")
+    if status.base_repo.lower() != spec.model_repo.lower():
+        return fail(
+            f"base mismatch: KL run compared against {status.base_repo}, "
+            f"competition requires {spec.model_repo}"
+        )
+
+    # A miner-uploaded dataset is text they chose.
+    dataset = status.dataset or {}
+    if dataset.get("kind") != "platform":
+        return fail(f"KL run used a {dataset.get('kind')!r} dataset, need the platform corpus")
+    if dataset.get("corpus_id") != spec.kl_corpus_id:
+        return fail(
+            f"corpus mismatch: KL run used {dataset.get('corpus_id')!r}, "
+            f"competition requires {spec.kl_corpus_id!r}"
+        )
+
+    # Same binding as a benchmark run: without it a miner submits a comparison
+    # of some other, better-behaved model.
+    if not status.repo:
+        return fail("coordinator returned no candidate model identity for KL run")
+    if status.repo.lower() != submission.repository.lower():
+        return fail(f"repo mismatch: KL run compared {status.repo}, submission commits {submission.repository}")
+    if (status.revision or "").lower() != submission.huggingface_revision.lower():
+        return fail(
+            f"revision mismatch: KL run used {(status.revision or '')[:12]}, "
+            f"submission commits {submission.huggingface_revision[:12]}"
+        )
+    if submission.file not in status.model_files:
+        present = ", ".join(status.model_files) or "none"
+        return fail(f"committed file '{submission.file}' not among KL run's model files ({present})")
+
+    algorithm, value = status.file_hashes.get(submission.file, (None, None))
+    if algorithm == "sha256" and value and value.lower() != submission.file_sha256:
+        return fail(f"file hash mismatch: KL run has {value[:12]}, submission commits {submission.file_sha256[:12]}")
+
+    if status.repo_private or status.repo_gated:
+        state = "private" if status.repo_private else "gated"
+        return fail(f"repo was {state} when the KL run read it — publish it before scoring")
+
+    pairing = (comparison.get("pairings") or {}).get(KL_PAIRING)
+    if not isinstance(pairing, dict):
+        return fail(f"comparison has no '{KL_PAIRING}' pairing")
+
+    # The DTO filters `quantiles` on presence, so the key can be absent — that is
+    # unverifiable, not zero divergence.
+    quantile = ((pairing.get("kl") or {}).get("quantiles") or {}).get(KL_QUANTILE)
+    if not isinstance(quantile, (int, float)) or isinstance(quantile, bool):
+        return fail(f"comparison has no P{KL_QUANTILE} KL for '{KL_PAIRING}'")
+
+    # The competition's memory cap is enforced against this figure, so a run
+    # that reports none cannot be scored — the cap would silently pass.
+    measured_bytes = status.measured_memory_bytes
+    if not measured_bytes or measured_bytes <= 0:
+        return fail("KL run reported no measured GPU memory for the candidate")
+
+    multiplier = kl_norm(float(quantile))
+    return RunVerification(
+        benchmark=KL_RUN_NAME,
+        run_id=run_id,
+        ok=True,
+        score=multiplier,
+        reason=(
+            f"KL P{KL_QUANTILE}={quantile:.6g} nats on {KL_PAIRING} -> x{multiplier:.4f}"
+            f", {measured_bytes // 1024:,} KB GPU"
+        ),
+        repo=status.repo or "",
+        revision=status.revision or "",
+        measured_memory_kb=measured_bytes // 1024,
     )
 
 
@@ -249,7 +292,10 @@ def verify_candidate_runs(
     spec: CompetitionSpec,
     coordinator: Coordinator,
 ) -> List[RunVerification]:
-    """Verify one run per competition benchmark. Missing runs score 0.0."""
+    """
+    Verify one run per competition benchmark, plus the KL comparison run when
+    the competition configures one. Missing runs score 0.0.
+    """
     run_ids = submission.run_ids
     results: List[RunVerification] = []
 
@@ -271,7 +317,46 @@ def verify_candidate_runs(
             continue
         results.append(verify_run(submission, task.name, run_id, status, task.fluid_epoch_id))
 
+    if spec.kl_corpus_id:
+        kl_run_id = run_ids.get(KL_RUN_NAME)
+        if not kl_run_id:
+            results.append(RunVerification(
+                benchmark=KL_RUN_NAME, run_id="", ok=False,
+                reason="no KL comparison run id submitted",
+            ))
+        else:
+            try:
+                results.append(verify_kl_run(submission, spec, kl_run_id, coordinator.poll(kl_run_id)))
+            except Exception as e:
+                results.append(RunVerification(
+                    benchmark=KL_RUN_NAME, run_id=kl_run_id, ok=False,
+                    reason=f"coordinator poll failed: {e}",
+                ))
+
     return results
+
+
+@dataclass
+class CandidateVerification:
+    """Everything scoring needs about one candidate, all of it from the coordinator."""
+    scores: Dict[str, float] = field(default_factory=dict)
+    # GPU memory measured for the committed model, in KB. 0 when no verified run
+    # reported one, which fails the memory cap rather than passing it silently.
+    measured_memory_kb: int = 0
+
+
+def measured_memory_kb(results: List[RunVerification]) -> int:
+    """
+    The GPU memory figure to score on: the largest any *verified* run reported.
+
+    The KL run is the authoritative one — it loads the committed model against
+    the competition's base. Benchmark runs carry a suite-level figure too, so a
+    competition without a KL check still gets a number. Taking the maximum means
+    a candidate is held to its heaviest observed load, never its lightest.
+
+    Rejected runs are ignored: their numbers describe some other model.
+    """
+    return max((r.measured_memory_kb for r in results if r.ok), default=0)
 
 
 def verify_all_candidates(
@@ -281,11 +366,11 @@ def verify_all_candidates(
     spec: CompetitionSpec,
     coordinator: Coordinator,
     max_workers: int = 5,
-) -> Dict[str, Dict[str, float]]:
+) -> Dict[str, CandidateVerification]:
     """
     Verify every candidate's runs and persist the outcome.
 
-    Returns {hotkey: {benchmark_name: score}} — a rejected or missing run
+    Returns {hotkey: CandidateVerification} — a rejected or missing run
     contributes 0.0, so every competition benchmark is always present.
     """
     if not submissions:
@@ -298,7 +383,7 @@ def verify_all_candidates(
             hotkeys,
         ))
 
-    verified_scores: Dict[str, Dict[str, float]] = {}
+    verified: Dict[str, CandidateVerification] = {}
     for hotkey, results in zip(hotkeys, all_results):
         submission = submissions[hotkey]
         for result in results:
@@ -315,41 +400,69 @@ def verify_all_candidates(
                 logger.info(f"{hotkey[:12]} {result.benchmark} rejected — {result.reason}")
 
         scores = {r.benchmark: r.score for r in results}
-        verified_scores[hotkey] = scores
-        logger.debug(f"{hotkey[:12]} verified scores: {scores}")
+        memory_kb = measured_memory_kb(results)
+        verified[hotkey] = CandidateVerification(scores=scores, measured_memory_kb=memory_kb)
+        logger.debug(f"{hotkey[:12]} verified scores: {scores} memory={memory_kb:,}KB")
 
-    return verified_scores
+    return verified
 
 
 # ---------------------------------------------------------------------------
-# Candidate finalization (stage 2, after precheck)
+# Candidate finalization
 # ---------------------------------------------------------------------------
 
-def finalize_prechecked_candidate(
+def finalize_candidate(
     conn: sqlite3.Connection,
     competition_id: str,
     hotkey: str,
     spec: CompetitionSpec,
-    verified_scores: Dict[str, float],
-    measured_memory_kb: int,
+    verification: CandidateVerification,
 ) -> bool:
     """
-    Apply floors and the memory cap to a candidate that passed precheck, then
+    Apply the competition's floors and memory cap to a verified candidate, then
     score it. Returns True if the candidate was scored.
+
+    Every input comes from verified coordinator runs, so this does no I/O beyond
+    the database.
     """
-    passed, failures = passes_floors(verified_scores, spec.benchmarks)
+    scores = verification.scores
+    memory_kb = verification.measured_memory_kb
+
+    passed, failures = passes_floors(scores, spec.benchmarks)
     if not passed:
         logger.info(f"{hotkey[:12]} floor fail: {failures}")
         store.set_candidate_status(conn, competition_id, hotkey, "failed", f"failed floors: {failures}")
         return False
 
-    if not passes_memory_cap(measured_memory_kb, spec):
-        reason = f"exceeded memory cap: {measured_memory_kb}KB > {spec.max_memory_kb}KB"
+    # No figure means no run reported one. Treating that as 0 would pass any cap,
+    # so it fails instead.
+    if not memory_kb:
+        reason = "no verified run reported the candidate's GPU memory"
+        logger.info(f"{hotkey[:12]} {reason}")
+        store.set_candidate_status(conn, competition_id, hotkey, "failed", reason)
+        return False
+
+    if not passes_memory_cap(memory_kb, spec):
+        reason = f"exceeded memory cap: {memory_kb}KB > {spec.max_gpu_memory_kb}KB"
         logger.info(f"{hotkey[:12]} memory cap fail: {reason}")
         store.set_candidate_status(conn, competition_id, hotkey, "failed", reason)
         return False
 
-    score = final_score(verified_scores, measured_memory_kb, spec)
-    logger.info(f"{hotkey[:12]} SCORED final={score:.6f} scores={verified_scores}")
-    store.finalize_candidate(conn, competition_id, hotkey, score, measured_memory_kb)
+    score = final_score(scores, memory_kb, spec)
+
+    # A zeroed score means something required was missing or unverifiable — most
+    # often the KL run, whose multiplier is 0.0 when it cannot be verified. Such
+    # a candidate must not occupy a payable rank: emission shares go by position,
+    # so in a thin field a zero would still draw a share.
+    #
+    # Only the multiplicative branch can reach 0 this way; BENCHMARK_FLOOR scores
+    # negated memory, where 0 is unreachable (memory_kb > 0 is checked above).
+    if spec.competition_type == CompetitionType.GPU_MEMORY_CEILING and score <= 0.0:
+        reason = f"scored 0 — nothing payable (scores={scores})"
+        logger.info(f"{hotkey[:12]} {reason}")
+        store.set_candidate_status(conn, competition_id, hotkey, "failed", reason)
+        return False
+
+    logger.info(f"{hotkey[:12]} SCORED final={score:.6f} scores={scores} memory={memory_kb:,}KB")
+    store.finalize_candidate(conn, competition_id, hotkey, score, memory_kb)
     return True

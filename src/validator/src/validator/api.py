@@ -3,7 +3,7 @@ Leader validator's HTTP API.
 
 Three namespaces:
   /v1/follower/*     — minimal, stable contract followers depend on to set weights.
-  /v1/state/*        — full detail (reveals, precheck outcomes, weights history,
+  /v1/state/*        — full detail (reveals, verification outcomes, weights history,
                        task status) for dashboards. /v1/state/competitions/{id}
                        is a superset of what /v1/follower/scoring-results returns,
                        so dashboards use this instead of stitching both namespaces.
@@ -11,6 +11,10 @@ Three namespaces:
                        and DELETE require Authorization: Bearer <ADMIN_API_KEY> —
                        these are the only privileged, write-capable routes the
                        leader exposes.
+  /admin, /v1/admin/* — browser page for creating competitions. The create call is
+                       signed by a wallet extension (bittensor btauth/1 headers) and
+                       only accepted from ss58 addresses in ADMIN_SIGNERS. Create-only:
+                       it can never overwrite, delete or pause anything.
 
 /v1/follower/*, /v1/state/*, and GET /v1/competitions/* have no auth — intended to
 sit behind a proxy and be treated as public read access. POST and DELETE on
@@ -18,17 +22,38 @@ sit behind a proxy and be treated as public read access. POST and DELETE on
 sent over plain HTTP is sniffable in transit, defeating the point of the check.
 """
 import hmac
+import re
+import time
+from pathlib import Path
 
 from aiohttp import web
+from bittensor import http_auth, sp_core
 from loguru import logger
 
 from common.chain import current_block as get_current_block
-from common.models.competition import CompetitionSpec
+from common.models.competition import CompetitionSpec, CompetitionType
 from validator import store
 from validator import settings as validator_settings
 
 
 MAX_REQUEST_BODY_BYTES = 256 * 1024
+
+SIGNED_MAX_AGE_SECONDS = 300
+SIGNED_ALLOWED_SKEW_SECONDS = 30
+_signed_nonces = http_auth.InMemoryNonceStore(
+    retention=SIGNED_MAX_AGE_SECONDS + SIGNED_ALLOWED_SKEW_SECONDS
+)
+
+ADMIN_PAGE = Path(__file__).with_name("admin_page.html")
+ADMIN_PAGE_HEADERS = {
+    "Cache-Control": "no-store",
+    "X-Frame-Options": "DENY",
+    "X-Content-Type-Options": "nosniff",
+    "Referrer-Policy": "no-referrer",
+    "Content-Security-Policy": "frame-ancestors 'none'; base-uri 'none'; form-action 'none'",
+}
+SIGNER = web.RequestKey("signer", str)
+COMPETITION_ID = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._-]*$")
 
 
 def _require_admin_auth(handler):
@@ -48,6 +73,87 @@ def _require_admin_auth(handler):
             return web.json_response({"error": "unauthorized"}, status=401)
         return await handler(request)
     return wrapped
+
+
+def _require_admin_signer(handler, receiver_ss58: str):
+    """Gate a handler behind a btauth/1 signature from an ADMIN_SIGNERS address.
+
+    The signature covers method, path, body hash, timestamp nonce and this leader's
+    hotkey (so a signature for one validator can't be replayed on another). Browser
+    wallets sign `<Bytes>payload</Bytes>`; bittensor's verifier accepts both forms.
+    Fails closed: empty ADMIN_SIGNERS returns 503.
+    """
+    async def wrapped(request: web.Request) -> web.Response:
+        if not validator_settings.ADMIN_SIGNERS:
+            return web.json_response({"error": "admin signers not configured"}, status=503)
+        # Compare public keys: wallets may show the same key under another ss58 prefix.
+        allowed = {sp_core.ss58_decode(a) for a in validator_settings.ADMIN_SIGNERS}
+        # Reject unlisted senders before verifying, so strangers' valid signatures
+        # can't fill the nonce store. Re-checked below against the verified sender.
+        try:
+            claimed = sp_core.ss58_decode(request.headers.get(http_auth.HEADER_HOTKEY, ""))
+        except ValueError:
+            return web.json_response({"error": "signature rejected: missing or invalid signer"}, status=401)
+        if claimed not in allowed:
+            return web.json_response({"error": "signer is not allowed to create competitions"}, status=403)
+        try:
+            caller = http_auth.verify(
+                request.headers, await request.read(),
+                method=request.method, path=request.path_qs,
+                self_hotkey_ss58=receiver_ss58,
+                max_age=SIGNED_MAX_AGE_SECONDS, allowed_skew=SIGNED_ALLOWED_SKEW_SECONDS,
+                nonce_store=_signed_nonces,
+            )
+        except http_auth.AuthError as e:
+            return web.json_response({"error": f"signature rejected: {e}"}, status=401)
+        if sp_core.ss58_decode(caller.hotkey_ss58) not in allowed:
+            return web.json_response(
+                {"error": f"{caller.hotkey_ss58} is not allowed to create competitions"}, status=403
+            )
+        request[SIGNER] = caller.hotkey_ss58
+        return await handler(request)
+    return wrapped
+
+
+def creation_errors(spec: CompetitionSpec, current_block: int) -> list[str]:
+    """Checks a new competition must pass on top of CompetitionSpec's own validation.
+
+    Kept out of CompetitionSpec so already-stored specs keep loading unchanged.
+    """
+    errors = []
+    if not COMPETITION_ID.match(spec.id):
+        errors.append("id must be letters, numbers, dots, underscores or hyphens")
+    if spec.start_block <= current_block:
+        errors.append(f"start_block {spec.start_block} is not in the future (current block {current_block})")
+    if spec.commit_end_block <= spec.start_block:
+        errors.append("commit_end_block must be after start_block")
+    if spec.reveal_grace_blocks < 0:
+        errors.append("reveal_grace_blocks must be >= 0")
+    if spec.max_gpu_memory_kb is not None and spec.max_gpu_memory_kb <= 0:
+        errors.append("max_gpu_memory_kb must be positive")
+    if spec.scoring_end_block <= spec.scoring_starts_at():
+        errors.append("scoring_end_block must be after commit_end_block + reveal_grace_blocks")
+    if spec.top_n < 1 or any(not 0 <= share <= 1 for share in spec.emission_distribution):
+        errors.append("need at least one winner, each reward share between 0 and 1")
+    names = [b.name for b in spec.benchmarks]
+    if not names or len(set(names)) != len(names):
+        errors.append("need at least one benchmark, names must be unique")
+    for b in spec.benchmarks:
+        if not 0 <= b.min_score <= 1:
+            errors.append(f"{b.name}: min_score must be between 0 and 1")
+        if b.name == "fluid_knowledge" and not b.fluid_epoch_id:
+            errors.append("fluid_knowledge needs a pinned fluid_epoch_id")
+    if spec.kl_corpus_id:
+        # Without a base pin the KL run can name any base, including a weak one
+        # it scores well against, and the multiplier becomes free.
+        if not spec.model_repo:
+            errors.append("kl_corpus_id needs model_repo: it is the base the KL run must compare against")
+        if spec.competition_type != CompetitionType.GPU_MEMORY_CEILING:
+            errors.append(
+                "kl_corpus_id only affects gpu_memory_ceiling ranking; "
+                "benchmark_floor ranks on memory alone"
+            )
+    return errors
 
 
 class LeaderApiMixin:
@@ -77,6 +183,12 @@ class LeaderApiMixin:
         app.router.add_post(
             "/v1/competitions/{competition_id}/resume",
             _require_admin_auth(self._h_resume_competition),
+        )
+        app.router.add_get("/admin", self._h_admin_page)
+        app.router.add_get("/v1/admin/head", self._h_admin_head)
+        app.router.add_post(
+            "/v1/admin/competitions",
+            _require_admin_signer(self._h_create_competition, self.hotkey),
         )
 
         self.leader_api_runner = web.AppRunner(app)
@@ -280,3 +392,43 @@ class LeaderApiMixin:
             "paused_at": store.paused_at(self._db, competition_id),
             "stage": store.get_stage(self._db, competition_id),
         })
+
+    # ── /admin, /v1/admin/* ──────────────────────────────────────────────
+
+    async def _h_admin_page(self, request: web.Request) -> web.Response:
+        if not validator_settings.ADMIN_SIGNERS:
+            raise web.HTTPNotFound()
+        return web.Response(
+            text=ADMIN_PAGE.read_text(), content_type="text/html", headers=ADMIN_PAGE_HEADERS
+        )
+
+    async def _h_admin_head(self, request: web.Request) -> web.Response:
+        """What the admin page needs to sign and to convert dates to blocks."""
+        if not validator_settings.ADMIN_SIGNERS:
+            raise web.HTTPNotFound()
+        try:
+            block = get_current_block(self.subtensor)
+        except Exception as e:
+            return web.json_response({"error": f"cannot read current block: {e}"}, status=503)
+        return web.json_response({
+            "block": block,
+            "time_ms": int(time.time() * 1000),
+            "receiver": self.hotkey,
+        })
+
+    async def _h_create_competition(self, request: web.Request) -> web.Response:
+        try:
+            spec = CompetitionSpec.model_validate(await request.json())
+        except ValueError as e:
+            return web.json_response({"error": f"invalid competition spec: {e}"}, status=422)
+        try:
+            current_block = get_current_block(self.subtensor)
+        except Exception as e:
+            return web.json_response({"error": f"cannot read current block: {e}"}, status=503)
+        errors = creation_errors(spec, current_block)
+        if errors:
+            return web.json_response({"error": "; ".join(errors)}, status=422)
+        if not store.insert_competition(self._db, spec):
+            return web.json_response({"error": f"competition {spec.id!r} already exists"}, status=409)
+        logger.warning(f"Competition {spec.id} created via admin page, signed by {request[SIGNER]}")
+        return web.json_response(spec.model_dump(mode="json"), status=201)

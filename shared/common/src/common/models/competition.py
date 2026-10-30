@@ -12,8 +12,14 @@ class CompetitionPhase(str, Enum):
 
 
 class CompetitionType(str, Enum):
-    BENCHMARK_FLOOR = "benchmark_floor"                  # benchmarks are pass/fail floors; rank by lowest max_memory
-    RAM_CEILING = "ram_ceiling"  # max_memory is a pass/fail cap; rank by highest benchmark composite
+    BENCHMARK_FLOOR = "benchmark_floor"  # benchmarks are pass/fail floors; rank by lowest measured memory
+    # Measured memory is a pass/fail cap; rank by highest benchmark composite.
+    GPU_MEMORY_CEILING = "gpu_memory_ceiling"
+
+
+# Reserved run name: miners commit the KL run as {"b": "kl", "r": "r1234"}, so it
+# arrives through MinerSubmission.run_ids without a payload spec bump.
+KL_RUN_NAME = "kl"
 
 
 class BenchmarkTask(BaseModel):
@@ -35,6 +41,10 @@ class CompetitionSpec(BaseModel):
     name: str
     description: Optional[str] = None
     model_repo: Optional[str] = None  # HF repo ID of the base model miners should optimize
+    # Platform corpus the KL run must measure on. Its text is never exposed (the
+    # catalog publishes rounded counts only), so miners cannot tune against it.
+    # None disables KL scoring.
+    kl_corpus_id: Optional[str] = None
 
     start_block: int
     commit_end_block: int
@@ -45,13 +55,18 @@ class CompetitionSpec(BaseModel):
     benchmarks: List[BenchmarkTask]
     model_requirements: ModelRequirements = ModelRequirements()
     reveal_grace_blocks: int = 150
-    ram_check_context_length: int = 4096
 
     emission_weight: float = 1.0  # this competition's fixed share of total network weight (0,1]
     distribution_blocks: int = 0  # blocks after scoring_end_block it keeps distributing that share
 
     competition_type: CompetitionType = CompetitionType.BENCHMARK_FLOOR
-    max_memory_kb: Optional[int] = None  # required cap for RAM_CEILING competitions
+    # Cap on the GPU memory the coordinator measures while loading the candidate,
+    # in KB. Required for GPU_MEMORY_CEILING competitions.
+    #
+    # This is GPU bytes at full offload, as the benchmark coordinator measures
+    # them — not host RAM. A threshold carried over from the old CPU-side RAM
+    # measurement does not transfer.
+    max_gpu_memory_kb: Optional[int] = None
 
     @model_validator(mode="after")
     def validate_emission_distribution(self):
@@ -66,9 +81,32 @@ class CompetitionSpec(BaseModel):
         return self
 
     @model_validator(mode="after")
-    def validate_max_memory_kb(self):
-        if self.competition_type == CompetitionType.RAM_CEILING and not self.max_memory_kb:
-            raise ValueError("max_memory_kb is required when competition_type is ram_ceiling")
+    def validate_kl_run_name_not_a_benchmark(self):
+        """A benchmark named `kl` would collide with the multiplier in verified_scores."""
+        if any(t.name == KL_RUN_NAME for t in self.benchmarks):
+            raise ValueError(f"'{KL_RUN_NAME}' is reserved for the KL comparison run and cannot name a benchmark")
+        return self
+
+    @model_validator(mode="after")
+    def validate_kl_corpus_has_a_base(self):
+        """A KL run is only meaningful against a pinned base: without one the
+        miner names the base themselves, and can pick a weak model their quant
+        barely diverges from, which makes the multiplier free.
+
+        Enforced on the model rather than in creation_errors because
+        POST /v1/competitions validates the spec and stores it without ever
+        calling creation_errors.
+        """
+        if self.kl_corpus_id and not self.model_repo:
+            raise ValueError(
+                "kl_corpus_id requires model_repo: it is the base the KL run compares against"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def validate_max_gpu_memory_kb(self):
+        if self.competition_type == CompetitionType.GPU_MEMORY_CEILING and not self.max_gpu_memory_kb:
+            raise ValueError("max_gpu_memory_kb is required when competition_type is gpu_memory_ceiling")
         return self
 
     @model_validator(mode="after")

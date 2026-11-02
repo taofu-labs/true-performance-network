@@ -1,6 +1,6 @@
 from enum import Enum
 from typing import List, Optional
-from pydantic import BaseModel, model_validator
+from pydantic import BaseModel, field_validator, model_validator
 
 
 class CompetitionPhase(str, Enum):
@@ -67,6 +67,20 @@ class CompetitionSpec(BaseModel):
     # them — not host RAM. A threshold carried over from the old CPU-side RAM
     # measurement does not transfer.
     max_gpu_memory_kb: Optional[int] = None
+
+    @field_validator("model_repo")
+    @classmethod
+    def normalize_model_repo(cls, v: Optional[str]) -> Optional[str]:
+        """Accept a pasted HF URL: the coordinator reports the base as `org/model`,
+        so a stored URL would fail every KL base check."""
+        if v is None:
+            return None
+        v = v.strip().removesuffix("/")
+        for prefix in ("https://huggingface.co/", "http://huggingface.co/", "huggingface.co/"):
+            if v.lower().startswith(prefix):
+                v = v[len(prefix):]
+                break
+        return v or None
 
     @model_validator(mode="after")
     def validate_emission_distribution(self):

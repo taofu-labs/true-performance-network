@@ -85,3 +85,15 @@ def test_emission_distribution_must_match_top_n_and_sum_to_one():
         make_spec(top_n=2, emission_distribution=[1.0])
     with pytest.raises(ValidationError, match="sums to"):
         make_spec(top_n=2, emission_distribution=[0.5, 0.2])
+
+
+@pytest.mark.parametrize("raw", [
+    "https://huggingface.co/Qwen/Qwen3.5-4B",
+    "https://huggingface.co/Qwen/Qwen3.5-4B/",
+    " huggingface.co/Qwen/Qwen3.5-4B ",
+    "Qwen/Qwen3.5-4B",
+])
+def test_model_repo_url_normalized_to_repo_id(raw):
+    """The coordinator reports the base as `org/model`; a stored URL (TPN-007)
+    failed every KL base check and zeroed kl_norm for all miners."""
+    assert make_spec(model_repo=raw).model_repo == "Qwen/Qwen3.5-4B"

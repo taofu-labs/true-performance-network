@@ -51,6 +51,12 @@ def benchmark(
         False, "--rerun",
         help="Re-run benchmarks that already have a saved run id",
     ),
+    hf_token_id: Optional[str] = typer.Option(
+        None, "--hf-token-id",
+        help="Id of a HuggingFace token stored on the benchmark service's Tokens page, "
+             "for benchmarking a private repo. Defaults to $BENCHMARK_HF_TOKEN_ID.",
+        envvar="BENCHMARK_HF_TOKEN_ID",
+    ),
     yes: bool = typer.Option(False, "--yes", "-y", help="Skip the price confirmation prompt"),
     force_price: bool = typer.Option(
         False, "--force-price",
@@ -151,7 +157,7 @@ def benchmark(
         for name in todo:
             request, quote_path, _ = request_for(name)
             try:
-                quotes[name] = client.quote(request, path=quote_path)
+                quotes[name] = client.quote(request, huggingface_token_id=hf_token_id, path=quote_path)
             except BillingError as e:
                 console.print(f"[red]Quote failed for {name}: {e}[/red]")
                 raise typer.Exit(1)
@@ -195,7 +201,7 @@ def benchmark(
     for name in todo:
         request, _, submit_path = request_for(name)
         try:
-            order = client.submit(request, quotes.get(name), path=submit_path)
+            order = client.submit(request, quotes.get(name), huggingface_token_id=hf_token_id, path=submit_path)
             console.print(f"[dim]{name}: order {order.id} ({order.status}) — waiting for run id[/dim]")
             order = client.wait_for_run_id(order.id)
         except BillingError as e:

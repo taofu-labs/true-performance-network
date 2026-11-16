@@ -17,6 +17,7 @@ from loguru import logger
 from common.models.competition import KL_RUN_NAME, CompetitionSpec, CompetitionType
 from common.models.submission import MinerSubmission
 from competition.benchmark_client import Coordinator, RunStatus, RunStatusCode
+from competition.model_store import check_repo_public
 from competition.scoring import final_score, kl_norm, passes_floors, passes_memory_cap
 from validator import store
 
@@ -120,13 +121,6 @@ def verify_run(
     algorithm, value = status.file_hashes.get(submission.file, (None, None))
     if algorithm == "sha256" and value and value.lower() != submission.file_sha256:
         return fail(f"file hash mismatch: run has {value[:12]}, submission commits {submission.file_sha256[:12]}")
-
-    # A winner's model has to be downloadable by anyone. The validator never
-    # contacts the Hub, so the run's own view of the repo is the evidence —
-    # a miner who publishes only long enough to benchmark is caught here.
-    if status.repo_private or status.repo_gated:
-        state = "private" if status.repo_private else "gated"
-        return fail(f"repo was {state} when the run read it — publish it before scoring")
 
     if benchmark_name not in status.benchmarks:
         covered = ", ".join(status.benchmarks) or "none"
@@ -251,10 +245,6 @@ def verify_kl_run(
     if algorithm == "sha256" and value and value.lower() != submission.file_sha256:
         return fail(f"file hash mismatch: KL run has {value[:12]}, submission commits {submission.file_sha256[:12]}")
 
-    if status.repo_private or status.repo_gated:
-        state = "private" if status.repo_private else "gated"
-        return fail(f"repo was {state} when the KL run read it — publish it before scoring")
-
     pairing = (comparison.get("pairings") or {}).get(KL_PAIRING)
     if not isinstance(pairing, dict):
         return fail(f"comparison has no '{KL_PAIRING}' pairing")
@@ -298,6 +288,16 @@ def verify_candidate_runs(
     """
     run_ids = submission.run_ids
     results: List[RunVerification] = []
+
+    if not check_repo_public(submission.repository):
+        names = [t.name for t in spec.benchmarks] + ([KL_RUN_NAME] if spec.kl_corpus_id else [])
+        return [
+            RunVerification(
+                benchmark=name, run_id=run_ids.get(name, ""), ok=False,
+                reason="repo not public at scoring time",
+            )
+            for name in names
+        ]
 
     for task in spec.benchmarks:
         run_id = run_ids.get(task.name)

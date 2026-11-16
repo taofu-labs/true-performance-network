@@ -83,9 +83,11 @@ class FakeBillingClient:
         self.quote_paths = []
         self.submit_paths = []
         self.submitted = []
+        self.token_ids = []
 
     def quote(self, request, huggingface_token_id=None, path="/benchmarks/quote"):
         self.quoted.append(request)
+        self.token_ids.append(huggingface_token_id)
         self.quote_paths.append(path)
         if self._quote_error:
             raise self._quote_error
@@ -93,6 +95,7 @@ class FakeBillingClient:
 
     def submit(self, request, quote=None, huggingface_token_id=None, path="/benchmarks"):
         self.submitted.append(request)
+        self.token_ids.append(huggingface_token_id)
         self.submit_paths.append(path)
         if self._submit_error:
             raise self._submit_error
@@ -414,3 +417,13 @@ def test_runs_a_kl_competition_that_pins_a_base(monkeypatch, tmp_path):
     result = invoke("--api-key", "bapi_x", "--yes")
     assert result.exit_code == 0, result.stdout
     assert "kl" in result.stdout
+
+
+def test_hf_token_id_is_sent_with_quote_and_submit(monkeypatch, tmp_path):
+    stub_leader(monkeypatch, benchmarks=("mmlu",))
+    write_upload_config(monkeypatch, tmp_path)
+    client = install_client(monkeypatch, FakeBillingClient())
+
+    result = invoke("--api-key", "bapi_x", "--hf-token-id", "tok-uuid", "--yes")
+    assert result.exit_code == 0, result.stdout
+    assert client.token_ids == ["tok-uuid", "tok-uuid"]

@@ -833,3 +833,33 @@ async def test_follower_does_not_rewrite_unchanged_weights(monkeypatch):
         await _run_one_follower_tick(monkeypatch, v, results, "scored")
 
     assert len(store.weights_history_for_competition(v._db, "comp1")) == 1
+
+
+def test_serve_axon_publishes_placeholder_and_swallows_errors(monkeypatch):
+    import bittensor as bt
+
+    v = make_validator(monkeypatch)
+    monkeypatch.setattr(common_settings, "BITTENSOR", True)
+    calls = []
+
+    class Result:
+        success = True
+        message = "Success"
+
+    def record(intent, wallet):
+        calls.append(intent)
+        return Result()
+    v.subtensor.execute = record
+    v.serve_axon()
+    assert isinstance(calls[0], bt.ServeAxon)
+    assert calls[0].ip == "0.0.0.0"
+    assert calls[0].netuid == int(common_settings.NETUID)
+
+    def boom(intent, wallet):
+        raise RuntimeError("rate limited")
+    v.subtensor.execute = boom
+    v.serve_axon()  # must not raise
+
+    Result.success = False
+    v.subtensor.execute = lambda intent, wallet: Result()
+    v.serve_axon()  # chain rejection logs, doesn't raise

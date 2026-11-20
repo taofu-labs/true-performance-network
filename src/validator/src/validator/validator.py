@@ -443,8 +443,31 @@ class Validator(HealthServerMixin, LeaderApiMixin):
                 )
                 await asyncio.sleep(validator_settings.WEIGHT_SUBMIT_INTERVAL)
 
+    def serve_axon(self):
+        """Publish a placeholder axon (0.0.0.0) so the hotkey shows as serving.
+        Nothing listens on it; failures (unregistered, rate limit) are non-fatal."""
+        if not (common_settings.BITTENSOR and self.subtensor):
+            return
+        try:
+            result = self.subtensor.execute(
+                bt.ServeAxon(
+                    netuid=int(common_settings.NETUID),
+                    ip="0.0.0.0",
+                    port=validator_settings.VALIDATOR_HEALTH_PORT,
+                ),
+                self.wallet,
+            )
+            # execute() reports chain rejections via result.success, it doesn't raise
+            if result.success:
+                logger.info("📡 Published axon 0.0.0.0 to chain")
+            else:
+                logger.warning(f"serve_axon rejected by chain (non-fatal): {result.message}")
+        except Exception as e:
+            logger.warning(f"serve_axon failed (non-fatal): {e}")
+
     async def run_validator(self):
         logger.info(f"🚀 Starting validator (mode={self.mode})")
+        self.serve_axon()
         # Start the healthcheck server
         if validator_settings.LAUNCH_HEALTH:
             await self._start_health_server()

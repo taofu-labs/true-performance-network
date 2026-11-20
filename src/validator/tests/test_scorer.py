@@ -270,6 +270,16 @@ def test_verify_candidate_runs_ignores_runs_for_benchmarks_not_in_spec():
     assert "r999" not in coordinator.polled
 
 
+def test_verify_candidate_runs_fails_every_run_when_repo_not_public(monkeypatch):
+    monkeypatch.setattr(scorer, "check_repo_public", lambda repo: False)
+    coordinator = StubCoordinator({"r100": make_status()})
+
+    results = scorer.verify_candidate_runs(make_submission(), make_spec(), coordinator)
+    assert [r.ok for r in results] == [False]
+    assert "not public" in results[0].reason
+    assert coordinator.polled == []
+
+
 
 # ---------------------------------------------------------------------------
 # verify_all_candidates — persistence + aggregate
@@ -416,29 +426,6 @@ def test_finalize_still_pays_benchmark_floor_at_zero_benchmarks():
         conn, "comp1", "hk1", make_spec(), verification({"mmlu": 0.8}),
     ) is True
     assert store.scoring_results_for_competition(conn, "comp1")[0]["final_score"] == -900.0
-
-
-def test_verify_run_rejects_a_private_repo():
-    """A winner's model must be downloadable. The validator never contacts the
-    Hub, so the run's own view of the repo is the only evidence."""
-    result = scorer.verify_run(
-        make_submission(), "mmlu", "r100", make_status(repo_private=True),
-    )
-    assert result.ok is False
-    assert "private" in result.reason
-
-
-def test_verify_run_rejects_a_gated_repo():
-    result = scorer.verify_run(
-        make_submission(), "mmlu", "r100", make_status(repo_gated=True),
-    )
-    assert result.ok is False
-    assert "gated" in result.reason
-
-
-def test_kl_run_rejects_a_private_repo():
-    assert verify_kl(repo_private=True).ok is False
-    assert "private" in verify_kl(repo_private=True).reason
 
 
 def test_finalize_fails_candidate_whose_memory_is_unknown():

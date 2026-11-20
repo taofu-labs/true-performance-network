@@ -4,6 +4,7 @@
 
 - Bittensor wallet
 - HuggingFace account with write access
+- Benchmark service account with credits, an API key and a stored HuggingFace token
 
 ## Install CLI
 
@@ -50,12 +51,20 @@ tpn upload ./my-model.gguf \
 
 You run your own benchmarks before committing, and pay for them yourself.
 
-First, create an API key on the benchmark service: log in to its web GUI, add
-credits, then create a key on the Tokens page. API keys can spend credits but
-cannot buy them, so top up in the GUI first.
+First, set up the benchmark service: log in to its web GUI and add credits.
+Then, on the Tokens page:
+
+1. Create an API key. API keys can spend credits but cannot buy them, so top up
+   in the GUI first.
+2. Store a HuggingFace token that can read your repo. `tpn upload` creates a
+   private repo, so the service needs this to benchmark it. A classic read token
+   works; a fine-grained token must include the repo.
+3. Copy the stored token's id from the token list. You pass this id, not the
+   `hf_...` value.
 
 ```bash
 export BENCHMARK_API_KEY=bapi_...
+export BENCHMARK_HF_TOKEN_ID=<stored token id>
 
 tpn benchmark --wallet <coldkey> --competition <competition-id>
 ```
@@ -88,10 +97,14 @@ benchmarks to finish.
 
 | Flag | Effect |
 |---|---|
+| `--hf-token-id <id>` | Stored HF token the service reads your private repo with (`$BENCHMARK_HF_TOKEN_ID`) |
 | `--only mmlu,gsm8k` | Run just these (`--only kl` runs the KL check alone) |
 | `--rerun` | Re-run benchmarks that already have a saved run id |
 | `--yes` | Skip the price confirmation prompt |
 | `--force-price` | Accept the current price without quoting first |
+
+If a quote fails with "…was not found on Hugging Face, or it is private", the
+token id is missing or the token cannot read the repo.
 
 Re-running one benchmark is cheap: `tpn benchmark --only <name> --rerun`
 replaces just that run id and leaves the others alone. Runs of the same model
@@ -127,10 +140,6 @@ final score** — and a zero-scoring candidate is not scored at all, so it earns
 nothing even if nobody else entered. `tpn benchmark` includes the KL run by
 default and `tpn commit` refuses a payload without it, because the commit
 payload is sealed — a missing run cannot be added after the fact.
-
-Keep your HuggingFace repo **public** from the moment you benchmark. The
-coordinator records whether the repo was private or gated when it read it, and
-the validator fails any run that read a non-public repo.
 
 #### Memory
 
@@ -171,7 +180,12 @@ Use `--dry-run` to inspect the payload without writing to chain.
 
 ### 6. Publish repo
 
-Makes the HF repo public so validators can download your model. Do this before the scoring phase begins.
+Makes the HF repo public. The leader checks the repo is public when the scoring
+phase starts, and a repo that is not public scores 0.0 on every run.
+
+Publish after `commit_end_block` (the REVEALING phase) and before scoring starts.
+Publishing earlier lets someone copy your file and commit it before the commit
+window closes.
 
 ```bash
 tpn publish --wallet <coldkey> --competition <competition-id>
@@ -221,7 +235,7 @@ For local development or non-standard setups, all commands accept these global f
 
 `tpn benchmark` additionally takes `--billing-url`
 (default `https://bench.trueperformancenetwork.com/api/v1`) and
-`--api-key` (`$BENCHMARK_API_KEY`) after the subcommand.
+`--api-key` (`$BENCHMARK_API_KEY`) and `--hf-token-id` (`$BENCHMARK_HF_TOKEN_ID`) after the subcommand.
 
 Example:
 ```bash

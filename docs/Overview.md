@@ -33,7 +33,7 @@ start_block ──OPEN──▶ commit_end_block ──REVEALING──▶ +revea
 
 1. **Register** your hotkey on the subnet (`tpn register`).
 2. **Upload** your `.gguf` to a **private** HuggingFace repo (`tpn upload`). One repo per submission, exactly one `.gguf` in it. The CLI records repo, filename, **immutable commit SHA** (revision) and the file's **sha256**.
-3. **Benchmark** the model yourself on the benchmark service (`tpn benchmark`, paid by you). Every run must be **completed** before the scoring phase starts — a run still in progress then scores 0.0.
+3. **Benchmark** the model yourself on the benchmark service (`tpn benchmark`, paid by you). The repo stays private: store a HuggingFace token that can read it on the service's Tokens page and pass the stored token's id with `--hf-token-id`. Every run must be **completed** before the scoring phase starts — a run still in progress then scores 0.0.
 4. **Commit** (`tpn commit`): writes a TimeLocked (TLE-encrypted) payload to chain:
    ```json
    {"spec":3,"competition_id":"…","repository":"user/repo","file":"model.gguf",
@@ -43,7 +43,7 @@ start_block ──OPEN──▶ commit_end_block ──REVEALING──▶ +revea
    Nobody can read it until the chain auto-decrypts it around `commit_end_block`, so submissions cannot be copied.
 
    A payload committed under spec 2 (which also carried a `max_memory` field) is still accepted, so a commit made just before a validator upgrade is not lost. Spec 1 predates run ids and is rejected.
-5. **Publish** the HF repo (`tpn publish`) so the benchmark service can read it, and **leave it public**. The coordinator records whether the repo was private or gated when it read it, and a run against a non-public repo scores 0.0.
+5. **Publish** the HF repo (`tpn publish`) after `commit_end_block` and before the scoring phase starts, and **leave it public**. Publishing earlier lets someone copy your file and commit it before the window closes. The leader checks the repo is public when it scores, and a repo that is not scores 0.0 on every run.
 6. **Monitor** with `tpn status`, or the leader's `GET /v1/state/competitions/{id}` (per-candidate status and failure reasons).
 
 ## Validator side: leader and followers
@@ -132,7 +132,7 @@ memory, which a (0,1] factor would *improve*.
 | Same sha256 as an earlier reveal | Dedup loss |
 | Run not completed, or benchmarked a different repo/revision/file | That benchmark = 0.0 |
 | Committed sha256 contradicts the hash the coordinator reports | That run = 0.0 |
-| Repo private or gated when the run read it | That run = 0.0 |
+| Repo not public at scoring time | Every run = 0.0 |
 | KL run missing, failed, or measured against the wrong base or corpus | `kl_norm = 0.0` → **not scored**, no emission |
 | No verified run reported a memory figure | Not scored (backfilled) |
 | Below a benchmark floor / above the memory cap | Not scored (backfilled) |
@@ -142,7 +142,7 @@ memory, which a (0,1] factor would *improve*.
 
 - Commit exactly the revision and file you benchmarked; don't push to the repo after benchmarking.
 - Make sure every run has completed before the scoring phase starts, including the KL run.
-- Publish the repo before you benchmark, and leave it public — a run that read a private or gated repo scores 0.0.
+- Keep the repo private while you benchmark (`--hf-token-id`), and publish it after `commit_end_block` but before the scoring phase starts.
 - You no longer report a memory figure — it is measured during your runs. Memory is **GPU memory at full offload**, so it is not comparable to a CPU-side RAM number you may have measured before.
 - If the competition requires a KL check, commit its run id. Without it your final score is 0, and the payload is sealed at commit so it cannot be added later.
 - Emissions only start flowing at `scoring_end_block`, not when your candidate is scored.
